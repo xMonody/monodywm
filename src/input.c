@@ -90,8 +90,11 @@ void seat_request_set_cursor(struct wl_listener *listener, void *data) {
 	}
 	/* the compositor's own frame zone (title strip / resize edge) owns the
 	 * cursor there; ignore the client's request - it still receives motion
-	 * and keeps its hover feedback, it just cannot change the cursor */
-	if (pointer_over_frame_zone(server)) {
+	 * and keeps its hover feedback, it just cannot change the cursor.  A
+	 * captured pointer (pointer-constraints) belongs to the client even over
+	 * a frame zone, so it may set or hide its own cursor there. */
+	if (!pointer_constraint_active(server) &&
+			pointer_over_frame_zone(server)) {
 		return;
 	}
 	if (event->seat_client == server->seat->pointer_state.focused_client) {

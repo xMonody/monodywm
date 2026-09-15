@@ -15,6 +15,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdlib.h>
 #include <time.h>
 
 #include <linux/input-event-codes.h>
@@ -25,6 +26,7 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
+#include <wlr/util/region.h>
 
 /* is the cursor over the visible title strip of an undecorated window?  The
  * strip spans the window width: the top CONFIG_TITLEBAR_HEIGHT px of the
@@ -33,6 +35,12 @@ static bool is_in_titlebar_zone(struct server *server, struct toplevel *tl) {
 	/* a popup (menu / dropdown) floating over the strip wins the pointer:
 	 * no move / minimize / maximize / close grab while the cursor is on it */
 	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
+		return false;
+	}
+	if (tl->fullscreen) {
+		/* fullscreen: the window covers the whole output, so the compositor
+		 * owns no frame over it - none of the title-strip gestures apply and
+		 * the client must get its clicks/cursor back */
 		return false;
 	}
 	if (tl->decoration_mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE &&
@@ -108,6 +116,15 @@ static bool is_double_click(struct server *server, uint32_t button) {
 void begin_move(struct server *server, struct toplevel *tl,
 		double ref_x, double ref_y) {
 	if (server->moving) {
+		return;
+	}
+	/* a fullscreen window covers the whole output and has nowhere to go:
+	 * dragging it (which would only peel it off fullscreen and expose the
+	 * desktop) is never honored, the user must leave fullscreen first.
+	 * Gating here covers every move entry point - the left+right chord,
+	 * the title-strip drag and xdg_toplevel.move - so a fullscreen window
+	 * can never be moved by the compositor. */
+	if (tl != NULL && tl->fullscreen) {
 		return;
 	}
 	server->moving = true;
@@ -367,8 +384,8 @@ static void arm_zone_timer(struct server *server) {
  * corner zones (top-left / top-right) are diagonal resize handles.
  * Each grab zone straddles its edge: half of CONFIG_EDGE_THICKNESS lies
  * outside the window box and half inside, so the handles are reachable
- * both from the desktop and from just inside the window.  A maximized
- * window is never resized here. */
+ * both from the desktop and from just inside the window.  A maximized or
+ * fullscreen window is never resized here. */
 static uint32_t toplevel_resize_edges(struct server *server,
 		struct toplevel *tl) {
 	/* a popup covering the window's border wins the pointer: no resize
@@ -380,7 +397,7 @@ static uint32_t toplevel_resize_edges(struct server *server,
 	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
 			tl->decoration_mode ==
 				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
-			tl->xdg_toplevel->current.maximized ||
+			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
 			toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
 		/* dialogs and fixed-size windows (e.g. QQ's login) are never
 		 * resized, so their edges never get a resize cursor either */
@@ -594,7 +611,7 @@ static bool cursor_in_cursor_band(struct server *server,
 	if (tl->closing || tl->minimized || tl->xdg_toplevel->base == NULL ||
 			tl->decoration_mode ==
 				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
-			tl->xdg_toplevel->current.maximized ||
+			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
 			toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
 		return false;
 	}
@@ -648,6 +665,12 @@ bool pointer_over_frame_zone(struct server *server) {
  * CONFIG_TITLEBAR_CURSOR (all-scroll); moving out of the strip restores
  * the client's cursor through clear_cursor_override() */
 void update_cursor_style(struct server *server) {
+	/* a captured pointer (QEMU grab, game mouselook) belongs to the client:
+	 * never show the compositor's own frame cursors over it */
+	if (pointer_constraint_active(server)) {
+		clear_cursor_override(server);
+		return;
+	}
 	const char *name = NULL;
 
 	if (server->moving && server->move_toplevel != NULL) {
@@ -774,8 +797,9 @@ static void disarm_resize_final_timer(struct server *server) {
 
 void begin_resize(struct server *server, struct toplevel *tl,
 		uint32_t edges) {
-	/* never resize a maximized window */
-	if (server->resizing || tl->xdg_toplevel->current.maximized) {
+	/* never resize a maximized or fullscreen window */
+	if (server->resizing || tl->xdg_toplevel->current.maximized ||
+			tl->fullscreen) {
 		return;
 	}
 	server->resizing = true;
@@ -954,16 +978,20 @@ void end_resize(struct server *server) {
  *   left held + double-click right -> close the window
  *   hold the other button          -> move the window under the cursor
  *                                    (cursor turns to CONFIG_MOVE_CURSOR; releasing
- *                                    restores the previous cursor style) */
+ *                                    restores the previous cursor style)
+ * A fullscreen window is never moved by the hold chord (it covers the whole
+ * output; leave fullscreen first), and maximize/restore is already a no-op
+ * while fullscreen, so only the close chord still applies there. */
 
 /* start moving the chord's window with the cursor; the grab anchors at the
  * trigger button's press point (server->press_x/press_y), so the whole drag
  * distance is honored; a maximized window is restored first so the drag
  * grips its restored geometry (Windows behavior, same as the title-strip
- * drag) */
+ * drag).  A fullscreen window is not moved at all (early return, so the
+ * chord neither grabs nor shows the move cursor). */
 static void begin_chord_move(struct server *server) {
 	struct toplevel *tl = server->chord_toplevel;
-	if (tl == NULL || server->moving || server->resizing) {
+	if (tl == NULL || server->moving || server->resizing || tl->fullscreen) {
 		return;
 	}
 	double ref_x = server->press_x;
@@ -1388,6 +1416,38 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 
 static void process_cursor_button(struct server *server, uint32_t time_msec,
 		uint32_t button, enum wl_pointer_button_state state) {
+	/* while the client holds the pointer (pointer-constraints lock/confine,
+	 * e.g. QEMU's Ctrl+Alt+G grab), every button belongs to it - a chord or
+	 * title-strip grab here would otherwise drag the captured window on
+	 * left+right.  Forward the button and keep no compositor gesture state. */
+	if (pointer_constraint_active(server)) {
+		/* the client owns the pointer.  A release is forwarded only when its
+		 * press reached the client; a press the compositor swallowed before
+		 * the constraint was activated (a grab that was in flight) keeps its
+		 * release swallowed, so no orphan release is delivered. */
+		if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+			bool swallow = bound_button_contains(&server->bound_buttons,
+				button);
+			bound_button_remove(&server->bound_buttons, button);
+			if (button == BTN_LEFT) {
+				server->left_button_held = false;
+				swallow = swallow || server->chord_swallow_left;
+				server->chord_swallow_left = false;
+			}
+			if (button == BTN_RIGHT) {
+				server->right_button_held = false;
+				swallow = swallow || server->chord_swallow_right;
+				server->chord_swallow_right = false;
+			}
+			if (swallow) {
+				return;
+			}
+		}
+		wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+			state);
+		return;
+	}
+
 	/* A layer-shell overlay (e.g. the start menu) can be destroyed while the
 	 * cursor is over it; wlroots then clears the pointer focus and it is
 	 * only re-established by a motion event, so the first click after the
@@ -1669,6 +1729,7 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 	 * to the client below like any ordinary scroll */
 	if (CONFIG_WHEEL_DEBOUNCE_ENABLED && tl != NULL &&
 			server->right_button_held &&
+			!pointer_constraint_active(server) &&
 			event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL &&
 			event->delta_discrete != 0) {
 		/* while holding the right mouse button over a window:
@@ -1700,11 +1761,255 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 		event->relative_direction);
 }
 
+/* ------------------------------------------------------------------ */
+/* pointer constraints (lock / confine) + relative pointer             */
+/* ------------------------------------------------------------------ */
+
+/* A client that needs captured mouse input (QEMU's grab, a game's
+ * mouselook, a remote-desktop viewer) asks pointer-constraints-v1 to lock
+ * or confine the pointer to one of its surfaces.  At most one constraint is
+ * active - the one on the surface that currently has the pointer focus -
+ * and it is applied to every motion event: a confined pointer is clamped to
+ * the constraint region, a locked pointer does not move the compositor
+ * cursor at all.  In both cases the raw deltas still reach the client
+ * through relative-pointer-v1, which is what actually drives its own
+ * cursor.  (pointer-gestures-v1 is unrelated: it carries touchpad
+ * pinch/swipe/hold events, not mouse capture.) */
+
+/* per-constraint bookkeeping: the client may destroy the constraint at any
+ * time, and the active pointer must then be dropped */
+struct pointer_constraint {
+	struct server *server;
+	struct wlr_pointer_constraint_v1 *constraint;
+	struct wl_listener destroy;
+};
+
+/* stop watching the active constraint surface's commits (safe to call when
+ * nothing is being watched) */
+static void constraint_commit_untrack(struct server *server) {
+	if (server->constraint_commit.link.prev != NULL) {
+		wl_list_remove(&server->constraint_commit.link);
+	}
+}
+
+static void pointer_constraint_destroy(struct wl_listener *listener,
+		void *data) {
+	struct pointer_constraint *pc =
+		wl_container_of(listener, pc, destroy);
+	if (pc->server->active_constraint == pc->constraint) {
+		pc->server->active_constraint = NULL;
+		/* the surface is going away with the constraint: detach the commit
+		 * listener before wlroots asserts the commit signal is empty */
+		constraint_commit_untrack(pc->server);
+	}
+	wl_list_remove(&pc->destroy.link);
+	free(pc);
+}
+
+/* origin (layout coordinates) of a toplevel's surface content, geometry
+ * offset included, so surface-local coordinates map back to the layout */
+static bool toplevel_surface_origin(struct server *server,
+		struct wlr_surface *surface, double *ox, double *oy) {
+	struct toplevel *tl;
+	wl_list_for_each(tl, &server->toplevels, link) {
+		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
+		if (base == NULL || base->surface != surface) {
+			continue;
+		}
+		*ox = tl->scene_tree->node.x - base->geometry.x;
+		*oy = tl->scene_tree->node.y - base->geometry.y;
+		return true;
+	}
+	return false;
+}
+
+/* place the cursor on the constraint's requested hint (a locked pointer may
+ * ask to be warped to a surface-local spot when it is activated) */
+static void pointer_warp_to_hint(struct server *server,
+		struct wlr_pointer_constraint_v1 *constraint) {
+	if (!constraint->current.cursor_hint.enabled ||
+			!(constraint->current.committed &
+				WLR_POINTER_CONSTRAINT_V1_STATE_CURSOR_HINT)) {
+		return;
+	}
+	double ox, oy;
+	if (!toplevel_surface_origin(server, constraint->surface, &ox, &oy)) {
+		return;
+	}
+	double sx = constraint->current.cursor_hint.x;
+	double sy = constraint->current.cursor_hint.y;
+	wlr_cursor_warp(server->cursor, NULL, ox + sx, oy + sy);
+	wlr_seat_pointer_warp(constraint->seat, sx, sy);
+}
+
+/* the client sets the locked pointer's cursor hint as a synced request: it
+ * only reaches `current` on the surface commit that follows the lock, so the
+ * hint has to be re-applied here, not only at activation */
+static void pointer_constraint_commit(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server,
+		constraint_commit);
+	if (server->active_constraint != NULL) {
+		pointer_warp_to_hint(server, server->active_constraint);
+	}
+}
+
+static void constraint_commit_track(struct server *server,
+		struct wlr_surface *surface) {
+	constraint_commit_untrack(server);
+	if (surface != NULL) {
+		server->constraint_commit.notify = pointer_constraint_commit;
+		wl_signal_add(&surface->events.commit, &server->constraint_commit);
+	}
+}
+
+/* A client that just captured the pointer (lock/confine) now owns every
+ * button: a compositor gesture that was in flight would never see its
+ * release - the constraint path consumes it - and would leave the grab state
+ * stuck, so end it.  Presses the compositor already swallowed stay recorded
+ * in bound_buttons / the chord swallow flags, so their releases are still not
+ * delivered to the client as orphans. */
+static void cancel_compositor_gestures(struct server *server) {
+	if (server->moving) {
+		end_move(server);
+	}
+	if (server->resizing) {
+		resize_grab_clear(server);
+	}
+	if (server->chord_active || server->zone_press) {
+		end_chord(server);
+		server->chord_toplevel = NULL;
+	}
+}
+
+/* activate the constraint owned by `surface` (if any) and deactivate the
+ * previous one; called whenever the pointer focus changes */
+static void set_active_constraint(struct server *server,
+		struct wlr_surface *surface) {
+	struct wlr_pointer_constraint_v1 *constraint = NULL;
+	if (surface != NULL && server->pointer_constraints != NULL) {
+		constraint = wlr_pointer_constraints_v1_constraint_for_surface(
+			server->pointer_constraints, surface, server->seat);
+	}
+	if (constraint == server->active_constraint) {
+		return;
+	}
+	struct wlr_pointer_constraint_v1 *old = server->active_constraint;
+	/* the client is about to own the pointer: drop any compositor gesture
+	 * in flight so it cannot leave the grab state stuck */
+	if (constraint != NULL) {
+		cancel_compositor_gestures(server);
+	}
+	/* point at the replacement first: send_deactivated() may destroy the
+	 * old constraint, and its destroy handler must not clear the new one */
+	server->active_constraint = constraint;
+	if (old != NULL) {
+		/* the old constraint no longer owns the pointer: stop tracking its
+		 * surface commits before it may be destroyed */
+		constraint_commit_untrack(server);
+		wlr_pointer_constraint_v1_send_deactivated(old);
+	}
+	if (constraint != NULL) {
+		wlr_pointer_constraint_v1_send_activated(constraint);
+		constraint_commit_track(server, constraint->surface);
+		pointer_warp_to_hint(server, constraint);
+		/* a captured pointer is drawn by the client: drop the compositor's
+		 * own frame cursor right away */
+		update_cursor_style(server);
+	}
+}
+
+/* is a constraint (lock/confine) active on the surface that has the pointer
+ * focus?  While it is, the client owns the pointer: no compositor gesture
+ * may intercept its buttons or show its own cursor. */
+bool pointer_constraint_active(struct server *server) {
+	struct wlr_pointer_constraint_v1 *constraint = server->active_constraint;
+	return constraint != NULL &&
+		constraint->surface == server->seat->pointer_state.focused_surface;
+}
+
+void new_pointer_constraint(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server,
+		new_pointer_constraint);
+	struct wlr_pointer_constraint_v1 *constraint = data;
+	struct pointer_constraint *pc = calloc(1, sizeof(*pc));
+	if (pc == NULL) {
+		wlr_log(WLR_ERROR, "failed to allocate pointer constraint tracker");
+		return;
+	}
+	pc->server = server;
+	pc->constraint = constraint;
+	pc->destroy.notify = pointer_constraint_destroy;
+	wl_signal_add(&constraint->events.destroy, &pc->destroy);
+
+	/* a client (QEMU on a click into the VM) locks the pointer while its
+	 * surface already has the focus: activate the constraint right away */
+	if (constraint->surface ==
+			server->seat->pointer_state.focused_surface) {
+		set_active_constraint(server, constraint->surface);
+	}
+}
+
+void pointer_focus_change(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server,
+		pointer_focus_change);
+	struct wlr_seat_pointer_focus_change_event *event = data;
+	set_active_constraint(server, event->new_surface);
+}
+
+/* raw deltas for relative-pointer clients (QEMU's relative mouse mode); sent
+ * on every motion, locked or not - the compositor cursor may not move, but
+ * the client's own cursor must */
+static void pointer_send_relative_motion(struct server *server,
+		uint32_t time_msec, double dx, double dy,
+		double dx_unaccel, double dy_unaccel) {
+	if (server->relative_pointer_manager == NULL) {
+		return;
+	}
+	wlr_relative_pointer_manager_v1_send_relative_motion(
+		server->relative_pointer_manager, server->seat,
+		(uint64_t)time_msec * 1000, dx, dy, dx_unaccel, dy_unaccel);
+}
+
+/* adjust a pending relative motion for the active constraint.  Returns false
+ * when the cursor must not move at all (locked pointer). */
+static bool pointer_constraint_apply(struct server *server,
+		double *dx, double *dy) {
+	struct wlr_pointer_constraint_v1 *constraint = server->active_constraint;
+	if (constraint == NULL ||
+			constraint->surface !=
+				server->seat->pointer_state.focused_surface) {
+		return true;
+	}
+	if (constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
+		return false;
+	}
+	/* confined: clamp the destination so the cursor stays inside the
+	 * surface-local region.  The seat stores the cursor's current
+	 * surface-local position, which is valid for any surface kind (toplevel,
+	 * popup, layer surface) without reconstructing a scene origin. */
+	double sx = server->seat->pointer_state.sx;
+	double sy = server->seat->pointer_state.sy;
+	double cx, cy;
+	if (!wlr_region_confine(&constraint->region, sx, sy,
+			sx + *dx, sy + *dy, &cx, &cy)) {
+		return true; /* cursor not inside the region: leave it alone */
+	}
+	*dx = cx - sx;
+	*dy = cy - sy;
+	return true;
+}
+
 void cursor_motion(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server, cursor_motion);
 	struct wlr_pointer_motion_event *event = data;
-	wlr_cursor_move(server->cursor, &event->pointer->base,
-		event->delta_x, event->delta_y);
+	double dx = event->delta_x;
+	double dy = event->delta_y;
+	pointer_send_relative_motion(server, event->time_msec, dx, dy,
+		event->unaccel_dx, event->unaccel_dy);
+	if (!pointer_constraint_apply(server, &dx, &dy)) {
+		return; /* locked pointer: the compositor cursor stays put */
+	}
+	wlr_cursor_move(server->cursor, &event->pointer->base, dx, dy);
 	process_cursor_motion(server, event->time_msec);
 }
 
@@ -1712,8 +2017,22 @@ void cursor_motion_absolute(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		cursor_motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
-	wlr_cursor_warp_absolute(server->cursor, &event->pointer->base,
-		event->x, event->y);
+	/* an absolute device carries no delta; derive one so relative-pointer
+	 * clients still get motion, then let the constraint decide where the
+	 * cursor may land */
+	double lx, ly;
+	wlr_cursor_absolute_to_layout_coords(server->cursor,
+		&event->pointer->base, event->x, event->y, &lx, &ly);
+	double dx = lx - server->cursor->x;
+	double dy = ly - server->cursor->y;
+	pointer_send_relative_motion(server, event->time_msec, dx, dy, dx, dy);
+	if (!pointer_constraint_apply(server, &dx, &dy)) {
+		return; /* locked pointer: the compositor cursor stays put */
+	}
+	/* clamp like wlr_cursor_warp_absolute() did: wlr_cursor_warp() would
+	 * silently drop a point that rounds just outside the device mapping */
+	wlr_cursor_warp_closest(server->cursor, &event->pointer->base,
+		server->cursor->x + dx, server->cursor->y + dy);
 	process_cursor_motion(server, event->time_msec);
 }
 

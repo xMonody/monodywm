@@ -46,7 +46,7 @@
 #define CONFIG_LONG_PRESS_NS (350 * 1000000L) /* holding the strip this long grabs the window (ns) */
 #define CONFIG_DRAG_THRESHOLD 4.0         /* 判断是否移动窗口 */
 
-#define CONFIG_WHEEL_DEBOUNCE_ENABLED true /* 控制是否启用骚鼠标 */
+#define CONFIG_WHEEL_DEBOUNCE_ENABLED false /* 控制是否启用骚鼠标 */
 #define CONFIG_WHEEL_BURST_NS (800 * 1000000L)   /* one continuous scroll: max length = one action (0.8 s) */
 #define CONFIG_WHEEL_TICK_GAP_NS (300 * 1000000L) /* two ticks this far apart = next action (0.3 s) */
 

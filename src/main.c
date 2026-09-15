@@ -43,7 +43,9 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_presentation_time.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_shm.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
@@ -368,6 +370,24 @@ int main(int argc, char *argv[]) {
 	server.cursor_shape_manager =
 		wlr_cursor_shape_manager_v1_create(server.display, 1);
 
+	/* pointer-constraints-v1 + relative-pointer-v1: clients such as QEMU
+	 * (captured mouse) and games lock or confine the pointer to one of
+	 * their surfaces and read the raw relative deltas while it is locked.
+	 * wlroots implements both server-side; pointer.c drives the constraint
+	 * activation and the delta handling, here only the globals are
+	 * registered. */
+	server.pointer_constraints =
+		wlr_pointer_constraints_v1_create(server.display);
+	if (server.pointer_constraints == NULL) {
+		wlr_log(WLR_ERROR,
+			"failed to create pointer-constraints-v1 global");
+	}
+	server.relative_pointer_manager =
+		wlr_relative_pointer_manager_v1_create(server.display);
+	if (server.relative_pointer_manager == NULL) {
+		wlr_log(WLR_ERROR, "failed to create relative-pointer-v1 global");
+	}
+
 	/* xdg-activation-v1: clients can request focus through an activation
 	 * token; the compositor focuses the matching toplevel on request */
 	server.activation = wlr_xdg_activation_v1_create(server.display);
@@ -428,6 +448,14 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.cursor->events.axis, &server.cursor_axis);
 	server.cursor_frame.notify = cursor_frame;
 	wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
+	if (server.pointer_constraints != NULL) {
+		server.new_pointer_constraint.notify = new_pointer_constraint;
+		wl_signal_add(&server.pointer_constraints->events.new_constraint,
+			&server.new_pointer_constraint);
+	}
+	server.pointer_focus_change.notify = pointer_focus_change;
+	wl_signal_add(&server.seat->pointer_state.events.focus_change,
+		&server.pointer_focus_change);
 
 	server.seat_request_set_cursor.notify = seat_request_set_cursor;
 	wl_signal_add(&server.seat->events.request_set_cursor, &server.seat_request_set_cursor);
@@ -532,6 +560,16 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.cursor_button.link);
 	wl_list_remove(&server.cursor_axis.link);
 	wl_list_remove(&server.cursor_frame.link);
+	if (server.pointer_constraints != NULL) {
+		wl_list_remove(&server.new_pointer_constraint.link);
+	}
+	wl_list_remove(&server.pointer_focus_change.link);
+	/* the per-surface commit listener is normally dropped by the constraint
+	 * destroy handler; detach it here too so teardown never trips wlroots'
+	 * empty-surface-signal assert */
+	if (server.constraint_commit.link.prev != NULL) {
+		wl_list_remove(&server.constraint_commit.link);
+	}
 	wl_list_remove(&server.seat_request_set_cursor.link);
 	wl_list_remove(&server.cursor_shape_set_shape.link);
 	if (server.activation != NULL) {

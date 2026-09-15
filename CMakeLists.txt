@@ -91,6 +91,8 @@ set(PROTOCOLS
 	linux-drm-syncobj-v1
 	ext-data-control-v1
 	wlr-data-control-unstable-v1
+	pointer-constraints-unstable-v1
+	relative-pointer-unstable-v1
 	wlr-screencopy-unstable-v1
 )
 

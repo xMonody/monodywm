@@ -25,6 +25,8 @@
 #include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_foreign_toplevel_management_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_input_method_v2.h>
@@ -373,6 +375,21 @@ struct server {
 	/* wlr-data-control-unstable-v1: legacy clipboard-control protocol still
 	 * bound by CopyQ and older clipboard tools instead of the ext- one. */
 	struct wlr_data_control_manager_v1 *data_control_manager;
+
+	/* pointer-constraints-v1 + relative-pointer-v1: a client (QEMU/GTK for
+	 * captured mouse input, games for mouselook) locks or confines the
+	 * pointer to its surface; relative-pointer delivers the raw deltas so a
+	 * locked pointer still moves the client's own cursor.  Only one
+	 * constraint is active at a time - the one on the pointer-focused
+	 * surface. */
+	struct wlr_pointer_constraints_v1 *pointer_constraints;
+	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
+	struct wl_listener new_pointer_constraint;
+	struct wl_listener pointer_focus_change;
+	/* watches the active constraint surface's commits: the cursor hint is
+	 * only moved into `current` on the commit after the lock request */
+	struct wl_listener constraint_commit;
+	struct wlr_pointer_constraint_v1 *active_constraint;
 
 
 	struct wl_list toplevels;      /* struct toplevel.link */
@@ -742,6 +759,9 @@ void cursor_motion(struct wl_listener *listener, void *data);
 void cursor_motion_absolute(struct wl_listener *listener, void *data);
 void cursor_button(struct wl_listener *listener, void *data);
 void cursor_axis(struct wl_listener *listener, void *data);
+void new_pointer_constraint(struct wl_listener *listener, void *data);
+void pointer_focus_change(struct wl_listener *listener, void *data);
+bool pointer_constraint_active(struct server *server);
 void cursor_frame(struct wl_listener *listener, void *data);
 
 #endif /* XMONODYWM_SERVER_H */

@@ -1255,7 +1255,7 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener,
 	if (tl->minimized || server->resizing || server->moving ||
 			tl->xdg_toplevel->base == NULL ||
 			!tl->xdg_toplevel->base->surface->mapped ||
-			tl->xdg_toplevel->current.maximized) {
+			tl->xdg_toplevel->current.maximized || tl->fullscreen) {
 		return;
 	}
 	/* a client-side-decorated client (e.g. Chromium) asks the compositor to
