@@ -23,6 +23,8 @@
 
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
+#include <wlr/types/wlr_data_control_v1.h>
+#include <wlr/types/wlr_ext_data_control_v1.h>
 #include <wlr/types/wlr_foreign_toplevel_management_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_input_method_v2.h>
@@ -362,6 +364,15 @@ struct server {
 	 * scale, no client-side guessing); handled like wl_pointer.set_cursor */
 	struct wlr_cursor_shape_manager_v1 *cursor_shape_manager;
 	struct wl_listener cursor_shape_set_shape;
+
+	/* ext-data-control-v1: privileged selection/clipboard control for tools
+	 * like wl-clipboard (wl-copy/wl-paste) and clipboard managers, which is
+	 * how terminal editors such as vim reach the Wayland clipboard. */
+	struct wlr_ext_data_control_manager_v1 *ext_data_control_manager;
+
+	/* wlr-data-control-unstable-v1: legacy clipboard-control protocol still
+	 * bound by CopyQ and older clipboard tools instead of the ext- one. */
+	struct wlr_data_control_manager_v1 *data_control_manager;
 
 
 	struct wl_list toplevels;      /* struct toplevel.link */

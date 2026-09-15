@@ -39,7 +39,9 @@
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_ext_data_control_v1.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_screencopy_v1.h>
@@ -317,6 +319,26 @@ int main(int argc, char *argv[]) {
 		wlr_linux_dmabuf_v1_create_with_renderer(server.display, 5, server.renderer);
 	}
 	wlr_data_device_manager_create(server.display);
+	/* ext-data-control-v1: privileged clipboard/selection control for tools
+	 * such as wl-clipboard (wl-copy/wl-paste) and clipboard managers, which
+	 * is how editors like vim reach the Wayland clipboard.  wlroots
+	 * implements the protocol server-side and bridges it to the seat
+	 * selection/primary-selection, so registering the global is enough. */
+	server.ext_data_control_manager =
+		wlr_ext_data_control_manager_v1_create(server.display, 1);
+	if (server.ext_data_control_manager == NULL) {
+		wlr_log(WLR_ERROR, "failed to create ext-data-control-v1 global");
+	}
+	/* wlr-data-control-unstable-v1: the legacy wlroots clipboard-control
+	 * protocol.  CopyQ (and older wl-clipboard/detached clipboard managers)
+	 * still bind only this one, not ext-data-control-v1, so it has to stay
+	 * advertised for them to reach the clipboard.  Implemented server-side
+	 * by wlroots like the ext- variant. */
+	server.data_control_manager =
+		wlr_data_control_manager_v1_create(server.display);
+	if (server.data_control_manager == NULL) {
+		wlr_log(WLR_ERROR, "failed to create wlr-data-control-v1 global");
+	}
 	struct wlr_xdg_shell *xdg_shell =
 		wlr_xdg_shell_create(server.display, 6);
 	wlr_viewporter_create(server.display);

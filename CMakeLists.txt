@@ -89,6 +89,8 @@ set(PROTOCOLS
 	xdg-activation-v1
 	wp_fractional_scale_v1=fractional-scale
 	linux-drm-syncobj-v1
+	ext-data-control-v1
+	wlr-data-control-unstable-v1
 	wlr-screencopy-unstable-v1
 )
 
