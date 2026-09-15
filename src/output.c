@@ -31,6 +31,13 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	struct monitor *mon = wl_container_of(listener, mon, frame);
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	/* advance every running window animation to this frame's own instant
+	 * before the scene samples it: each rendered frame shows exactly the
+	 * eased state for its vblank (see animate.c - no update-timer/vblank
+	 * beat, high-refresh outputs interpolate more states) */
+	anim_frame_tick(mon->server,
+		(uint32_t)now.tv_sec * 1000u +
+		(uint32_t)(now.tv_nsec / 1000000u));
 	/* render any dirty offscreen rounded-corner FBOs before the scene
 	 * samples them */
 	rounded_render_all(mon->server);

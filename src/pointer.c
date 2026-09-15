@@ -241,7 +241,7 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 			 * the drag threshold: the window stays maximized, nothing moves */
 			return;
 		}
-		restore_maximized_toplevel(tl);
+		restore_maximized_toplevel(tl, false); /* drag: grab owns the geometry */
 		/* re-anchor the grab by mapping the press point's offset inside
 		 * the maximized box proportionally into the restored box: the
 		 * cursor keeps gripping the same window-internal spot it pressed.
@@ -296,7 +296,7 @@ static void begin_zone_drag(struct server *server) {
 		 * previous geometry and clamp the grab point into the restored
 		 * window, so the cursor grips its title bar and the window
 		 * follows (Windows behavior) */
-		restore_maximized_toplevel(tl);
+		restore_maximized_toplevel(tl, false); /* drag: grab owns the geometry */
 		struct wlr_box rb = tl->restore_box;
 		/* restore_maximized_toplevel clamps the restored position into
 		 * the work area, so grip the cursor on the window's actual box,
@@ -568,13 +568,13 @@ static void clear_cursor_override(struct server *server) {
  * reachable the same way, so the whole colored strip is draggable. */
 static struct toplevel *toplevel_nearby(struct server *server) {
 	struct toplevel *tl = toplevel_at(server);
-	if (tl != NULL && !tl->minimized) {
+	if (tl != NULL && !tl->minimized && !tl->closing) {
 		return tl;
 	}
 	struct toplevel *candidate;
 	wl_list_for_each(candidate, &server->toplevels, link) {
 		if (toplevel_resize_edges(server, candidate) != 0 ||
-				(!candidate->minimized &&
+				(!candidate->minimized && !candidate->closing &&
 				 is_in_titlebar_zone(server, candidate))) {
 			return candidate;
 		}
@@ -591,7 +591,7 @@ static struct toplevel *toplevel_nearby(struct server *server) {
  * cursor leaves the edge. */
 static bool cursor_in_cursor_band(struct server *server,
 		struct toplevel *tl) {
-	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
+	if (tl->closing || tl->minimized || tl->xdg_toplevel->base == NULL ||
 			tl->decoration_mode ==
 				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
 			tl->xdg_toplevel->current.maximized ||
@@ -628,7 +628,7 @@ bool pointer_over_frame_zone(struct server *server) {
 		return false;
 	}
 	struct toplevel *tl = toplevel_at(server);
-	if (tl != NULL && !tl->minimized) {
+	if (tl != NULL && !tl->minimized && !tl->closing) {
 		return cursor_in_cursor_band(server, tl) ||
 			is_in_titlebar_zone(server, tl);
 	}
@@ -969,7 +969,7 @@ static void begin_chord_move(struct server *server) {
 	double ref_x = server->press_x;
 	double ref_y = server->press_y;
 	if (tl->xdg_toplevel->current.maximized) {
-		restore_maximized_toplevel(tl);
+		restore_maximized_toplevel(tl, false); /* drag: grab owns the geometry */
 		struct wlr_box rb = tl->restore_box;
 		/* restore_maximized_toplevel clamps the restored position into the
 		 * work area, so grip the cursor on the window's actual box */
@@ -1065,7 +1065,7 @@ static void chord_double_click(struct server *server, uint32_t chord_button) {
 		/* the held button is the right one */
 		focus_toplevel(server, tl);
 		if (tl->xdg_toplevel->current.maximized) {
-			restore_maximized_toplevel(tl);
+			restore_maximized_toplevel(tl, true);
 		} else {
 			set_maximized(server, tl, true);
 		}
@@ -1265,40 +1265,85 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 
 	/* normal path: forward pointer motion to the surface under the cursor */
 	double sx, sy;
-	struct wlr_scene_node *node = wlr_scene_node_at(
-		&server->scene->tree.node, server->cursor->x, server->cursor->y,
-		&sx, &sy);
 	struct wlr_surface *surface = NULL;
-	if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
-		struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
-		struct wlr_scene_surface *scene_surface =
-			wlr_scene_surface_try_from_buffer(buffer);
-		if (scene_surface != NULL) {
-			surface = scene_surface->surface;
+	/* While a window morphs (animate.c: maximize/restore zoom, or the
+	 * scale part of an open/close fade) its visible content is the rounded
+	 * FBO scaled into the morph box, but the scene only ever hit-tests the
+	 * raw client surface at its natural geometry.  A cursor over the
+	 * morphing window's visible area that the scene attributes to a window
+	 * below (restore / shrink zoom) must reach the morphing window
+	 * instead, with coordinates mapped through the morph scale.  Popups
+	 * and layer-shell surfaces float above the windows and always win.
+	 * The extra hit tests only run while some window actually morphs. */
+	struct toplevel *morph_tl = NULL;
+	bool any_morph = false;
+	{
+		struct toplevel *t;
+		wl_list_for_each(t, &server->toplevels, link) {
+			if (t->morph_active) {
+				any_morph = true;
+				break;
+			}
+		}
+	}
+	if (any_morph && !pointer_over_popup(server) &&
+			!pointer_over_layer_surface(server)) {
+		morph_tl = toplevel_morph_at(server, server->cursor->x,
+			server->cursor->y);
+	}
+	if (morph_tl != NULL && morph_tl->xdg_toplevel != NULL &&
+			morph_tl->xdg_toplevel->base != NULL) {
+		struct wlr_box box;
+		toplevel_box(morph_tl, &box);
+		surface = morph_tl->xdg_toplevel->base->surface;
+		if (morph_tl->morph_w > 0 && morph_tl->morph_h > 0 &&
+				box.width > 0 && box.height > 0) {
+			/* map the cursor (inside the morph box) through the morph
+			 * scale onto the content's natural geometry */
+			sx = (server->cursor->x - morph_tl->morph_x) *
+				(double)box.width / (double)morph_tl->morph_w;
+			sy = (server->cursor->y - morph_tl->morph_y) *
+				(double)box.height / (double)morph_tl->morph_h;
 		} else {
-			/* the hit buffer is the compositor's rounded-corner masked
-			 * content re-render (mask.c): resolve the xdg surface via the
-			 * scene tag on its tree */
-			struct wlr_scene_node *n = node;
-			while (n != NULL) {
-				if (n->data != NULL) {
-					struct scene_tag *tag = n->data;
-					if (tag->type == TAG_POPUP) {
-						/* a rounded popup (Qt menu): the hit buffer is its
-						 * masked re-render; resolve the popup surface */
-						struct wlr_xdg_popup *popup = tag->ptr;
-						if (popup != NULL && popup->base != NULL) {
-							surface = popup->base->surface;
+			sx = 0.0;
+			sy = 0.0;
+		}
+	} else {
+		struct wlr_scene_node *node = wlr_scene_node_at(
+			&server->scene->tree.node, server->cursor->x, server->cursor->y,
+			&sx, &sy);
+		if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
+			struct wlr_scene_buffer *buffer =
+				wlr_scene_buffer_from_node(node);
+			struct wlr_scene_surface *scene_surface =
+				wlr_scene_surface_try_from_buffer(buffer);
+			if (scene_surface != NULL) {
+				surface = scene_surface->surface;
+			} else {
+				/* the hit buffer is the compositor's rounded-corner masked
+				 * content re-render: resolve the xdg surface via the scene
+				 * tag on its tree */
+				struct wlr_scene_node *n = node;
+				while (n != NULL) {
+					if (n->data != NULL) {
+						struct scene_tag *tag = n->data;
+						if (tag->type == TAG_POPUP) {
+							/* a rounded popup (Qt menu): the hit buffer is its
+							 * masked re-render; resolve the popup surface */
+							struct wlr_xdg_popup *popup = tag->ptr;
+							if (popup != NULL && popup->base != NULL) {
+								surface = popup->base->surface;
+							}
+						} else if (tag->type == TAG_TOPLEVEL) {
+							struct toplevel *tl = tag->ptr;
+							if (tl->xdg_toplevel->base != NULL) {
+								surface = tl->xdg_toplevel->base->surface;
+							}
 						}
-					} else if (tag->type == TAG_TOPLEVEL) {
-						struct toplevel *tl = tag->ptr;
-						if (tl->xdg_toplevel->base != NULL) {
-							surface = tl->xdg_toplevel->base->surface;
-						}
+						break; /* a closer tagged object won the hit test */
 					}
-					break; /* a closer tagged object won the hit test */
+					n = n->parent != NULL ? &n->parent->node : NULL;
 				}
-				n = n->parent != NULL ? &n->parent->node : NULL;
 			}
 		}
 	}
@@ -1453,7 +1498,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 					case ZONE_MAXIMIZE:
 						focus_toplevel(server, tl);
 						if (tl->xdg_toplevel->current.maximized) {
-							restore_maximized_toplevel(tl);
+							restore_maximized_toplevel(tl, true);
 						} else {
 							set_maximized(server, tl, true);
 						}
@@ -1596,7 +1641,7 @@ static bool wheel_action_allowed(struct server *server) {
  * window, so scrolling down can restore it */
 static struct toplevel *toplevel_at_or_minimized(struct server *server) {
 	struct toplevel *tl = toplevel_at(server);
-	if (tl != NULL && !tl->minimized) {
+	if (tl != NULL && !tl->minimized && !tl->closing) {
 		return tl;
 	}
 	struct toplevel *candidate;
@@ -1638,7 +1683,7 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 		if (event->delta_discrete < 0) {
 			if (tl->xdg_toplevel->current.maximized) {
 				/* already maximized: restore the saved geometry */
-				restore_maximized_toplevel(tl);
+				restore_maximized_toplevel(tl, true);
 			} else {
 				set_maximized(server, tl, true);
 			}

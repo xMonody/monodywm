@@ -421,7 +421,7 @@ static bool keyboard_shortcut(struct server *server,
 				if (server->focused != NULL) {
 					if (server->focused->xdg_toplevel->current.maximized) {
 						/* toggle: restore the size/position saved before maximizing */
-						restore_maximized_toplevel(server->focused);
+						restore_maximized_toplevel(server->focused, true);
 					} else {
 						set_maximized(server, server->focused, true);
 					}

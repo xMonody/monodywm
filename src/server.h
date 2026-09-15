@@ -68,6 +68,7 @@ struct ipc_client;     /* defined in ipc.c */
 struct wlr_swapchain;  /* defined in wlr/render/swapchain.h */
 struct server;
 struct toplevel;
+struct toplevel_anim;  /* defined in animate.c */
 struct layer_surface;
 struct rounded_cache;  /* defined in rounded.c */
 
@@ -181,7 +182,38 @@ struct toplevel {
 	bool decoration_configured;
 
 	bool minimized;
+	/* a close was requested and the close-fade (animate.c) owns the
+	 * wlr_xdg_toplevel close request, which it sends once the window is
+	 * invisible.  The window is inert until it actually goes away: not
+	 * focusable, not raisable, excluded from the window cycle, and
+	 * minimize/maximize are refused.  When the fade finishes, its scene
+	 * node is disabled, so a client that never honors the close request
+	 * cannot leave an invisible, input-blocking window behind.  Cleared
+	 * only when the surface is destroyed (a remap while closing is
+	 * re-closed, never re-shown). */
+	bool closing;
 	bool positioned; /* initial position has been assigned */
+
+	/* per-window animation state (animate.c): map fade-in, minimize /
+	 * restore vertical drop, close fade-out, maximize/restore zoom.
+	 * NULL while the window has never been animated; the state is freed
+	 * when the window's scene tree is destroyed. */
+	struct toplevel_anim *anim;
+
+	/* Windows-style maximize/restore zoom (animate.c).  While morph_active
+	 * is set, the rounded FBO is published scaled into the morph box
+	 * instead of its natural geometry (rounded.c) and toplevel.c anchors
+	 * the scene tree at the morph box origin.  Cleared when the zoom ends
+	 * or is cancelled. */
+	bool morph_active;
+	int morph_x, morph_y, morph_w, morph_h;
+
+	/* set while the map handler applies the client's initial state (an
+	 * app that starts maximized): animate_toplevel_geometry reads and
+	 * clears it so the first maximize is applied instantly, only later
+	 * user maximize/restore actions get the zoom */
+	bool skip_geom;
+
 	/* auto-centering (place.c): a fresh window is re-centered whenever its
 	 * surface size changes, until the user interacts with it (move /
 	 * resize / maximize / fullscreen set user_moved and stop it).  Electron
@@ -420,6 +452,13 @@ struct server {
 	bool resize_final_pending;    /* outline mode: waiting for the final commit */
 	struct wl_event_source *resize_final_timer; /* outline mode: watchdog if the client never commits */
 
+	/* animate.c: server-wide pacing watchdog, armed while any window
+	 * animation runs (the animation state itself is advanced per rendered
+	 * frame in output.c's frame handler, vsync-locked - this timer only
+	 * keeps frames flowing where scene damage cannot and enforces
+	 * wall-clock timeouts).  Lazily created, disarmed when idle. */
+	struct wl_event_source *anim_timer;
+
 	/* current compositor-driven cursor name, NULL when the client's cursor
 	 * is shown (used to avoid redundant updates) */
 	const char *cursor_override;
@@ -473,6 +512,13 @@ void xdg_surface_tag(struct wlr_scene_tree *tree, enum scene_tag_type type,
 	void *ptr);
 void *scene_tag_at(struct server *server, enum scene_tag_type type,
 	double lx, double ly);
+/* the toplevel *drawn* under (lx, ly): while a window morphs (animate.c)
+ * its visible content is the rounded FBO scaled into the morph box, which
+ * the scene's raw hit test cannot see, so a cursor over the morph box
+ * resolves to the morphing window even where its raw client surface has
+ * not grown into it yet (restore/shrink zoom); see scene.c */
+struct toplevel *toplevel_morph_at(struct server *server, double lx,
+	double ly);
 struct toplevel *toplevel_at(struct server *server);
 /* the cursor is over a popup surface (menu / dropdown / tooltip): the popup
  * wins the pointer over the compositor frame (resize edges, title strip) */
@@ -500,7 +546,7 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 	bool fullscreen);
 void set_maximized(struct server *server, struct toplevel *tl,
 	bool maximized);
-void restore_maximized_toplevel(struct toplevel *tl);
+void restore_maximized_toplevel(struct toplevel *tl, bool animate);
 void set_minimized(struct server *server, struct toplevel *tl,
 	bool minimized);
 void focus_toplevel(struct server *server, struct toplevel *tl);
@@ -526,6 +572,16 @@ void rounded_cache_content_commit(struct toplevel *tl);
 void rounded_cache_subsurface_commit(struct toplevel *tl,
 	struct toplevel_subsurface *ts);
 void rounded_cache_hide_content(struct toplevel *tl);
+/* fade a whole window (animate.c): normally only the rounded FBO node is
+ * visible (the raw client content is hidden at opacity 0), so it animates
+ * that node; before the first FBO publish / with rounded corners disabled
+ * every scene buffer under the window tree is faded instead */
+void rounded_window_set_opacity(struct toplevel *tl, float opacity);
+/* maximize/restore zoom & open/close scale support (animate.c): */
+/* maximize/restore zoom support (animate.c): */
+bool rounded_morph_supported(struct toplevel *tl); /* FBO visible & scalable */
+bool rounded_cache_size_ready(struct toplevel *tl, int width, int height);
+void rounded_cache_morph_apply(struct toplevel *tl);
 void rounded_render_all(struct server *server);
 
 /* ---- border.c: window border width and focus-dependent color ---- */
@@ -547,6 +603,48 @@ int shadow_padding(void);
 /* ---- place.c: initial window placement ----
  * size fully client-driven, position centered on the output (screen) */
 bool place_toplevel(struct server *server, struct toplevel *tl);
+
+/* ---- animate.c: window animations ----
+ *
+ * Each entry point returns true when an animation was started.  When it
+ * returns false the caller must apply the state change instantly (old,
+ * animation-less behavior):
+ *
+ *   animate_toplevel_minimize: fall vertically from the current position
+ *     until below the bottom edge of the output, then hide the scene node
+ *     (caller has already set tl->minimized and moved focus away);
+ *   animate_toplevel_restore:   the hidden window drops back in from above
+ *     its own top edge and lands exactly where it was;
+ *   animate_toplevel_fade_in:   new window fades in from opacity 0;
+ *   animate_toplevel_close:     fade out, then send the xdg close once the
+ *     window is invisible (returns true while the fade runs; the caller
+ *     must not send the close itself);
+ *   animate_toplevel_cancel:    stop the running animation and bring the
+ *     window back to a clean visible/hidden state (used when the window
+ *     unmaps before an animation finished). */
+bool animate_toplevel_minimize(struct server *server, struct toplevel *tl);
+bool animate_toplevel_restore(struct server *server, struct toplevel *tl);
+bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl);
+bool animate_toplevel_close(struct toplevel *tl);
+/* Windows-style maximize/restore zoom.  `from` is the box the window is
+ * shown in now, `to` the target box; the caller has already sent the final
+ * size configure and must NOT move the scene node itself - the zoom scales
+ * the window between the two boxes and leaves the node at `to`'s origin.
+ * Returns false when the zoom cannot run (caller applies `to` instantly). */
+bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
+	const struct wlr_box *from, const struct wlr_box *to);
+/* stop an in-flight maximize/restore zoom and land the window on its zoom
+ * target (used by toplevel.c when a new maximize/restore request replaces
+ * the running one, e.g. rapid toggling or clients re-asserting the state
+ * before the first configure is acked) */
+void animate_toplevel_abort_geometry(struct toplevel *tl);
+void animate_toplevel_cancel(struct toplevel *tl);
+/* advance every running window animation to the given CLOCK_MONOTONIC
+ * instant; called by each output's frame handler right before the scene
+ * is rendered (output.c), so every rendered frame shows the eased state
+ * of its own vblank (no beat between a fixed timer and the display
+ * refresh; high-refresh outputs interpolate proportionally more states) */
+void anim_frame_tick(struct server *server, uint32_t now_ms);
 
 /* ---- layer.c: wlr-layer-shell + work area ---- */
 void get_work_area(struct server *server, struct wlr_output *output,

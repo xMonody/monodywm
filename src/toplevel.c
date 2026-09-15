@@ -177,6 +177,63 @@ static void clamp_to_work_area(struct server *server, int *x, int *y,
 	}
 }
 
+/* restore a maximized/fullscreen window to its saved spot, Windows style:
+ * the position is restored exactly - including when it hangs partly off
+ * the screen, which the user placed there deliberately.  Only two safety
+ * nets apply, and neither moves a merely half-off-screen window:
+ *   - a spot completely outside every output is unreachable, so the
+ *     window is brought back into the work area;
+ *   - a layer-shell bar that appeared while the window was zoomed (its
+ *     exclusive zone shrank the work area) must not occlude the window:
+ *     it is nudged out of the bar strip on that side only. */
+static void restore_box_position(struct server *server,
+		const struct wlr_box *box, int *x, int *y) {
+	*x = box->x;
+	*y = box->y;
+	if (box->width <= 0 || box->height <= 0) {
+		return;
+	}
+	struct wlr_output *output = wlr_output_layout_output_at(
+		server->output_layout, box->x + box->width / 2,
+		box->y + box->height / 2);
+	if (output == NULL) {
+		output = wlr_output_layout_get_center_output(server->output_layout);
+	}
+	if (output == NULL) {
+		return;
+	}
+	struct wlr_box out;
+	wlr_output_layout_get_box(server->output_layout, output, &out);
+	struct wlr_box area;
+	get_work_area(server, output, &area);
+
+	/* fully outside every output: pull the top-left into the work area */
+	struct wlr_box b = { *x, *y, box->width, box->height };
+	struct wlr_box inter;
+	if (!wlr_box_intersection(&inter, &b, &out)) {
+		*x = area.x;
+		*y = area.y;
+		return;
+	}
+
+	/* nudge out from under a bar that now exists on that side (a window
+	 * drag already refuses to slide a window under the bars) */
+	if (area.y > out.y && *y < area.y) { /* top bar */
+		*y = area.y;
+	}
+	if (area.x > out.x && *x < area.x) { /* left bar */
+		*x = area.x;
+	}
+	if (area.x + area.width < out.x + out.width &&
+			*x + box->width > area.x + area.width) { /* right bar */
+		*x = area.x + area.width - box->width;
+	}
+	if (area.y + area.height < out.y + out.height &&
+			*y + box->height > area.y + area.height) { /* bottom bar */
+		*y = area.y + area.height - box->height;
+	}
+}
+
 /* geometry of a maximized window: the work area exactly (the window fills
  * the area, flush against any layer-shell bars' exclusive zones) */
 void maximized_box(struct server *server, struct wlr_output *output,
@@ -202,7 +259,7 @@ void arrange_toplevels_work_area(struct server *server,
 	wl_list_for_each(tl, &server->toplevels, link) {
 		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 		if (base == NULL || !base->surface->mapped || tl->minimized ||
-				tl->fullscreen) {
+				tl->closing || tl->fullscreen) {
 			/* fullscreen windows deliberately cover the whole output,
 			 * bars included */
 			continue;
@@ -254,6 +311,7 @@ struct toplevel *neighbor_toplevel(struct server *server,
 		struct toplevel *candidate = wl_container_of(iter, candidate, link);
 		if (candidate->xdg_toplevel->base != NULL &&
 				candidate->xdg_toplevel->base->surface->mapped &&
+				!candidate->closing &&
 				(include_minimized || !candidate->minimized)) {
 			return candidate;
 		}
@@ -315,16 +373,62 @@ static struct toplevel *focus_fallback(struct server *server,
 /* ------------------------------------------------------------------ */
 
 void close_toplevel(struct toplevel *tl) {
-	if (tl->xdg_toplevel->base != NULL) {
-		wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
+	if (tl->xdg_toplevel->base == NULL) {
+		return;
 	}
+	if (tl->closing) {
+		return; /* a close is already pending; the fade owns the request */
+	}
+	if (animate_toplevel_close(tl)) {
+		/* the fade-out is running and sends the close request once the
+		 * window is invisible (animate.c).  The close is now sticky: the
+		 * window turns inert until it actually goes away - it cannot be
+		 * re-focused, minimized, maximized or restored, so no later user
+		 * action can silently cancel the close - and once the fade
+		 * finishes, animate.c disables its scene node, so an uncooperative
+		 * client can never leave an invisible, input-blocking window. */
+		struct server *server = tl->server;
+		tl->closing = true;
+		if (server->focused == tl) {
+			/* hand keyboard focus to the window that would receive it when
+			 * this one dies, right away (like a minimize does): input must
+			 * never keep targeting a window that is fading away */
+			struct toplevel *prev = focus_fallback(server, tl);
+			server->focused = NULL;
+			if (tl->xdg_toplevel->base != NULL) {
+				wlr_xdg_toplevel_set_activated(tl->xdg_toplevel, false);
+			}
+			wlr_seat_keyboard_clear_focus(server->seat);
+			if (prev != NULL) {
+				focus_toplevel(server, prev);
+			} else {
+				ipc_send_window_event(server, "window_focus", NULL);
+				ime_set_focus(server, NULL);
+			}
+			/* the fade must stay visible above the newly focused window
+			 * (mirrors the minimize drop, which raises the falling window
+			 * after focus moved on) */
+			if (tl->scene_tree != NULL) {
+				wlr_scene_node_raise_to_top(&tl->scene_tree->node);
+			}
+		}
+		return;
+	}
+	/* no fade ran (animations disabled, or the window is hidden): close
+	 * right away */
+	wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
 }
 
 void set_fullscreen(struct server *server, struct toplevel *tl,
 		bool fullscreen) {
-	if (tl->xdg_toplevel->base == NULL ||
+	if (tl->closing || tl->xdg_toplevel->base == NULL ||
 			tl->xdg_toplevel->current.fullscreen == fullscreen) {
 		return;
+	}
+	if (tl->morph_active) {
+		/* a maximize/restore zoom is running: let fullscreen take over
+		 * cleanly instead of fighting the running zoom */
+		animate_toplevel_abort_geometry(tl);
 	}
 	tl->user_moved = true; /* fullscreen state: stop auto-centering */
 	tl->fullscreen = fullscreen;
@@ -344,8 +448,17 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 			fullscreen_box(server, output, &fbox);
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, fbox.width,
 				fbox.height);
-			wlr_scene_node_set_position(&tl->scene_tree->node, fbox.x,
-				fbox.y);
+			/* Windows-style zoom into the fullscreen box (animate.c):
+			 * keep showing the floating window until the client commits the
+			 * fullscreen content, then scale it up.  Falls back to an
+			 * instant jump when the zoom cannot run. */
+			struct wlr_box from_box;
+			toplevel_box(tl, &from_box);
+			struct wlr_box to_box = { fbox.x, fbox.y, fbox.width, fbox.height };
+			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
+				wlr_scene_node_set_position(&tl->scene_tree->node, fbox.x,
+					fbox.y);
+			}
 		} else {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
 		}
@@ -354,14 +467,24 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 				tl->fullscreen_restore_box.width > 0) {
 			int x = tl->fullscreen_restore_box.x;
 			int y = tl->fullscreen_restore_box.y;
-			/* never restore underneath a layer-shell bar */
-			clamp_to_work_area(server, &x, &y,
-				tl->fullscreen_restore_box.width,
-				tl->fullscreen_restore_box.height);
+			/* back exactly where it was; a bar that appeared meanwhile is
+			 * the only thing that may move it (restore_box_position) */
+			restore_box_position(server, &tl->fullscreen_restore_box,
+				&x, &y);
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel,
 				tl->fullscreen_restore_box.width,
 				tl->fullscreen_restore_box.height);
-			wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+			/* Windows-style zoom back to the floating box (animate.c),
+			 * same as maximize restore: keep the fullscreen window on
+			 * screen until the client commits the restored content, then
+			 * scale it down into place */
+			struct wlr_box from_box;
+			toplevel_box(tl, &from_box);
+			struct wlr_box to_box = { x, y, tl->fullscreen_restore_box.width,
+				tl->fullscreen_restore_box.height };
+			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
+				wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+			}
 		}
 	}
 	wlr_xdg_toplevel_set_fullscreen(tl->xdg_toplevel, fullscreen);
@@ -375,8 +498,15 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 
 void set_maximized(struct server *server, struct toplevel *tl,
 		bool maximized) {
-	if (tl->xdg_toplevel->base == NULL) {
+	if (tl->closing || tl->xdg_toplevel->base == NULL) {
 		return;
+	}
+	if (tl->morph_active) {
+		/* an in-flight maximize/restore zoom owns the scene node: let a
+		 * new maximize/restore request replace it cleanly instead of
+		 * fighting the running zoom (rapid toggling, or clients that
+		 * re-assert set_maximized before the first configure is acked) */
+		animate_toplevel_abort_geometry(tl);
 	}
 	if (tl->fullscreen) {
 		/* while fullscreen, maximize/restore is not available; only
@@ -410,17 +540,27 @@ void set_maximized(struct server *server, struct toplevel *tl,
 	}
 	tl->user_moved = true; /* maximize/restore state: stop auto-centering */
 	if (maximized) {
-		/* remember the floating geometry so dragging the title bar of the
-		 * maximized window can restore it (Windows behavior).  Only capture
-		 * it on the genuine floating -> maximized transition: clients like
-		 * QQ re-assert set_maximized repeatedly (before the first request
-		 * is even acked, when current.maximized is still false), and
-		 * re-saving then would overwrite the floating geometry with the
-		 * already-maximized box. */
-		if (!tl->xdg_toplevel->current.maximized &&
-				!tl->has_restore_box) {
-			toplevel_box(tl, &tl->restore_box);
-			tl->has_restore_box = true;
+		/* remember the floating geometry so restoring returns the window
+		 * exactly to where it was before this maximize (Windows behavior).
+		 * Only capture while the client still reports the window as
+		 * floating (current.maximized false): clients like QQ re-assert
+		 * set_maximized before the first request is acked, and re-saving
+		 * then would overwrite the floating geometry with the
+		 * already-maximized box.  Re-capture whenever the floating box
+		 * changed since the last capture, so a move or resize between two
+		 * maximize/restore cycles never makes the next restore return to
+		 * an old spot or an old size. */
+		if (!tl->xdg_toplevel->current.maximized) {
+			struct wlr_box fbox;
+			toplevel_box(tl, &fbox);
+			if (!tl->has_restore_box ||
+					tl->restore_box.x != fbox.x ||
+					tl->restore_box.y != fbox.y ||
+					tl->restore_box.width != fbox.width ||
+					tl->restore_box.height != fbox.height) {
+				tl->restore_box = fbox;
+				tl->has_restore_box = true;
+			}
 		}
 
 		struct wlr_output *output = toplevel_output(server, tl);
@@ -429,7 +569,17 @@ void set_maximized(struct server *server, struct toplevel *tl,
 			maximized_box(server, output, &box);
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box.width,
 				box.height);
-			wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
+			/* Windows-style zoom into the maximized box (animate.c): keep
+			 * showing the floating window until the client commits the
+			 * maximized content, then scale it up.  Falls back to an
+			 * instant jump when the zoom cannot run. */
+			struct wlr_box from_box;
+			toplevel_box(tl, &from_box);
+			struct wlr_box to_box = { box.x, box.y, box.width, box.height };
+			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
+				wlr_scene_node_set_position(&tl->scene_tree->node, box.x,
+					box.y);
+			}
 		} else {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
 		}
@@ -441,14 +591,22 @@ void set_maximized(struct server *server, struct toplevel *tl,
 		if (tl->has_restore_box && tl->restore_box.width > 0) {
 			int x = tl->restore_box.x;
 			int y = tl->restore_box.y;
-			/* the work area may have shrunk since the window was
-			 * maximized (a bar appeared): clamp the restore into the work
-			 * area so the window never lands back underneath the bar */
-			clamp_to_work_area(server, &x, &y, tl->restore_box.width,
-				tl->restore_box.height);
+			/* restore to the saved spot exactly (even half off-screen);
+			 * only a bar that appeared meanwhile may move it */
+restore_box_position(server, &tl->restore_box, &x, &y);
+
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel,
 				tl->restore_box.width, tl->restore_box.height);
-			wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+			/* Windows-style zoom back to the floating box (animate.c):
+			 * keep the maximized window on screen until the client commits
+			 * the restored content, then scale it down into place */
+			struct wlr_box from_box;
+			toplevel_box(tl, &from_box);
+			struct wlr_box to_box = { x, y, tl->restore_box.width,
+				tl->restore_box.height };
+			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
+				wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+			}
 		} else {
 			/* 0x0 lets the client pick its own size again */
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
@@ -462,22 +620,48 @@ void set_maximized(struct server *server, struct toplevel *tl,
 
 /* un-maximize back to the previously saved geometry (drag of a maximized
  * window's title bar) */
-void restore_maximized_toplevel(struct toplevel *tl) {
-	if (tl->xdg_toplevel->base == NULL ||
+/* un-maximize back to the previously saved geometry (drag of a maximized
+ * window's title bar, keyboard/button toggle).  With `animate` the restore
+ * plays the same Windows-style zoom as maximizing (animate.c) and the
+ * caller must not move the scene node itself afterwards - the zoom leaves
+ * the node at the restored box.  Drag restores pass false: the pointer
+ * grabs the restored window and positions it per motion, so a zoom would
+ * fight the grab. */
+void restore_maximized_toplevel(struct toplevel *tl, bool animate) {
+	if (tl->closing || tl->xdg_toplevel->base == NULL ||
 			!tl->xdg_toplevel->current.maximized || tl->fullscreen) {
 		return;
+	}
+	if (tl->morph_active) {
+		/* an in-flight maximize/restore zoom owns the scene node */
+		animate_toplevel_abort_geometry(tl);
 	}
 	tl->user_moved = true; /* drag-restore: stop auto-centering */
 	if (tl->has_restore_box && tl->restore_box.width > 0) {
 		int x = tl->restore_box.x;
 		int y = tl->restore_box.y;
-		/* the work area may have shrunk since the window was maximized (a
-		 * bar appeared): clamp the restore into the work area so the window
-		 * never lands back underneath the bar */
-		clamp_to_work_area(tl->server, &x, &y, tl->restore_box.width,
-			tl->restore_box.height);
+		/* restore to the saved spot exactly (even half off-screen); only a
+		 * bar that appeared meanwhile may move it */
+		restore_box_position(tl->server, &tl->restore_box, &x, &y);
 		wlr_xdg_toplevel_set_size(tl->xdg_toplevel, tl->restore_box.width,
 			tl->restore_box.height);
+		if (animate) {
+			/* Windows-style zoom back to the floating box, symmetric with
+			 * maximizing (animate.c) */
+			struct wlr_box from_box;
+			toplevel_box(tl, &from_box);
+			struct wlr_box to_box = { x, y, tl->restore_box.width,
+				tl->restore_box.height };
+			if (animate_toplevel_geometry(tl->server, tl, &from_box,
+					&to_box)) {
+				wlr_xdg_toplevel_set_maximized(tl->xdg_toplevel, false);
+				if (tl->fthandle != NULL) {
+					wlr_foreign_toplevel_handle_v1_set_maximized(
+						tl->fthandle, false);
+				}
+				return;
+			}
+		}
 		wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
 	}
 	wlr_xdg_toplevel_set_maximized(tl->xdg_toplevel, false);
@@ -488,6 +672,10 @@ void restore_maximized_toplevel(struct toplevel *tl) {
 
 void set_minimized(struct server *server, struct toplevel *tl,
 		bool minimized) {
+	if (tl->closing) {
+		/* a close is pending: never minimize/restore a dying window */
+		return;
+	}
 	if (toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
 		/* dialogs and fixed-size windows have no minimize button */
 		return;
@@ -495,16 +683,22 @@ void set_minimized(struct server *server, struct toplevel *tl,
 	if (tl->minimized == minimized) {
 		return;
 	}
+	if (tl->morph_active) {
+		/* an in-flight maximize/restore zoom owns the scene node (rapid
+		 * toggles, or clients re-asserting set_maximized before the first
+		 * configure is acked): let the new request replace it */
+		animate_toplevel_abort_geometry(tl);
+	}
 	tl->minimized = minimized;
-	/* minimizing only hides the scene node: the window keeps its position and
-	 * size, so restoring it (focus cycle, foreign-toplevel activate) puts it
-	 * back exactly where it was */
-	wlr_scene_node_set_enabled(&tl->scene_tree->node, !minimized);
 	if (tl->fthandle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_minimized(tl->fthandle, minimized);
 	}
 	if (minimized && server->focused == tl) {
-		/* hand keyboard/cursor focus to the previous visible window */
+		/* hand keyboard/cursor focus to the previous visible window.  The
+		 * window keeps its scene node visible while it falls (animate.c),
+		 * but it is already flagged minimized, so nothing focuses it again
+		 * and restoring it (focus cycle, foreign-toplevel activate) puts
+		 * it back exactly where it was */
 		struct toplevel *prev = neighbor_toplevel(server, tl, false, false);
 		server->focused = NULL;
 		if (tl->xdg_toplevel->base != NULL) {
@@ -517,6 +711,16 @@ void set_minimized(struct server *server, struct toplevel *tl,
 			ipc_send_window_event(server, "window_focus", NULL);
 			ime_set_focus(server, NULL);
 		}
+	}
+	if (minimized) {
+		/* animate the fall; without an animation the node is simply hidden
+		 * (the window keeps its position, so restoring it puts it back
+		 * exactly where it was) */
+		if (!animate_toplevel_minimize(server, tl)) {
+			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
+		}
+	} else if (!animate_toplevel_restore(server, tl)) {
+		wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
 	}
 	/* hiding the window may expose a different surface under the cursor */
 	update_cursor_style(server);
@@ -541,7 +745,7 @@ static void toplevel_raise(struct server *server, struct toplevel *tl) {
 }
 
 void focus_toplevel(struct server *server, struct toplevel *tl) {
-	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
+	if (tl->closing || tl->minimized || tl->xdg_toplevel->base == NULL ||
 			!tl->xdg_toplevel->base->surface->mapped) {
 		return;
 	}
@@ -756,6 +960,18 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, map);
 	struct server *server = tl->server;
 
+	if (tl->closing) {
+		/* the client re-showed a surface it was asked to close (e.g. it
+		 * answered the close request with an unmap/remap dance): keep the
+		 * window hidden and re-send the close - a close request is sticky
+		 * until the surface is destroyed */
+		if (tl->scene_tree != NULL) {
+			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
+		}
+		wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
+		return;
+	}
+
 	if (!tl->positioned) {
 		tl->positioned = true;
 		/* size stays exactly what the client committed; the position is
@@ -769,14 +985,24 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	/* honor fullscreen/maximize requests that arrived before the first
 	 * commit (the surface is initialized and mapped by now) */
 	if (tl->xdg_toplevel->requested.fullscreen) {
+		/* initial state, not a user fullscreen action: apply instantly */
+		tl->skip_geom = true;
 		set_fullscreen(server, tl, true);
+		tl->skip_geom = false;
 	} else if (tl->xdg_toplevel->requested.maximized) {
+		/* initial state, not a user maximize action: apply instantly */
+		tl->skip_geom = true;
 		set_maximized(server, tl, true);
+		tl->skip_geom = false;
 	}
 	focus_toplevel(server, tl);
 	update_toplevel_output(server, tl);
 	rounded_cache_hide_content(tl);
 	rounded_cache_dirty(tl);
+	/* a freshly mapped window fades in (animate.c) */
+	if (!tl->minimized) {
+		animate_toplevel_fade_in(server, tl);
+	}
 	/* a window mapped under a stationary cursor must immediately show the
 	 * right cursor (title zone / resize edge), without waiting for motion */
 	update_cursor_style(server);
@@ -784,6 +1010,10 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, unmap);
+	/* the window hid itself mid-animation: stop it and leave the window
+	 * in a clean state (a pending minimize completes, a pending restore
+	 * lands) */
+	animate_toplevel_cancel(tl);
 	toplevel_unfocus(tl->server, tl);
 	update_cursor_style(tl->server);
 }

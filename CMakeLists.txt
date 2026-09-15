@@ -120,6 +120,7 @@ set(COMPOSITOR_SOURCES
 	src/rounded.c
 	src/border.c
 	src/shadow.c
+	src/animate.c
 	src/place.c
 	src/layer.c
 	src/output.c

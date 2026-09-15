@@ -852,6 +852,40 @@ void rounded_cache_hide_content(struct toplevel *tl) {
 	rounded_set_content_opacity(rc, 0.0f);
 }
 
+/* fade the whole on-screen window (animate.c).  Normally the only visible
+ * window buffer is the rounded FBO node - the raw client content is hidden
+ * at opacity 0 - so a fade animates just that node (border and shadow are
+ * part of the same FBO and fade along).  Before the first FBO publish (or
+ * with rounded corners disabled) the raw content is what the scene draws:
+ * every scene buffer under the window tree (main surface + subsurfaces +
+ * popups) is faded instead. */
+static void rounded_window_opacity_cb(struct wlr_scene_buffer *buffer,
+		int sx, int sy, void *data) {
+	(void)sx;
+	(void)sy;
+	float opacity = *(float *)data;
+	wlr_scene_buffer_set_opacity(buffer, opacity);
+}
+
+void rounded_window_set_opacity(struct toplevel *tl, float opacity) {
+	if (opacity < 0.0f) {
+		opacity = 0.0f;
+	} else if (opacity > 1.0f) {
+		opacity = 1.0f;
+	}
+	struct rounded_cache *rc = tl->rounded;
+	if (rc != NULL && !rc->failed && rc->node != NULL &&
+			rc->node->buffer != NULL) {
+		wlr_scene_buffer_set_opacity(rc->node, opacity);
+		return;
+	}
+	if (tl->scene_tree == NULL) {
+		return;
+	}
+	wlr_scene_node_for_each_buffer(&tl->scene_tree->node,
+		rounded_window_opacity_cb, &opacity);
+}
+
 struct rounded_cache *rounded_cache_create(struct server *server,
 		struct toplevel *tl) {
 	struct rounded_cache *rc = calloc(1, sizeof(*rc));
@@ -902,9 +936,22 @@ void rounded_cache_destroy(struct rounded_cache *rc) {
 }
 
 void rounded_cache_dirty(struct toplevel *tl) {
-	if (tl->rounded != NULL) {
-		tl->rounded->content_dirty = true;
-		tl->rounded->mask_dirty = true;
+	if (tl->rounded == NULL) {
+		return;
+	}
+	tl->rounded->content_dirty = true;
+	tl->rounded->mask_dirty = true;
+	/* Invalidating the cache does not necessarily damage the scene: entering
+	 * fullscreen from a maximized window whose box already equals the output
+	 * (no layer-shell bar shrinking the work area) keeps the geometry
+	 * unchanged, and a configure ack with no buffer change carries no damage
+	 * either.  Nothing would then schedule a frame, so rounded_render_all
+	 * would never re-render the FBO and the border (whose width/color depend
+	 * on the fullscreen state) would keep its old appearance.  Schedule a
+	 * frame like rounded_cache_dirty_mask does. */
+	struct wlr_output *output = toplevel_output(tl->server, tl);
+	if (output != NULL) {
+		wlr_output_schedule_frame(output);
 	}
 }
 
@@ -1192,15 +1239,75 @@ static void rounded_expand_ring(struct rounded_cache *rc) {
 
 /* publish the freshly rendered rounded buffer to the scene node and keep
  * its position/dest size in sync with the window + shadow padding.
- * damage == NULL means the whole buffer changed. */
+ * damage == NULL means the whole buffer changed.
+ *
+ * While the toplevel is running a maximize/restore zoom (tl->morph_active,
+ * animate.c) the FBO is shown in the current morph box instead of its
+ * natural geometry, so mid-animation re-renders never pop to the natural
+ * size.  The FBO node is a child of the scene tree, so its position is
+ * relative to the tree origin: offset it by the morph box origin minus the
+ * tree origin. */
 static void rounded_publish(struct rounded_cache *rc,
 		const struct wlr_box *box, const pixman_region32_t *damage) {
 	wlr_scene_buffer_set_buffer_with_damage(rc->node, rc->rounded_buf,
 		damage);
+	struct toplevel *tl = rc->tl;
 	int shadow_i = (int)lroundf(rc->shadow_logical);
-	wlr_scene_node_set_position(&rc->node->node, -shadow_i, -shadow_i);
+	int ox = box->x;
+	int oy = box->y;
+	int width = box->width;
+	int height = box->height;
+	if (tl->morph_active) {
+		ox = tl->morph_x;
+		oy = tl->morph_y;
+		width = tl->morph_w;
+		height = tl->morph_h;
+	}
+	int tree_x = tl->scene_tree != NULL ? tl->scene_tree->node.x : 0;
+	int tree_y = tl->scene_tree != NULL ? tl->scene_tree->node.y : 0;
+	wlr_scene_node_set_position(&rc->node->node,
+		ox - tree_x - shadow_i, oy - tree_y - shadow_i);
 	wlr_scene_buffer_set_dest_size(rc->node,
-		box->width + 2 * shadow_i, box->height + 2 * shadow_i);
+		width + 2 * shadow_i, height + 2 * shadow_i);
+}
+
+/* true while the window is running a maximize/restore zoom (animate.c): the
+ * scene tree is anchored at the morph box origin and every publish lands in
+ * the morph box */
+bool rounded_morph_supported(struct toplevel *tl) {
+	struct rounded_cache *rc = tl->rounded;
+	return rc != NULL && !rc->failed && rc->node != NULL &&
+		rc->node->buffer != NULL;
+}
+
+/* the rounded FBO currently holds content rendered at exactly width x
+ * height (layout pixels): the maximize/restore zoom uses this to detect
+ * that the client has committed the target size and the cache has been
+ * re-rendered at it, so the zoom can start/continue without popping */
+bool rounded_cache_size_ready(struct toplevel *tl, int width, int height) {
+	struct rounded_cache *rc = tl->rounded;
+	return rc != NULL && !rc->failed && rc->node != NULL &&
+		rc->node->buffer != NULL &&
+		rc->logical_width == width && rc->logical_height == height;
+}
+
+/* re-apply the current morph box to the scene node (position + dest size);
+ * called every animation tick after tl->morph_* changed.  No-op unless a
+ * morph is running. */
+void rounded_cache_morph_apply(struct toplevel *tl) {
+	struct rounded_cache *rc = tl->rounded;
+	if (rc == NULL || rc->failed || rc->node == NULL ||
+			!tl->morph_active) {
+		return;
+	}
+	int shadow_i = (int)lroundf(rc->shadow_logical);
+	int tree_x = tl->scene_tree != NULL ? tl->scene_tree->node.x : 0;
+	int tree_y = tl->scene_tree != NULL ? tl->scene_tree->node.y : 0;
+	wlr_scene_node_set_position(&rc->node->node,
+		tl->morph_x - tree_x - shadow_i,
+		tl->morph_y - tree_y - shadow_i);
+	wlr_scene_buffer_set_dest_size(rc->node,
+		tl->morph_w + 2 * shadow_i, tl->morph_h + 2 * shadow_i);
 }
 
 /* snapshot the main surface's direct subsurface stacking order so a later

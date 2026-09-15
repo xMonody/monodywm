@@ -27,15 +27,15 @@
 #define CONFIG_BORDER_TOP_LEFT   0x7c73b0    /* 顶部边框左1/3颜色 (最小化) */
 #define CONFIG_BORDER_TOP_MID    0xb87898    /* 顶部边框中1/3颜色 (最大化) */
 #define CONFIG_BORDER_TOP_RIGHT  0x7c73b0    /* 顶部边框右1/3颜色 (关闭) */
-#define CONFIG_BORDER_GRADIENT_WIDTH 10       /* 顶部边框三段颜色拼接处渐变宽度 (px) */
+#define CONFIG_BORDER_GRADIENT_WIDTH 15       /* 顶部边框三段颜色拼接处渐变宽度 (px) */
 
 #define CONFIG_FULLSCREEN_BORDER 1              /* 全屏窗口是否显示边框 0/1 */
 #define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 /* 全屏边框颜色 0xRRGGBB */
 
 // 窗口阴影 (scenefx 风格高斯柔影, 颜色独立于边框色):
-#define CONFIG_SHADOW_BLUR_SIGMA 25.0f
-#define CONFIG_SHADOW_COLOR      0x000000
-#define CONFIG_SHADOW_ALPHA      0.25f
+#define CONFIG_SHADOW_BLUR_SIGMA 20.0f
+#define CONFIG_SHADOW_COLOR      0x24283b
+#define CONFIG_SHADOW_ALPHA      0.8f
 
 #define CONFIG_TITLEBAR_HEIGHT  6           /* 移动窗口标题栏范围 */
 #define CONFIG_EDGE_THICKNESS   6           /* 调整窗口大小边框范围 */
@@ -55,6 +55,31 @@
  * (屏幕减去 layer-shell 状态栏的独占区), 保证新窗口不被状态栏盖住. */
 #define CONFIG_CENTER_AVOID_BARS 0
 
+/* 窗口动画 (animate.c):  设为 0 则关闭所有动画 行为与原来一致: 瞬时切换 */
+#define CONFIG_ANIM_ENABLE   1
+
+/* 各动画时长互相独立, 可单独调整, 互不影响: */
+#define CONFIG_ANIM_FALL_MS  90      /* 最小化落下 / 从最小化还原(掉回原位) 时长 (ms) */
+#define CONFIG_ANIM_FADE_MS  50      /* 创建淡入 / 关闭淡出 时长 (ms) */
+#define CONFIG_ANIM_FALL_GAP 10      /* 落出屏幕底边/从窗口上方起跳时保留的间隙 (px) */
+/* 最小化落下 / 还原掉回时伴随的缩放 (围绕窗口自身中心):
+ *   落下时窗口从 1.0 逐渐缩小到 CONFIG_ANIM_FALL_SCALE;
+ *   还原掉回时从 CONFIG_ANIM_FALL_SCALE 逐渐放大回 1.0.
+ * 设为 1.0 则关闭缩放, 只保留纯落下/掉回. */
+#define CONFIG_ANIM_FALL_SCALE 1.0f /* 落下/掉回缩放到的比例 (1.0 = 不缩放, 直接掉落) */
+/* 最大化 / 取消最大化(还原) 的 Windows 式缩放动画:
+ *   CONFIG_ANIM_MAXIMIZE_MS = 缩放时长基准 (与上面的 FALL_MS 无关, 是
+ *   另一个独立时长项). 大跨度缩放 (小窗口铺满全屏) 会在此基准上自动增加
+ *   少许时长 (跨度/12, 上限 2 倍基准) 以保持每帧位移平滑, 增加量有界,
+ *   不会脱离这个旋钮的控制.
+ *   CONFIG_ANIM_MAXIMIZE_WAIT_MS = 等待客户端把内容重排成目标尺寸的时间
+ *   上限: 必须大于几次客户端往返 (约 5 帧以上), 否则稍慢的客户端会在
+ *   缩放开始前被强制"直接跳变", 表现为没有动画. */
+#define CONFIG_ANIM_MAXIMIZE_MS 70  /* 最大化/还原 缩放时长基准 (ms) */
+#define CONFIG_ANIM_MAXIMIZE_WAIT_MS 120 /* 等待目标尺寸内容重排的上限 (ms) */
+
+/* 创建/关闭动画是纯淡入/淡出 (窗口保持自然大小), 缩放效果已移除.
+ * 只有最大化/还原保留 Windows 式缩放 (见上方的 MAXIMIZE 注释). */
 /* 组合键修饰符, 按需组合使用 */
 #define MODKEY0 (WLR_MODIFIER_ALT)                        // alt (单独按 Alt)
 #define MODKEY1 (WLR_MODIFIER_LOGO)                        // win
