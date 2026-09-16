@@ -1,21 +1,17 @@
-/*
- * monodywm - a minimal floating Wayland compositor built on wlroots 0.19
- *
- * Entry point: creates the display, backend, renderer and scene, creates
- * every protocol global (through wlroots, which implements them
- * server-side; the XML descriptions live in Protocol/ and are turned into
- * .h/.c by wayland-scanner at build time), registers the module listeners
- * and runs the event loop.
- *
- * Modules:
- *   ipc.c      - status-bar socket (JSON events)
- *   scene.c    - scene-graph tagging / hit-testing
- *   toplevel.c - xdg-shell windows, window state
- *   layer.c    - wlr-layer-shell surfaces + work area
- *   output.c   - monitors + wlr-output-management
- *   input.c    - seat, keyboard, shortcuts
- *   pointer.c  - cursor interaction (move / resize / gestures)
- */
+// monodywm - 基于 wlroots 0.19 的极简浮动 Wayland 合成器
+//
+// 入口: 创建 display、backend、renderer 和 scene, 创建所有协议 global
+// (由 wlroots 在服务端实现; XML 描述在 Protocol/ 目录, 构建时由
+// wayland-scanner 生成 .h/.c), 注册各模块监听器并运行事件循环.
+//
+// 模块:
+//   ipc.c      - 状态栏套接字 (JSON 事件)
+//   scene.c    - 场景图打标签 / 命中测试
+//   toplevel.c - xdg-shell 窗口与窗口状态
+//   layer.c    - wlr-layer-shell surface + 作区
+//   output.c   - 显示器 + wlr-output-management
+//   input.c    - seat、键盘、快捷键
+//   pointer.c  - 光标交互 (移动 / 缩放 / 手势)
 
 #include "server.h"
 
@@ -42,8 +38,10 @@
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
+#include <wlr/types/wlr_keyboard_shortcuts_inhibit_v1.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
+#include <wlr/types/wlr_primary_selection_v1.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
@@ -57,13 +55,11 @@
 #include <wlr/types/wlr_virtual_pointer_v1.h>
 #include <wlr/util/log.h>
 
-/* run a command in a detached child process:
- *   - setsid(): new session, no controlling terminal, immune to terminal
- *     signals (Ctrl+C, SIGHUP when the tty closes), keeps running even if
- *     the compositor's terminal goes away
- *   - stdin/stdout/stderr -> /dev/null: no output polluting the compositor's
- *     tty, and the process can never block on a terminal read/write
- *   - _exit(127) if exec fails: never fall through into the compositor */
+// 在独立子进程中运行命令:
+//   - setsid(): 新会话, 无控制终端, 不受终端信号 (Ctrl+C、tty 关闭时的 SIGHUP)
+//     影响, 合成器终端消失后仍继续运行;
+//   - stdin/stdout/stderr -> /dev/null: 不污染合成器 tty, 进程也不会阻塞在终端读写上;
+//   - exec 失败时 _exit(127): 绝不会落回合成器代码.
 void spawn_command(const char *cmd) {
 	if (cmd == NULL || cmd[0] == '\0') {
 		return;
@@ -85,12 +81,9 @@ void spawn_command(const char *cmd) {
 		_exit(127);
 	}
 
-	/* never leave the child in the compositor's working directory: the
-	 * compositor's CWD can be deleted while it runs (e.g. the build
-	 * directory is removed and rebuilt), and some apps - foot in
-	 * particular, which starts a shell - hang before mapping their
-	 * window when the CWD no longer exists.  A stable directory also
-	 * keeps apps from inheriting a weird location. */
+	// 不要把孩子留在合成器的工作目录: 合成器运行期间其 CWD 可能被删除
+	// (例如构建目录被删掉重建), 某些应用 - 尤其是会启动 shell 的 foot -
+	// 在 CWD 不存在时会卡在映射窗口之前. 固定目录也能避免应用继承奇怪的位置.
 	const char *home = getenv("HOME");
 	if (home == NULL || home[0] == '\0' || chdir(home) == -1) {
 		chdir("/");
@@ -136,7 +129,7 @@ static void reap_children(int sig) {
 	errno = saved_errno;
 }
 
-/* install the SIGCHLD handler (called once from main()) */
+// 安装 SIGCHLD 处理器 (main() 中只调用一次)
 static void init_reaper(void) {
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
@@ -150,9 +143,8 @@ static void init_reaper(void) {
 			strerror(errno));
 	}
 
-	/* never die from a write to a disconnected IPC client (a status bar
-	 * that exited): the IPC layer cleans the client up and reports the
-	 * failure instead of letting SIGPIPE kill the whole compositor */
+	// 绝不能因为向已断开的 IPC 客户端 (退出的状态栏) 写入而死掉:
+	// IPC 层会清理该客户端并上报失败, 而不是让 SIGPIPE 杀死整个合成器
 	signal(SIGPIPE, SIG_IGN);
 }
 
@@ -198,12 +190,12 @@ static void run_startup_file(void) {
 	ssize_t len;
 
 	while ((len = getline(&line, &cap, f)) != -1) {
-		/* strip the trailing newline / carriage return */
+		// 去掉行尾的换行/回车
 		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
 			line[--len] = '\0';
 		}
 
-		/* skip leading whitespace, blank lines and comments */
+		// 跳过前导空白、空行和注释
 		char *cmd = line;
 		while (*cmd == ' ' || *cmd == '\t') {
 			cmd++;
@@ -220,11 +212,10 @@ static void run_startup_file(void) {
 }
 
 int main(int argc, char *argv[]) {
-	/* WLR_DEBUG=1 switches to debug logging (the bundled tests verify cursor
-	 * decisions through the "cursor: ..." WLR_DEBUG lines) */
+	// WLR_DEBUG=1 切换为调试日志 (自带测试通过 "cursor: ..." 的 WLR_DEBUG 行验证光标决策)
 	const char *dbg = getenv("WLR_DEBUG");
 	wlr_log_init(dbg != NULL && dbg[0] != '\0' ? WLR_DEBUG : WLR_INFO, NULL);
-	/* never leave spawned helpers as zombies */
+	// 不要让生成的后台进程变成僵尸
 	init_reaper();
 
 	char *startup_cmd = NULL;
@@ -270,10 +261,9 @@ int main(int argc, char *argv[]) {
 	}
 	server.output_layout = wlr_output_layout_create(server.display);
 	server.output_manager = wlr_output_manager_v1_create(server.display);
-	/* xdg-output-unstable-v1: tells clients (grim, xwayland, ...) the
-	 * logical geometry/name of each output.  grim refuses to trust the
-	 * core wl_output geometry for capture and falls back to guessing when
-	 * this global is missing, which produces 0x0 captures on this layout. */
+	// xdg-output-unstable-v1: 告诉客户端 (grim、xwayland 等) 每个输出的
+	// 逻辑几何和名称. grim 在缺少该 global 时不肯信任核心 wl_output 几何,
+	// 会退回到猜测, 在本布局上会产生 0x0 的截图.
 	wlr_xdg_output_manager_v1_create(server.display, server.output_layout);
 	server.foreign_toplevel_manager =
 		wlr_foreign_toplevel_manager_v1_create(server.display);
@@ -290,9 +280,8 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create xcursor manager");
 		return EXIT_FAILURE;
 	}
-	/* show the default arrow right away so the pointer is visible when the
-	 * first output appears - otherwise no cursor image exists until the
-	 * first pointer motion and the desktop starts without a cursor */
+	// 立即显示默认箭头, 这样首个输出出现时指针就可见 - 否则在第一次
+	// 指针移动之前都没有光标图像, 桌面启动时没有光标
 	wlr_cursor_set_xcursor(server.cursor, server.xcursor_manager, "left_ptr");
 
 	for (int i = 0; i < LAYER_COUNT; i++) {
@@ -308,45 +297,48 @@ int main(int argc, char *argv[]) {
 	wl_list_init(&server.text_inputs);
 	wl_list_init(&server.keyboards);
 
-	/* ---- core & stable protocols ----
-	  No explicit wl_shm creation: wlr_renderer_init_wl_display() above
-	  already registered the wl_shm global (and, on renderers with a DRM
-	  fd and dmabuf support, the linux-dmabuf global too).  Creating
-	  wl_shm again here advertised a second duplicate wl_shm global. */
+	// ---- 核心与稳定协议 ----
+	// 不显式创建 wl_shm: 上面的 wlr_renderer_init_wl_display() 已经注册了
+	// wl_shm global (以及, 在带 DRM fd 且支持 dmabuf 的渲染器上, linux-dmabuf global).
+	// 这里再创建会多出一个重复的 wl_shm global.
 	wlr_compositor_create(server.display, 6, server.renderer);
 	wlr_subcompositor_create(server.display);
 
-	if (wlr_renderer_get_texture_formats(server.renderer,
-			WLR_BUFFER_CAP_DMABUF) == NULL || wlr_renderer_get_drm_fd(server.renderer) < 0) {
-		wlr_linux_dmabuf_v1_create_with_renderer(server.display, 5, server.renderer);
-	}
+	// 这里不再单独创建 linux-dmabuf: wlr_renderer_init_wl_display() 在渲染器
+	// 支持 dmabuf 且能拿到 DRM fd 时已注册了 v4 global.
 	wlr_data_device_manager_create(server.display);
-	/* ext-data-control-v1: privileged clipboard/selection control for tools
-	 * such as wl-clipboard (wl-copy/wl-paste) and clipboard managers, which
-	 * is how editors like vim reach the Wayland clipboard.  wlroots
-	 * implements the protocol server-side and bridges it to the seat
-	 * selection/primary-selection, so registering the global is enough. */
+	// ext-data-control-v1: 面向 wl-clipboard (wl-copy/wl-paste) 和剪贴板管理器等
+	// 工具的剪贴板/选择区特权控制, vim 这类编辑器就是这样访问 Wayland 剪贴板的.
+	// wlroots 在服务端实现该协议并桥接到 seat 的 selection/primary-selection,
+	// 所以注册 global 就够了.
 	server.ext_data_control_manager =
 		wlr_ext_data_control_manager_v1_create(server.display, 1);
 	if (server.ext_data_control_manager == NULL) {
 		wlr_log(WLR_ERROR, "failed to create ext-data-control-v1 global");
 	}
-	/* wlr-data-control-unstable-v1: the legacy wlroots clipboard-control
-	 * protocol.  CopyQ (and older wl-clipboard/detached clipboard managers)
-	 * still bind only this one, not ext-data-control-v1, so it has to stay
-	 * advertised for them to reach the clipboard.  Implemented server-side
-	 * by wlroots like the ext- variant. */
+	// wlr-data-control-unstable-v1: 旧的 wlroots 剪贴板控制协议.
+	// CopyQ (以及较旧的 wl-clipboard/独立剪贴板管理器) 仍只绑定这个,
+	// 不绑定 ext-data-control-v1, 所以要继续提供, 它们才能访问剪贴板.
+	// 与 ext- 版本一样由 wlroots 在服务端实现.
 	server.data_control_manager =
 		wlr_data_control_manager_v1_create(server.display);
 	if (server.data_control_manager == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr-data-control-v1 global");
+	}
+	// primary-selection-v1: 标准 PRIMARY 选择区, 用于中键粘贴. seat 的请求
+	// 监听已驱动 wlr_seat_set_primary_selection(); 没有这个 global 客户端就
+	// 无法拥有/提供选择内容, 中键粘贴会失效.
+	server.primary_selection_manager =
+		wlr_primary_selection_v1_device_manager_create(server.display);
+	if (server.primary_selection_manager == NULL) {
+		wlr_log(WLR_ERROR, "failed to create primary-selection-v1 global");
 	}
 	struct wlr_xdg_shell *xdg_shell =
 		wlr_xdg_shell_create(server.display, 6);
 	wlr_viewporter_create(server.display);
 	wlr_presentation_create(server.display, server.backend, 2);
 
-	/* ---- wlroots protocols ---- */
+	// ---- wlroots 协议 ----
 	struct wlr_layer_shell_v1 *layer_shell =
 		wlr_layer_shell_v1_create(server.display, 5);
 	struct wlr_xdg_decoration_manager_v1 *decoration_manager =
@@ -354,28 +346,24 @@ int main(int argc, char *argv[]) {
 	struct wlr_virtual_pointer_manager_v1 *virtual_pointer_manager =
 		wlr_virtual_pointer_manager_v1_create(server.display);
 
-	/* wlr-screencopy-v1: screen capture for grim/slurp/wf-recorder.
-	 * wlroots implements the whole protocol server-side (frame capture,
-	 * damage, cursor overlay), the compositor only registers the global.
-	 * Kept in favor of ext-image-copy-capture-v1: it is what the capture
-	 * tools expect today and works with the bundled DMABUF/SHM paths. */
+	// wlr-screencopy-v1: 为 grim/slurp/wf-recorder 提供屏幕捕获.
+	// wlroots 在服务端实现整个协议 (帧捕获、damage、光标叠加), 合成器只注册 global.
+	// 选它而不选 ext-image-copy-capture-v1: 这是当前捕获工具所期望的,
+	// 且与自带的 DMABUF/SHM 路径兼容.
 	struct wlr_screencopy_manager_v1 *screencopy_manager = wlr_screencopy_manager_v1_create(server.display);
 	if (screencopy_manager == NULL) {
 		wlr_log(WLR_ERROR, "failed to create wlr-screencopy-v1 global");
 	}
 
-	/* cursor-shape-v1: clients pick a shape, the compositor renders it from
-	 * its own xcursor theme at the output's (fractional) scale, so the
-	 * cursor size always matches - no client-side guessing */
+	// cursor-shape-v1: 客户端选择形状, 合成器用自带的 xcursor 主题按输出
+	// 的 (分数) 缩放渲染, 所以光标大小总能匹配 - 无需客户端猜测
 	server.cursor_shape_manager =
 		wlr_cursor_shape_manager_v1_create(server.display, 1);
 
-	/* pointer-constraints-v1 + relative-pointer-v1: clients such as QEMU
-	 * (captured mouse) and games lock or confine the pointer to one of
-	 * their surfaces and read the raw relative deltas while it is locked.
-	 * wlroots implements both server-side; pointer.c drives the constraint
-	 * activation and the delta handling, here only the globals are
-	 * registered. */
+	// pointer-constraints-v1 + relative-pointer-v1: QEMU (捕获鼠标) 和游戏等
+	// 客户端把指针锁定/限定到自己的某个 surface, 并在锁定期间读取原始相对增量.
+	// wlroots 在服务端实现两者; pointer.c 负责约束的激活和增量处理,
+	// 这里只注册 global.
 	server.pointer_constraints =
 		wlr_pointer_constraints_v1_create(server.display);
 	if (server.pointer_constraints == NULL) {
@@ -388,23 +376,31 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create relative-pointer-v1 global");
 	}
 
-	/* xdg-activation-v1: clients can request focus through an activation
-	 * token; the compositor focuses the matching toplevel on request */
+	// keyboard-shortcuts-inhibit-v1: 聚焦的客户端 (GTK4 应用/远程桌面/虚拟机界面)
+	// 可以要求合成器停止处理自己的快捷键, 让按键直达客户端.
+	server.shortcuts_inhibit =
+		wlr_keyboard_shortcuts_inhibit_v1_create(server.display);
+	if (server.shortcuts_inhibit == NULL) {
+		wlr_log(WLR_ERROR,
+			"failed to create keyboard-shortcuts-inhibit-v1 global");
+	}
+
+	// xdg-activation-v1: 客户端可以通过激活 token 请求焦点;
+	// 合成器在收到请求时聚焦匹配的 toplevel
 	server.activation = wlr_xdg_activation_v1_create(server.display);
 	if (server.activation == NULL) {
 		wlr_log(WLR_ERROR, "failed to create xdg-activation-v1 global");
 	}
 
-	/* wp_fractional_scale_v1: surfaces are told the output's exact
-	 * fractional scale; wlroots scene surfaces (layer-shell, subsurfaces,
-	 * cursor, toplevels) handle it automatically */
+	// wp_fractional_scale_v1: 告诉 surface 输出的精确分数缩放;
+	// wlroots 场景 surface (layer-shell、subsurface、光标、toplevel) 自动处理
 	server.fractional_scale_manager =
 		wlr_fractional_scale_manager_v1_create(server.display, 1);
 	if (server.fractional_scale_manager == NULL) {
 		wlr_log(WLR_ERROR, "failed to create fractional-scale-v1 global");
 	}
 
-	/* ---- input method (fcitx5 / ibus) ---- */
+	// ---- 输入法 (fcitx5 / ibus) ----
 	struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard_manager =
 		wlr_virtual_keyboard_manager_v1_create(server.display);
 	struct wlr_input_method_manager_v2 *input_method_manager =
@@ -412,7 +408,7 @@ int main(int argc, char *argv[]) {
 	struct wlr_text_input_manager_v3 *text_input_manager =
 		wlr_text_input_manager_v3_create(server.display);
 
-	/* ---- listeners ---- */
+	// ---- 监听器 ----
 	server.new_output.notify = server_new_output;
 	wl_signal_add(&server.backend->events.new_output, &server.new_output);
 	server.new_input.notify = server_new_input;
@@ -453,6 +449,11 @@ int main(int argc, char *argv[]) {
 		wl_signal_add(&server.pointer_constraints->events.new_constraint,
 			&server.new_pointer_constraint);
 	}
+	if (server.shortcuts_inhibit != NULL) {
+		server.new_shortcuts_inhibitor.notify = new_shortcuts_inhibitor;
+		wl_signal_add(&server.shortcuts_inhibit->events.new_inhibitor,
+			&server.new_shortcuts_inhibitor);
+	}
 	server.pointer_focus_change.notify = pointer_focus_change;
 	wl_signal_add(&server.seat->pointer_state.events.focus_change,
 		&server.pointer_focus_change);
@@ -488,10 +489,9 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 
-	/* linux-drm-syncobj-v1: advertise explicit synchronization only when
-	 * both the renderer and the backend can handle timeline wait/signal.
-	 * Use the renderer's DRM fd (the device actually used for rendering),
-	 * never a hard-coded /dev/dri/card0. */
+	// linux-drm-syncobj-v1: 只有渲染器和后端都支持 timeline wait/signal 时才提供
+	// 显式同步. 使用渲染器的 DRM fd (实际用于渲染的设备), 绝不用硬编码的
+	// /dev/dri/card0.
 	if (server.renderer->features.timeline && server.backend->features.timeline) {
 		int drm_fd = wlr_renderer_get_drm_fd(server.renderer);
 		if (drm_fd >= 0) {
@@ -513,14 +513,14 @@ int main(int argc, char *argv[]) {
 	}
 
 	setenv("WAYLAND_DISPLAY", socket, true);
-	/* the Wayland socket is live: the WM is up, now start the user's
-	 * daemons from ~/.config/mywm/run (plus any -s command) */
+	// Wayland 套接字已就绪: WM 起来了, 现在启动用户的守护进程
+	// (来自 ~/.config/mywm/run, 外加任何 -s 命令)
 	run_startup_file();
 	if (startup_cmd != NULL) {
 		spawn_command(startup_cmd);
 	}
 
-	/* IPC socket for status bars (JSON over a Unix domain socket) */
+	// 状态栏用的 IPC 套接字 (Unix 域套接字上的 JSON)
 	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
 	char ipc_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	if (runtime_dir != NULL && runtime_dir[0] != '\0') {
@@ -538,11 +538,10 @@ int main(int argc, char *argv[]) {
 		socket);
 	wl_display_run(server.display);
 
-	/* wlroots asserts that the objects it owns (output layout, output
-	 * manager, seat, protocol managers, ...) are destroyed without leftover
-	 * listeners, so detach every compositor listener before teardown. The
-	 * per-surface listeners (toplevels, layer surfaces, ime, cursors) are
-	 * removed by their own destroy handlers during destroy_clients(). */
+	// wlroots 断言它拥有的对象 (输出布局、输出管理器、seat、协议管理器等)
+	// 销毁时没有残留监听器, 所以拆除前先摘掉合成器的每个监听器.
+	// 按 surface 挂的监听器 (toplevel、layer surface、ime、光标) 由各自的
+	// destroy 处理器在 destroy_clients() 期间移除.
 	wl_list_remove(&server.new_output.link);
 	wl_list_remove(&server.new_input.link);
 	wl_list_remove(&server.new_virtual_pointer.link);
@@ -563,10 +562,12 @@ int main(int argc, char *argv[]) {
 	if (server.pointer_constraints != NULL) {
 		wl_list_remove(&server.new_pointer_constraint.link);
 	}
+	if (server.shortcuts_inhibit != NULL) {
+		wl_list_remove(&server.new_shortcuts_inhibitor.link);
+	}
 	wl_list_remove(&server.pointer_focus_change.link);
-	/* the per-surface commit listener is normally dropped by the constraint
-	 * destroy handler; detach it here too so teardown never trips wlroots'
-	 * empty-surface-signal assert */
+	// 按 surface 挂的 commit 监听器通常由约束的 destroy 处理器摘掉;
+	// 这里也摘一次, 确保拆除时不会触发 wlroots 的"signal 监听器为空"断言
 	if (server.constraint_commit.link.prev != NULL) {
 		wl_list_remove(&server.constraint_commit.link);
 	}

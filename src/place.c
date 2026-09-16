@@ -1,29 +1,20 @@
-/*
- * place.c - window placement (auto-centered)
- *
- * Windows keep the size the client committed (the compositor never
- * re-sizes them, no wlr_xdg_toplevel_set_size call here) and are centered
- * on the output (screen) both horizontally and vertically.  A fresh window
- * is centered on the screen the cursor is on, and re-centered whenever its
- * surface size changes (Electron windows such as QQ often map with a small
- * placeholder surface and only commit the real size on a later frame), so
- * the window ends up centered no matter when its real size arrives.  Once
- * the user interacts with the window (move / resize / maximize / fullscreen
- * set toplevel.user_moved) auto-centering stops and the window stays where
- * the user puts it.
- *
- * The centering reference is the SURFACE's actual rendering extent, not the
- * xdg window geometry: Electron windows (QQ) commit a surface larger than
- * their window geometry, and centering on the smaller geometry would leave
- * the real content offset toward the bottom-right - far enough to run off
- * screen.  (For normal windows surface == geometry; for CSD windows with a
- * transparent drop shadow the surface center is only off by half the shadow
- * margin, which is negligible.)
- *
- * CONFIG_CENTER_AVOID_BARS switches the centering reference from the whole
- * output box to the work area (the output minus layer-shell exclusive
- * zones, i.e. status bars), so a bar can never cover the new window.
- */
+// place.c - 窗口放置 (自动居中)
+//
+// 窗口保持客户端提交的尺寸 (合成器不重新设尺寸, 这里不调用
+// wlr_xdg_toplevel_set_size), 并在输出 (屏幕) 上水平垂直居中.
+// 新窗口居中到光标所在的屏幕, 之后只要 surface 尺寸变化就重新居中
+// (Electron 窗口如 QQ 常先映射一个小的占位 surface, 稍后才提交真实尺寸),
+// 这样无论真实尺寸何时到达, 窗口最终都会居中. 一旦用户与窗口交互
+// (移动/缩放/最大化/全屏会置 toplevel.user_moved), 自动居中就停止,
+// 窗口停在用户放的位置.
+//
+// 居中的参考是 SURFACE 的实际渲染范围, 不是 xdg 窗口 geometry:
+// Electron 窗口 (QQ) 提交的 surface 比它的 geometry 大, 按较小的 geometry
+// 居中会让真实内容偏向右下, 甚至跑出屏幕. (普通窗口 surface == geometry;
+// 带透明投影的 CSD 窗口二者中心只差半个阴影边距, 可忽略.)
+//
+// CONFIG_CENTER_AVOID_BARS 把居中参考从整个输出框换成工作区
+// (输出减去 layer-shell 独占区, 即状态栏), 这样状态栏永远盖不住新窗口.
 
 #include "server.h"
 
@@ -31,14 +22,11 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_xdg_shell.h>
 
-/* center a toplevel on the output under the cursor (falling back to the
- * center output when the cursor is outside every output).  Returns false
- * when the window has no usable size yet; true after the scene node has
- * been positioned.  The size is untouched; the position centers the
- * surface's rendering extent (node - geometry + surface size).  A window
- * bigger than the centering reference is anchored to the reference's
- * top-left corner so it never starts off-screen; anything smaller is
- * clamped so no part falls outside the screen. */
+// 把 toplevel 居中到光标所在的输出 (光标不在任何输出上时退回中心输出).
+// 窗口还没有可用尺寸时返回 false; 定位完成后返回 true.
+// 尺寸不动; 位置让 surface 的渲染范围 (node - geometry + surface size) 居中.
+// 比参考区更大的窗口对齐到参考区左上角, 避免一开始就在屏幕外;
+// 更小的窗口会做钳制, 保证没有任何部分落在屏幕外.
 bool place_toplevel(struct server *server, struct toplevel *tl) {
 	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 	if (base == NULL || base->surface == NULL) {
@@ -50,17 +38,14 @@ bool place_toplevel(struct server *server, struct toplevel *tl) {
 	if (sw <= 0 || sh <= 0) {
 		return false;
 	}
-	/* the xdg surface tree is anchored at the geometry top-left and the
-	 * surface sits at -geometry inside it, so the surface's top-left
-	 * corner is (node.x - gx, node.y - gy) and the window's real
-	 * rendering extent is that corner plus the surface size.  Centering
-	 * on this extent (instead of the xdg geometry) is what keeps windows
-	 * whose surface is bigger than their geometry (QQ) on center. */
+	// xdg surface 树锚定在 geometry 左上角, surface 位于树内的 -geometry 处,
+	// 所以 surface 左上角是 (node.x - gx, node.y - gy), 窗口真实渲染范围
+	// 就是该角加上 surface 尺寸. 按这个范围 (而不是 xdg geometry) 居中,
+	// 才能让 surface 比 geometry 大的窗口 (QQ) 保持居中.
 	int gx = base->geometry.x;
 	int gy = base->geometry.y;
 
-	/* center on the output the cursor is on (the window should appear
-	 * where the user is looking), falling back to the center output */
+	// 居中到光标所在的输出 (窗口应出现在用户看的地方), 退回中心输出
 	struct wlr_output *output = wlr_output_layout_output_at(
 		server->output_layout, server->cursor->x, server->cursor->y);
 	if (output == NULL) {
@@ -70,20 +55,20 @@ bool place_toplevel(struct server *server, struct toplevel *tl) {
 		return false;
 	}
 
-	struct wlr_box ref; /* centering reference: output box or work area */
+	struct wlr_box ref; // 居中参考: 输出框或工作区
 #if CONFIG_CENTER_AVOID_BARS
 	get_work_area(server, output, &ref);
 #else
 	wlr_output_layout_get_box(server->output_layout, output, &ref);
 #endif
 
-	/* node position that puts the surface's top-left corner here */
+	// 让 surface 左上角落在此处的 node 位置
 	int rx = ref.x + (ref.width - sw) / 2;
 	int ry = ref.y + (ref.height - sh) / 2;
 
-	/* keep the surface on screen */
+	// 保持 surface 在屏幕内
 	if (sw >= ref.width) {
-		rx = ref.x; /* wider than the screen: left-align */
+		rx = ref.x; // 比屏幕宽: 左对齐
 	} else {
 		if (rx < ref.x) {
 			rx = ref.x;
@@ -92,7 +77,7 @@ bool place_toplevel(struct server *server, struct toplevel *tl) {
 		}
 	}
 	if (sh >= ref.height) {
-		ry = ref.y; /* taller than the screen: top-align */
+		ry = ref.y; // 比屏幕高: 顶对齐
 	} else {
 		if (ry < ref.y) {
 			ry = ref.y;

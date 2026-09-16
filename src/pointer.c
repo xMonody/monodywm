@@ -1,15 +1,10 @@
-/*
- * pointer.c - compositor cursor interaction
- *
- * Undecorated windows get a frame owned by the compositor:
- *   - top strip (the 3-colored title border) : long press / drag moves
- *     the window; double-click a segment minimizes (left), toggles
- *     maximize/restore (middle) or closes (right); hold right + wheel
- *     up/down toggles maximize-restore / minimize-restore
- *   - edges / corners    : resize
- * A press in the frame is swallowed by the compositor and never reaches
- * the client; client-side decorated windows keep their native controls.
- */
+// pointer.c - 合成器光标交互
+//
+// 无装饰窗口获得合成器拥有的边框:
+//   - 顶部条 (三色标题边框): 长按/拖动移动窗口; 双击某段最小化 (左)、
+//     切换最大化/还原 (中) 或关闭 (右); 按住右键滚轮上/下切换最大化-还原/最小化-还原
+//   - 边缘/角: 缩放
+// 边框内的按压被合成器吞掉, 绝不到达客户端; 客户端自绘装饰的窗口保留其原生控件.
 
 #include "server.h"
 
@@ -28,28 +23,25 @@
 #include <wlr/util/log.h>
 #include <wlr/util/region.h>
 
-/* is the cursor over the visible title strip of an undecorated window?  The
- * strip spans the window width: the top CONFIG_TITLEBAR_HEIGHT px of the
- * content, split into three gesture segments (minimize / maximize / close). */
+// 光标是否位于无装饰窗口可见的标题条上? 该条横跨窗口宽度:
+// 内容顶部 CONFIG_TITLEBAR_HEIGHT 像素, 分成三个手势段 (最小化/最大化/关闭).
 static bool is_in_titlebar_zone(struct server *server, struct toplevel *tl) {
-	/* a popup (menu / dropdown) floating over the strip wins the pointer:
-	 * no move / minimize / maximize / close grab while the cursor is on it */
+	// 浮在标题条上的 popup (菜单/下拉框) 赢得指针:
+	// 光标在其上时不进行移动/最小化/最大化/关闭抓取
 	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
 		return false;
 	}
 	if (tl->fullscreen) {
-		/* fullscreen: the window covers the whole output, so the compositor
-		 * owns no frame over it - none of the title-strip gestures apply and
-		 * the client must get its clicks/cursor back */
+		// 全屏: 窗口覆盖整个输出, 合成器在其上不拥有边框 -
+		// 标题条手势都不适用, 客户端必须拿回它的点击/光标
 		return false;
 	}
 	if (tl->decoration_mode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE &&
 			!toplevel_is_dialog(tl) && !toplevel_is_fixed_size(tl)) {
-		return false; /* client draws its own title bar, use it natively */
+		return false; // 客户端自绘标题栏, 原生使用它
 	}
-	/* dialogs and fixed-size windows: the top border band is the
-	 * compositor's close button even when the client draws its own (CSD)
-	 * decorations */
+	// 对话框和固定尺寸窗口: 即使客户端自绘 (CSD) 装饰,
+	// 顶部条带也是合成器的关闭按钮
 	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 	if (base == NULL || !base->surface->mapped) {
 		return false;
@@ -66,13 +58,12 @@ static bool is_in_titlebar_zone(struct server *server, struct toplevel *tl) {
 		ly < box.y + CONFIG_TITLEBAR_HEIGHT;
 }
 
-/* which third of the title strip the press sits over: left third =
- * minimize, middle third = toggle maximize/restore, right third = close */
+// 按压落在标题条哪三分之一: 左三分之一 = 最小化,
+// 中间三分之一 = 切换最大化/还原, 右三分之一 = 关闭
 static enum zone_action title_strip_action(struct server *server,
 		struct toplevel *tl) {
-	/* a window that cannot maximize/minimize (dialog, or fixed-size like
-	 * QQ's login) has a top border that is one single close button: a
-	 * double-click anywhere on it closes the window */
+	// 不能最大化/最小化的窗口 (对话框, 或如 QQ 登录的固定尺寸) 顶部边框
+	// 就是单个关闭按钮: 双击其任意位置都关闭窗口
 	if (toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
 		return ZONE_CLOSE;
 	}
@@ -98,9 +89,9 @@ static void disarm_zone_timer(struct server *server) {
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* window move                                                        */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// 窗口移动
+// ------------------------------------------------------------------
 
 static bool is_double_click(struct server *server, uint32_t button) {
 	if (!server->last_was_click || button != server->last_click_button) {
@@ -118,12 +109,10 @@ void begin_move(struct server *server, struct toplevel *tl,
 	if (server->moving) {
 		return;
 	}
-	/* a fullscreen window covers the whole output and has nowhere to go:
-	 * dragging it (which would only peel it off fullscreen and expose the
-	 * desktop) is never honored, the user must leave fullscreen first.
-	 * Gating here covers every move entry point - the left+right chord,
-	 * the title-strip drag and xdg_toplevel.move - so a fullscreen window
-	 * can never be moved by the compositor. */
+	// 全屏窗口覆盖整个输出, 无处可去:
+	// 拖动它 (只会把它从全屏剥下来并露出桌面) 永不生效, 用户必须先离开全屏.
+	// 在这里设门控可覆盖所有移动入口 - 左右和弦、标题条拖动和 xdg_toplevel.move -
+	// 所以合成器绝不可能移动全屏窗口.
 	if (tl != NULL && tl->fullscreen) {
 		return;
 	}
@@ -131,15 +120,14 @@ void begin_move(struct server *server, struct toplevel *tl,
 	server->input_mode = INPUT_MODE_MOVE;
 	server->move_toplevel = tl;
 	if (tl != NULL) {
-		tl->user_moved = true; /* user move: stop auto-centering */
+		tl->user_moved = true; // 用户移动: 停止自动居中
 	}
 	server->move_ref_x = ref_x;
 	server->move_ref_y = ref_y;
 	server->grab_x = ref_x - tl->scene_tree->node.x;
 	server->grab_y = ref_y - tl->scene_tree->node.y;
-	/* remember the maximized box: when the drag restores the window, the
-	 * press point's window-internal offset is mapped proportionally into
-	 * the restored box (see move_toplevel_to) */
+	// 记住最大化框: 拖动还原窗口时, 按压点在窗口内部的偏移会按比例映射进还原框
+	// (见 move_toplevel_to)
 	server->move_max_w = 0;
 	server->move_max_h = 0;
 	if (tl->xdg_toplevel->current.maximized) {
@@ -164,11 +152,10 @@ void end_move(struct server *server) {
 	disarm_zone_timer(server);
 }
 
-/* clamp a dragged window's position so its top can never slide above a
- * top layer-shell bar; left/right bars clamp their sides too.  The bottom
- * is deliberately unclamped: the cursor itself is kept above the bar
- * (clamp_move_cursor), and the window follows it, so it may slide past a
- * bottom bar and off the bottom of the screen - Windows-style. */
+// 钳制被拖动窗口的位置, 使其顶部绝不会滑到顶部 layer-shell 状态栏之上;
+// 左右状态栏也会钳制对应侧. 底部故意不钳制: 光标本身保持在状态栏之上
+// (clamp_move_cursor), 窗口跟随它, 所以窗口可以滑过底部状态栏并移出屏幕底边 -
+// Windows 风格.
 static void clamp_drag_position(struct server *server, struct toplevel *tl,
 		double *x, double *y) {
 	struct wlr_box box;
@@ -185,27 +172,26 @@ static void clamp_drag_position(struct server *server, struct toplevel *tl,
 	struct wlr_box area;
 	get_work_area(server, output, &area);
 
-	if (area.x > out.x) {           /* bar at the left */
+	if (area.x > out.x) {           // 左侧有栏
 		if (*x < area.x) {
 			*x = area.x;
 		}
 	}
-	if (area.y > out.y) {           /* bar at the top */
+	if (area.y > out.y) {           // 顶部有栏
 		if (*y < area.y) {
 			*y = area.y;
 		}
 	}
-	if (area.x + area.width < out.x + out.width) { /* bar at the right */
+	if (area.x + area.width < out.x + out.width) { // 右侧有栏
 		if (*x + box.width > area.x + area.width) {
 			*x = area.x + area.width - box.width;
 		}
 	}
 }
 
-/* while a window is being dragged, the cursor may never enter a layer-shell
- * bar's exclusive zone: clamp it to the work area of the output under it,
- * so it stays visible above the bar.  The window follows the cursor with
- * no bottom limit, so it can slide past the bar and off the screen. */
+// 拖动窗口期间, 光标绝不能进入 layer-shell 状态栏的独占区:
+// 钳制到其下输出的作区, 让它保持在状态栏之上可见.
+// 窗口跟随光标且没有底部限制, 所以它可以滑过状态栏并移出屏幕.
 static void clamp_move_cursor(struct server *server) {
 	struct wlr_output *output = wlr_output_layout_output_at(
 		server->output_layout, server->cursor->x, server->cursor->y);
@@ -239,54 +225,44 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 	if (tl == NULL) {
 		return;
 	}
-	/* a maximized window whose move came from the client (xdg_toplevel.
-	 * move - e.g. QQ's own title bar sends it on a plain click, not just
-	 * a drag): defer the restore until the drag really moves, so a mere
-	 * click - or the first press of a double-click, with its few px of
-	 * hand jitter - never un-maximizes the window and yanks it across
-	 * the screen.  Only here (not in request_move) can a click be told
-	 * apart from a drag, and only once the cursor passed
-	 * CONFIG_DRAG_THRESHOLD (the zone strip gates its move on the same
-	 * threshold; without it the client title bar restored on the first
-	 * pixel of jitter and scrambled the double-click). */
+	// 移动来自客户端 (xdg_toplevel.move - 如 QQ 自己的标题栏在普通点击时
+	// 也会发, 而不只是拖动) 的最大化窗口: 延迟还原到真正拖动时,
+	// 这样单纯点击 - 或双击的第一次按下及其几像素手抖 - 绝不会取消最大化
+	// 并把窗口猛拽到别处. 只有这里 (不是 request_move) 才能把点击和拖动区分开,
+	// 且只有光标越过 CONFIG_DRAG_THRESHOLD 后才可以 (标题条区也用同一阈值设门控;
+	// 没有它的话客户端标题栏在第一像素抖动时就会还原, 打乱双击).
 	if (tl->xdg_toplevel->current.maximized) {
 		double ddx = server->cursor->x - server->move_ref_x;
 		double ddy = server->cursor->y - server->move_ref_y;
 		if (ddx * ddx + ddy * ddy <
 				CONFIG_DRAG_THRESHOLD * CONFIG_DRAG_THRESHOLD) {
-			/* a click (or a double-click's first press) that never crossed
-			 * the drag threshold: the window stays maximized, nothing moves */
+			// 一次从未越过拖动阈值的点击 (或双击的第一次按下):
+			// 窗口保持最大化, 什么都不动
 			return;
 		}
-		restore_maximized_toplevel(tl, false); /* drag: grab owns the geometry */
-		/* re-anchor the grab by mapping the press point's offset inside
-		 * the maximized box proportionally into the restored box: the
-		 * cursor keeps gripping the same window-internal spot it pressed.
-		 * A plain absolute offset would keep it on the same pixel, which
-		 * drifts right on narrower restored windows (e.g. a press on the
-		 * centered title text of a maximized gvim would float past the
-		 * text once the window shrinks); proportional mapping lands the
-		 * cursor on the same relative spot - exactly where centered
-		 * content (title text) sits.  Do NOT re-anchor against the
-		 * restored origin: that makes the grab negative (the press point
-		 * usually lies above/left of it) and shoves the window away. */
+		restore_maximized_toplevel(tl, false); // 拖动: 抓取接管几何
+		// 重新锚定抓取: 把按压点在最大化框内部的偏移按比例映射进还原框,
+		// 光标持续抓住按下时同一个窗口内部位置. 单纯的绝对偏移会让它停在同一个像素,
+		// 在更窄的还原窗口上会向右漂 (例如按在最大化 gvim 居中标题文字上,
+		// 窗口缩小时光标会飘过文字); 按比例映射会落在同一个相对位置 -
+		// 正是居中内容 (标题文字) 所在之处.
+		// 绝不要相对还原后的原点重新锚定: 那会让抓取变负
+		// (按压点通常在它左上方) 并把窗口推开.
 		if (server->move_deferred_restore && tl->has_restore_box &&
 				tl->restore_box.width > 0 && server->move_max_w > 0) {
 			server->grab_x = server->grab_x * tl->restore_box.width /
 				server->move_max_w;
 			server->grab_y = server->grab_y * tl->restore_box.height /
 				server->move_max_h;
-			/* map only once: current.maximized stays true until the client
-			 * commits the un-maximize configure, so every motion would
-			 * re-enter this branch and shrink the grab exponentially,
-			 * drifting the cursor up-left on every event */
+			// 只映射一次: 在客户端提交取消最大化 configure 之前
+			// current.maximized 一直为 true, 否则每次移动都会重入此分支
+			// 并让抓取指数收缩, 每个事件都把光标往左上漂
 			server->move_max_w = 0;
 			server->move_max_h = 0;
 		}
 	}
-	/* the cursor must stay above the status bar while dragging; the
-	 * window follows it with no bottom limit (it may slide past the bar
-	 * and off the screen, Windows-style) */
+	// 拖动期间光标必须保持在状态栏之上; 窗口跟随它且没有底部限制
+	// (可以滑过状态栏并移出屏幕, Windows 风格)
 	clamp_move_cursor(server);
 	lx = server->cursor->x;
 	ly = server->cursor->y;
@@ -296,28 +272,24 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 	wlr_scene_node_set_position(&tl->scene_tree->node, nx, ny);
 }
 
-/* turn a press on the title strip into a move grab: the grab anchors at the
- * original press position; dragging a maximized window restores it first
- * (Windows behavior) so the drag grips its restored geometry */
+// 把标题条上的按压变成移动抓取: 抓取锚定在原始按压位置;
+// 拖动最大化窗口会先还原它 (Windows 行为), 使拖动抓住其还原后的几何
 static void begin_zone_drag(struct server *server) {
 	struct toplevel *tl = server->zone_toplevel;
 	if (tl == NULL) {
 		return;
 	}
 	server->dragged = true;
-	server->zone_action = ZONE_NONE; /* the drag cancels any armed double click */
+	server->zone_action = ZONE_NONE; // 拖动取消任何已臂置的双击
 	double ref_x = server->press_x;
 	double ref_y = server->press_y;
 	if (tl->xdg_toplevel->current.maximized) {
-		/* drag of a maximized window's title bar: restore it to its
-		 * previous geometry and clamp the grab point into the restored
-		 * window, so the cursor grips its title bar and the window
-		 * follows (Windows behavior) */
-		restore_maximized_toplevel(tl, false); /* drag: grab owns the geometry */
+		// 拖动最大化窗口的标题栏: 先还原到之前的几何, 并把抓取点钳进还原后的窗口,
+		// 使光标抓住其标题栏, 窗口跟随 (Windows 行为)
+		restore_maximized_toplevel(tl, false); // 拖动: 抓取接管几何
 		struct wlr_box rb = tl->restore_box;
-		/* restore_maximized_toplevel clamps the restored position into
-		 * the work area, so grip the cursor on the window's actual box,
-		 * not the stale saved one */
+		// restore_maximized_toplevel 会把还原位置钳进作区,
+		// 所以按窗口实际框 (而不是过期保存的框) 抓住光标
 		rb.x = tl->scene_tree->node.x;
 		rb.y = tl->scene_tree->node.y;
 		if (tl->has_restore_box && rb.width > 0) {
@@ -341,9 +313,8 @@ static void begin_zone_drag(struct server *server) {
 	disarm_zone_timer(server);
 }
 
-/* the strip was held without moving for CONFIG_LONG_PRESS_NS: grab the
- * window so it follows the cursor (a long press anywhere on the border
- * moves the window) */
+// 标题条被按住未移动达到 CONFIG_LONG_PRESS_NS: 抓取窗口使其跟随光标
+// (在边框任意处长按都会移动窗口)
 static int zone_timer_cb(void *data) {
 	struct server *server = data;
 	if (server->zone_press && server->zone_toplevel != NULL &&
@@ -357,7 +328,7 @@ static int zone_timer_cb(void *data) {
 			begin_zone_drag(server);
 		}
 	}
-	return 0; /* leave the source armed for the next press */
+	return 0; // 保持源臂置, 供下一次按压使用
 }
 
 static void arm_zone_timer(struct server *server) {
@@ -367,30 +338,26 @@ static void arm_zone_timer(struct server *server) {
 		server->zone_timer =
 			wl_event_loop_add_timer(loop, zone_timer_cb, server);
 		if (server->zone_timer == NULL) {
-			return; /* no timer: drag still moves, long press can't grab */
+			return; // 没有定时器: 拖动仍能移动, 长按无法抓取
 		}
 	}
 	wl_event_source_timer_update(server->zone_timer,
 		CONFIG_LONG_PRESS_NS / 1000000);
 }
 
-/* ------------------------------------------------------------------ */
-/* edge resize                                                        */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// 边缘缩放
+// ------------------------------------------------------------------
 
-/* which edges of the toplevel the cursor is over. Only compositor-owned
- * windows (no client-side decoration) resize here; CSD windows handle
- * their own edges.  The top strip itself is the title bar, but its two
- * corner zones (top-left / top-right) are diagonal resize handles.
- * Each grab zone straddles its edge: half of CONFIG_EDGE_THICKNESS lies
- * outside the window box and half inside, so the handles are reachable
- * both from the desktop and from just inside the window.  A maximized or
- * fullscreen window is never resized here. */
+// 光标位于 toplevel 的哪些边缘. 只有合成器拥有的窗口 (无客户端侧装饰) 在这里缩放;
+// CSD 窗口自行处理边缘. 顶部条本身是标题栏, 但它的两个角区 (左上/右上)
+// 是对角缩放柄. 每个抓取区跨骑边缘: CONFIG_EDGE_THICKNESS 的一半在窗口框外,
+// 一半在内, 所以从桌面和窗口内部都能碰到手柄.
+// 最大化或全屏窗口绝不在这里缩放.
 static uint32_t toplevel_resize_edges(struct server *server,
 		struct toplevel *tl) {
-	/* a popup covering the window's border wins the pointer: no resize
-	 * handle while the cursor is over it (the popup is the focused
-	 * surface and its clicks must reach the menu, not a resize grab) */
+	// 覆盖窗口边框的 popup 赢得指针: 光标在其上时没有缩放手柄
+	// (popup 是聚焦 surface, 其点击必须到达菜单, 而不是触发缩放抓取)
 	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
 		return 0;
 	}
@@ -399,8 +366,8 @@ static uint32_t toplevel_resize_edges(struct server *server,
 				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
 			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
 			toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
-		/* dialogs and fixed-size windows (e.g. QQ's login) are never
-		 * resized, so their edges never get a resize cursor either */
+		// 对话框和固定尺寸窗口 (如 QQ 登录) 绝不缩放,
+		// 所以它们的边缘也不会出现缩放光标
 		return 0;
 	}
 	struct wlr_box box;
@@ -410,8 +377,7 @@ static uint32_t toplevel_resize_edges(struct server *server,
 	}
 	double lx = server->cursor->x;
 	double ly = server->cursor->y;
-	/* per-axis fixed dimensions (min == max) disable only that axis's
-	 * resize handles */
+	// 单轴固定尺寸 (min == max) 只禁用该轴的缩放手柄
 	bool fixed_w = tl->xdg_toplevel->current.min_width > 0 &&
 		tl->xdg_toplevel->current.min_width ==
 			tl->xdg_toplevel->current.max_width;
@@ -422,30 +388,29 @@ static uint32_t toplevel_resize_edges(struct server *server,
 		return 0;
 	}
 	uint32_t edges = 0;
-	double zone = CONFIG_EDGE_THICKNESS / 2.0; /* half out, half in */
-	double x0 = box.x - zone;              /* left handle outer edge */
-	double x1 = box.x + box.width + zone;  /* right handle outer edge */
-	double y0 = box.y - zone;              /* top handle outer edge */
-	double y1 = box.y + box.height + zone; /* bottom handle outer edge */
+	double zone = CONFIG_EDGE_THICKNESS / 2.0; // 一半在外, 一半在内
+	double x0 = box.x - zone;              // 左手柄外缘
+	double x1 = box.x + box.width + zone;  // 右手柄外缘
+	double y0 = box.y - zone;              // 上手柄外缘
+	double y1 = box.y + box.height + zone; // 下手柄外缘
 	bool in_x = lx >= x0 && lx <= x1;
 	bool in_y = ly >= y0 && ly <= y1;
 	bool on_left = lx >= x0 && lx < box.x + zone;
 	bool on_right = lx > box.x + box.width - zone && lx <= x1;
 	bool on_top = ly >= y0 && ly < box.y + zone;
 	bool on_bottom = ly > box.y + box.height - zone && ly <= y1;
-	/* left/right handles run the full height (both corner zones included) */
+	// 左右手柄贯穿整个高度 (含两个角区)
 	if (on_left && in_y && !fixed_w) {
 		edges |= WLR_EDGE_LEFT;
 	}
 	if (on_right && in_y && !fixed_w) {
 		edges |= WLR_EDGE_RIGHT;
 	}
-	/* the bottom handle runs the full width */
+	// 下手柄贯穿整个宽度
 	if (on_bottom && in_x && !fixed_h) {
 		edges |= WLR_EDGE_BOTTOM;
 	}
-	/* the top edge itself is the title strip; only its two corner zones
-	 * are diagonal resize handles */
+	// 顶部边缘本身是标题条; 只有它的两个角区是对角缩放手柄
 	if (on_top && (on_left || on_right) && !fixed_h) {
 		edges |= WLR_EDGE_TOP;
 	}
@@ -458,10 +423,10 @@ static const char *resize_cursor_name(uint32_t edges) {
 	bool top = (edges & WLR_EDGE_TOP) != 0;
 	bool bottom = (edges & WLR_EDGE_BOTTOM) != 0;
 	if ((left && top) || (right && bottom)) {
-		return "nwse-resize"; /* top-left / bottom-right corner */
+		return "nwse-resize"; // 左上/右下角
 	}
 	if ((right && top) || (left && bottom)) {
-		return "nesw-resize"; /* top-right / bottom-left corner */
+		return "nesw-resize"; // 右上/左下角
 	}
 	if (left || right) {
 		return "ew-resize";
@@ -469,9 +434,9 @@ static const char *resize_cursor_name(uint32_t edges) {
 	return "ns-resize";
 }
 
-/* ------------------------------------------------------------------ */
-/* bound buttons (like labwc): presses the compositor swallowed        */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// bound buttons (类似 labwc): 合成器吞掉的按压
+// ------------------------------------------------------------------
 
 static bool bound_button_contains(struct bound_buttons *bb, uint32_t value) {
 	for (int i = 0; i < bb->size; i++) {
@@ -511,14 +476,11 @@ static void set_cursor_override(struct server *server, const char *name) {
 	wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager, name);
 }
 
-/* show the cursor the focused client currently wants: its compositor-
- * rendered cursor shape (cursor-shape-v1), its own cursor surface
- * (wl_pointer.set_cursor), or the default arrow.  A shape wins over a
- * surface: the compositor always renders it at the correct output scale,
- * while a client-drawn surface may be sized by a client that does not
- * use wp_fractional_scale_v1.  If a compositor
- * cursor override (title strip / resize edge) is active it wins over
- * everything else. */
+// 显示聚焦客户端当前想要的光标: 它由合成器渲染的光标形状 (cursor-shape-v1)、
+// 它自己的 cursor surface (wl_pointer.set_cursor), 或默认箭头.
+// 形状优先于 surface: 合成器总能按正确的输出缩放渲染它,
+// 而客户端自绘 surface 可能由不使用 wp_fractional_scale_v1 的客户端决定尺寸.
+// 若合成器光标覆盖 (标题条/resize 边缘) 处于活动状态, 它优先于一切.
 void reapply_client_cursor(struct server *server) {
 	if (server->cursor_override != NULL) {
 		wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
@@ -527,11 +489,9 @@ void reapply_client_cursor(struct server *server) {
 	}
 	struct wlr_surface *focused =
 		server->seat->pointer_state.focused_surface;
-	/* the stored client shape is only valid while the pointer is still over
-	 * that client's surface; once the pointer moved out to empty desktop or
-	 * onto another surface, restoring it would show a stale cursor (e.g. a
-	 * resize shape the client set at the edge).  Fall through to the default
-	 * arrow below in that case. */
+	// 记录的形状只在指针仍位于该客户端 surface 上时有效;
+	// 一旦指针移到空桌面或另一个 surface, 恢复它会显示过期光标
+	// (如客户端在边缘设置的 resize 形状). 那种情况下落到下面的默认箭头.
 	bool over_shape_client = focused != NULL &&
 		server->client_cursor_shape_client != NULL &&
 		focused->resource->client ==
@@ -545,13 +505,10 @@ void reapply_client_cursor(struct server *server) {
 			wlr_cursor_shape_v1_name(server->client_cursor_shape));
 		return;
 	}
-	/* only hand the pointer back to the client when the pointer is still
-	 * over that client's surface (e.g. leaving the resize strip back into
-	 * the window). If the pointer moved out to empty desktop, the stored
-	 * client cursor (e.g. the terminal's text caret) would be stale, so
-	 * fall back to the default arrow. The client draws its cursor on a
-	 * separate surface, so compare the owning clients rather than the
-	 * surfaces themselves. */
+	// 只在指针仍位于该客户端 surface 上时才把指针交回客户端
+	// (如从 resize 条回到窗口内). 若指针移到空桌面, 记录的客户端光标
+	// (如终端的文本插入符) 会过期, 所以退回默认箭头.
+	// 客户端把光标画在单独的 surface 上, 所以比较所属客户端而不是 surface 本身.
 	bool over_client_surface = focused != NULL &&
 		server->client_cursor_surface != NULL &&
 		focused->resource->client ==
@@ -576,13 +533,10 @@ static void clear_cursor_override(struct server *server) {
 	reapply_client_cursor(server);
 }
 
-/* the toplevel the cursor interacts with: the window under the cursor, or
- * - when the cursor is outside every window - the one whose resize grab
- * zone (CONFIG_EDGE_THICKNESS px straddling the box: half in, half out)
- * contains the cursor, so the resize handles stay reachable even though
- * half of them live outside the box.
- * The title strip's 2 px overhang above the box (the ring's top edge) is
- * reachable the same way, so the whole colored strip is draggable. */
+// 光标交互的 toplevel: 光标下的窗口, 或 - 光标在所有窗口之外时 -
+// 其缩放抓取区 (CONFIG_EDGE_THICKNESS 像素跨骑窗口框: 一半内一半外)
+// 包含光标的那个, 所以缩放手柄即使有一半在框外也仍可触达.
+// 标题条在框上方 2 像素的悬出 (环的顶边) 同样可达, 所以整条彩色条都可拖动.
 static struct toplevel *toplevel_nearby(struct server *server) {
 	struct toplevel *tl = toplevel_at(server);
 	if (tl != NULL && !tl->minimized && !tl->closing) {
@@ -599,13 +553,11 @@ static struct toplevel *toplevel_nearby(struct server *server) {
 	return NULL;
 }
 
-/* the band around a window where the compositor suppresses client cursor
- * requests.  The actual grab zone is CONFIG_EDGE_THICKNESS/2 (half inside /
- * half outside the box), but clients detect their own edges over the full
- * CONFIG_EDGE_THICKNESS inside the window (winit, GTK, ...).  Without the
- * wider band a client would store its own resize shape (e.g. clash-verge's
- * ew_resize) just outside the grab zone and get it restored stale once the
- * cursor leaves the edge. */
+// 合成器抑制客户端光标请求的窗口周围条带.
+// 实际抓取区是 CONFIG_EDGE_THICKNESS/2 (一半内一半外),
+// 但客户端在窗口内部整个 CONFIG_EDGE_THICKNESS 范围内检测自己的边缘
+// (winit、GTK 等). 没有更宽的条带, 客户端会把它的 resize 形状
+// (如 clash-verge 的 ew_resize) 存在抓取区外一点, 光标离开边缘后又被过期地恢复.
 static bool cursor_in_cursor_band(struct server *server,
 		struct toplevel *tl) {
 	if (tl->closing || tl->minimized || tl->xdg_toplevel->base == NULL ||
@@ -622,8 +574,8 @@ static bool cursor_in_cursor_band(struct server *server,
 	}
 	double lx = server->cursor->x;
 	double ly = server->cursor->y;
-	double in = CONFIG_EDGE_THICKNESS;        /* inside the window */
-	double out = CONFIG_EDGE_THICKNESS / 2.0; /* outside the window */
+	double in = CONFIG_EDGE_THICKNESS;        // 窗口内侧
+	double out = CONFIG_EDGE_THICKNESS / 2.0; // 窗口外侧
 	bool x_band = lx >= box.x - out && lx <= box.x + box.width + out;
 	bool y_band = ly >= box.y - out && ly <= box.y + box.height + out;
 	bool on_left = lx >= box.x - out && lx < box.x + in;
@@ -636,10 +588,9 @@ static bool cursor_in_cursor_band(struct server *server,
 		(on_top && x_band) || (on_bottom && x_band);
 }
 
-/* is the cursor over the compositor's own frame zone (title strip / resize
- * edge) of any window?  There the compositor owns the cursor, so client
- * cursor requests are ignored (input.c) - the client still keeps pointer
- * focus and receives motion, so its hover feedback keeps working. */
+// 光标是否位于任意窗口的合成器边框区 (标题条/resize 边缘)?
+// 那里合成器拥有光标, 所以客户端光标请求被忽略 (input.c) -
+// 客户端仍保留指针焦点并收到 motion, 所以其悬停反馈继续工作.
 bool pointer_over_frame_zone(struct server *server) {
 	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
 		return false;
@@ -649,8 +600,7 @@ bool pointer_over_frame_zone(struct server *server) {
 		return cursor_in_cursor_band(server, tl) ||
 			is_in_titlebar_zone(server, tl);
 	}
-	/* cursor outside every window: the outer half of an edge zone is still
-	 * reachable over the desktop */
+	// 光标在所有窗口之外: 边缘区的外半部分在桌面上仍可触达
 	struct toplevel *candidate;
 	wl_list_for_each(candidate, &server->toplevels, link) {
 		if (cursor_in_cursor_band(server, candidate)) {
@@ -660,13 +610,12 @@ bool pointer_over_frame_zone(struct server *server) {
 	return false;
 }
 
-/* decide which compositor-owned cursor to show at the current position:
- * hovering the colored top strip (CONFIG_TITLEBAR_HEIGHT px) shows
- * CONFIG_TITLEBAR_CURSOR (all-scroll); moving out of the strip restores
- * the client's cursor through clear_cursor_override() */
+// 决定当前位置显示哪种合成器光标: 悬停彩色顶部条 (CONFIG_TITLEBAR_HEIGHT 像素)
+// 显示 CONFIG_TITLEBAR_CURSOR (all-scroll); 移出条后通过 clear_cursor_override()
+// 恢复客户端光标
 void update_cursor_style(struct server *server) {
-	/* a captured pointer (QEMU grab, game mouselook) belongs to the client:
-	 * never show the compositor's own frame cursors over it */
+	// 被捕获的指针 (QEMU 抓取、游戏 mouselook) 属于客户端:
+	// 绝不在其上显示合成器自己的边框光标
 	if (pointer_constraint_active(server)) {
 		clear_cursor_override(server);
 		return;
@@ -678,28 +627,23 @@ void update_cursor_style(struct server *server) {
 	} else if (server->resizing && server->resize_toplevel != NULL) {
 		name = resize_cursor_name(server->resize_edges);
 	} else if (server->seat->pointer_state.button_count > 0) {
-		/* implicit grab: a client holds a pointer button (text selection,
-		 * right-button drag, ...) and the pointer is focused on its
-		 * surface.  Never switch to the compositor's hover cursors (edge
-		 * resize / title strip) while that button is held, no matter which
-		 * path reaches here (motion, button release, focus change); the
-		 * client's cursor stays until the last button is released. */
+		// 隐式抓取: 客户端按住指针按钮 (文本选择、右键拖动等), 指针聚焦在其 surface 上.
+		// 按住期间绝不切换到合成器的悬停光标 (边缘 resize/标题条), 无论哪条路径到达这里
+		// (motion、按钮释放、焦点变化); 客户端光标保持到最后一个按钮释放.
 		return;
 	} else {
 		struct toplevel *tl = toplevel_nearby(server);
 		if (tl != NULL) {
 			if (toplevel_is_dialog(tl)) {
-				/* dialogs: the top close band gets the all-scroll hint
-				 * (CONFIG_EDGE_THICKNESS / title-strip height); the edges
-				 * keep the client's own cursor - no resize cursors */
+				// 对话框: 顶部关闭条带得到 all-scroll 提示
+				// (CONFIG_EDGE_THICKNESS / 标题条高度); 边缘保留客户端自己的光标 -
+				// 没有缩放光标
 				if (is_in_titlebar_zone(server, tl)) {
 					name = CONFIG_TITLEBAR_CURSOR;
 				}
 			} else {
 				uint32_t edges = toplevel_resize_edges(server, tl);
-				/* the corner resize zones win over the title strip;
-				 * everywhere else the top strip keeps its all-scroll
-				 * cursor */
+				// 角落缩放区优先于标题条; 其他地方顶部条保持其 all-scroll 光标
 				bool corner = (edges & WLR_EDGE_TOP) != 0;
 				if (corner || !is_in_titlebar_zone(server, tl)) {
 					if (edges != 0) {
@@ -715,15 +659,15 @@ void update_cursor_style(struct server *server) {
 	if (name != NULL) {
 		set_cursor_override(server, name);
 	} else if (server->cursor_override != NULL) {
-		/* leave the pointer over the client's own cursor (or the default
-		 * one, which the motion handler resets when the surface changes) */
+		// 让指针停在客户端自己的光标上 (或默认光标, motion 处理器在 surface
+		// 变化时会重置它)
 		clear_cursor_override(server);
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* resize outline (labwc-style)                                       */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// 缩放轮廓 (labwc 风格)
+// ------------------------------------------------------------------
 
 static void resize_outline_ensure(struct server *server) {
 	if (server->resize_outline != NULL) {
@@ -731,7 +675,7 @@ static void resize_outline_ensure(struct server *server) {
 	}
 	server->resize_outline =
 		wlr_scene_tree_create(server->layers[LAYER_OVERLAY]);
-	/* focused border color 0x9F6680, premultiplied */
+	// 聚焦边框色 0x9F6680, 预乘
 	float color[4] = { 0.62f, 0.40f, 0.50f, 1.0f };
 	for (int i = 0; i < 4; i++) {
 		server->resize_outline_edges[i] =
@@ -762,11 +706,9 @@ static void resize_outline_hide(struct server *server) {
 	}
 }
 
-/* outline mode: after the button release the final size is sent and the
- * grab stays until the client commits it (so the top/left reposition and
- * the resize cursor stay put).  A client that never commits - hung, or one
- * ignoring the configure - would leave the grab and the resize cursor
- * stuck forever, so a watchdog force-ends the grab. */
+// 轮廓模式: 按钮释放后发送最终尺寸, 并保持抓取直到客户端提交它
+// (这样上/左重新定位和缩放光标保持不动). 从不提交的客户端 - 卡死,
+// 或忽略 configure - 会让抓取和缩放光标永远卡住, 所以看门狗强制结束抓取.
 static int resize_final_timeout_cb(void *data) {
 	struct server *server = data;
 	if (server->resizing && server->resize_final_pending) {
@@ -782,7 +724,7 @@ static void arm_resize_final_timer(struct server *server) {
 		server->resize_final_timer =
 			wl_event_loop_add_timer(loop, resize_final_timeout_cb, server);
 		if (server->resize_final_timer == NULL) {
-			return; /* no watchdog: the grab still ends on the commit */
+			return; // 没有看门狗: 抓取仍会在提交时结束
 		}
 	}
 	wl_event_source_timer_update(server->resize_final_timer,
@@ -797,7 +739,7 @@ static void disarm_resize_final_timer(struct server *server) {
 
 void begin_resize(struct server *server, struct toplevel *tl,
 		uint32_t edges) {
-	/* never resize a maximized or fullscreen window */
+	// 绝不缩放最大化或全屏窗口
 	if (server->resizing || tl->xdg_toplevel->current.maximized ||
 			tl->fullscreen) {
 		return;
@@ -805,19 +747,19 @@ void begin_resize(struct server *server, struct toplevel *tl,
 	server->resizing = true;
 	server->input_mode = INPUT_MODE_RESIZE;
 	server->resize_toplevel = tl;
-	tl->user_moved = true; /* user resize: stop auto-centering */
+	tl->user_moved = true; // 用户缩放: 停止自动居中
 	server->resize_edges = edges;
 	server->resize_final_pending = false;
 	server->press_x = server->cursor->x;
 	server->press_y = server->cursor->y;
 	toplevel_box(tl, &server->resize_orig);
-	/* a grab that has not moved yet must not re-request the current size */
+	// 尚未移动的抓取不得重新请求当前尺寸
 	server->resize_last_w = server->resize_orig.width;
 	server->resize_last_h = server->resize_orig.height;
 	if (CONFIG_RESIZE_DRAW_CONTENTS) {
 		wlr_xdg_toplevel_set_resizing(tl->xdg_toplevel, true);
 	} else {
-		/* outline mode: show the starting box, apply the real size later */
+		// 轮廓模式: 显示起始框, 稍后再应用真实尺寸
 		server->resize_target = server->resize_orig;
 		resize_outline_show(server, &server->resize_target);
 	}
@@ -828,17 +770,15 @@ static void update_resize(struct server *server) {
 	struct toplevel *tl = server->resize_toplevel;
 	if (tl == NULL || tl->xdg_toplevel->base == NULL ||
 			tl->xdg_toplevel->current.maximized) {
-		return; /* never adjust a maximized window */
+		return; // 绝不调整最大化窗口
 	}
 	double dx = server->cursor->x - server->press_x;
 	double dy = server->cursor->y - server->press_y;
 	struct wlr_box orig = server->resize_orig;
 
-	/* compute the target size with rounding instead of (int) truncation:
-	 * truncating kept the dragged edge up to 1 px behind the cursor and
-	 * quantized sub-pixel mouse motion asymmetrically, so the edge wobbled
-	 * under the cursor while a move (which uses doubles end to end) was
-	 * smooth. */
+	// 目标尺寸用四舍五入而不是 (int) 截断: 截断会让拖动边缘落后光标最多 1 像素,
+	// 并不对称地量化亚像素鼠标移动, 所以边缘在光标下抖动,
+	// 而移动 (端到端用 double) 是平滑的.
 	int nw = orig.width;
 	int nh = orig.height;
 	if ((server->resize_edges & WLR_EDGE_RIGHT) != 0) {
@@ -854,7 +794,7 @@ static void update_resize(struct server *server) {
 		nh = orig.height - (int)llround(dy);
 	}
 
-	/* clamp to the client's constraints (or a sane fallback) */
+	// 钳制到客户端约束 (或合理的回退值)
 	int min_w = tl->xdg_toplevel->current.min_width > 0
 		? tl->xdg_toplevel->current.min_width : 40;
 	int min_h = tl->xdg_toplevel->current.min_height > 0
@@ -876,8 +816,7 @@ static void update_resize(struct server *server) {
 		nh = max_h;
 	}
 
-	/* the target box: a top/left grab moves the window origin so the
-	 * opposite edge stays anchored where it was when the grab started */
+	// 目标框: 上/左抓取会移动窗口原点, 使对侧边缘保持在抓取开始时的锚点
 	struct wlr_box box = {
 		.x = (server->resize_edges & WLR_EDGE_LEFT) != 0
 			? orig.x + orig.width - nw : orig.x,
@@ -888,10 +827,9 @@ static void update_resize(struct server *server) {
 	};
 
 	if (!CONFIG_RESIZE_DRAW_CONTENTS) {
-		/* outline mode (labwc-style): only follow the cursor with the
-		 * outline; apply the real size once on release, so the dragged
-		 * edge never waits for the client's configure -> commit round trip
-		 * and the drag feels as tight as a window move. */
+		// 轮廓模式 (labwc 风格): 只用轮廓跟随光标;
+		// 释放时一次性应用真实尺寸, 使拖动边缘无需等待客户端
+		// configure -> commit 往返, 手感像窗口移动一样紧.
 		if (box.x == server->resize_target.x &&
 				box.y == server->resize_target.y &&
 				box.width == server->resize_target.width &&
@@ -903,14 +841,11 @@ static void update_resize(struct server *server) {
 		return;
 	}
 
-	/* live mode: only send a configure when the target size actually
-	 * changed; wlr_xdg_toplevel_set_size always schedules one, so repeating
-	 * the same size on every motion event (sub-pixel deltas, or a client
-	 * that has not committed yet) would push a configure -> commit -> mask/
-	 * border GPU re-render cycle through the client on every event.  That
-	 * synchronous per-commit GL work is what makes a resize drag stutter
-	 * (and a software cursor with it) while a move - no round trip, no
-	 * GL - stays smooth. */
+	// 实时模式: 只有目标尺寸真正变化时才发 configure;
+	// wlr_xdg_toplevel_set_size 总会调度一次, 所以在每个 motion 事件上重复同样尺寸
+	// (亚像素增量, 或客户端尚未提交) 会让 configure -> commit -> mask/
+	// border GPU 重绘循环在每个事件上穿过客户端. 那种同步的每次提交 GL 工作
+	// 正是缩放拖动卡顿的原因 (软件光标也跟着卡), 而移动 - 无往返、无 GL - 保持平滑.
 	if (nw == server->resize_last_w && nh == server->resize_last_h) {
 		return;
 	}
@@ -925,8 +860,8 @@ void resize_grab_clear(struct server *server) {
 	server->resize_toplevel = NULL;
 	server->resize_edges = 0;
 	server->resize_final_pending = false;
-	/* a late motion between the release and the final commit can re-show
-	 * the outline; hide it here so no ghost outline survives the grab */
+	// 释放到最终提交之间的迟到 motion 可能重新显示轮廓;
+	// 在这里隐藏它, 使抓取结束后不残留幽灵轮廓
 	resize_outline_hide(server);
 	disarm_resize_final_timer(server);
 }
@@ -943,11 +878,9 @@ void end_resize(struct server *server) {
 			resize_grab_clear(server);
 			return;
 		}
-		/* outline mode: hide the outline and apply the final box.  Keep the
-		 * grab (resizing stays true) until the client commits the new
-		 * geometry, so the cursor stays resize-shaped and the top/left
-		 * reposition happens in xdg_toplevel_commit() against the committed
-		 * size (no one-frame bounce, no transient default cursor). */
+		// 轮廓模式: 隐藏轮廓并应用最终框. 保持抓取 (resizing 仍为 true)
+		// 直到客户端提交新几何, 使光标保持缩放形状, 上/左重新定位发生在
+		// xdg_toplevel_commit() 中并基于已提交尺寸 (没有一帧的弹跳, 也没有瞬时的默认光标).
 		resize_outline_hide(server);
 		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 		if (!base->surface->mapped) {
@@ -959,36 +892,32 @@ void end_resize(struct server *server) {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel,
 				server->resize_target.width,
 				server->resize_target.height);
-			server->resize_final_pending = true; /* finish on commit */
-			arm_resize_final_timer(server); /* watchdog */
+			server->resize_final_pending = true; // 在提交时结束
+			arm_resize_final_timer(server); // 看门狗
 		} else {
-			resize_grab_clear(server); /* size unchanged: nothing will commit */
+			resize_grab_clear(server); // 尺寸未变: 不会有提交
 		}
 		return;
 	}
 	resize_grab_clear(server);
 }
 
-/* ------------------------------------------------------------------ */
-/* chord gestures                                                      */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// 和弦手势
+// ------------------------------------------------------------------
 
-/* Hold one mouse button, then press the other:
- *   right held + double-click left -> toggle maximize / restore
- *   left held + double-click right -> close the window
- *   hold the other button          -> move the window under the cursor
- *                                    (cursor turns to CONFIG_MOVE_CURSOR; releasing
- *                                    restores the previous cursor style)
- * A fullscreen window is never moved by the hold chord (it covers the whole
- * output; leave fullscreen first), and maximize/restore is already a no-op
- * while fullscreen, so only the close chord still applies there. */
+// 按住一个鼠标按钮, 再按另一个:
+//   按住右键 + 双击左键 -> 切换最大化/还原
+//   按住左键 + 双击右键 -> 关闭窗口
+//   按住另一个按钮       -> 移动光标下的窗口
+//                           (光标变为 CONFIG_MOVE_CURSOR; 释放恢复之前的光标样式)
+// 全屏窗口绝不因按住和弦而移动 (它覆盖整个输出; 先离开全屏),
+// 而最大化/还原在全屏时本来就是空操作, 所以那里只有关闭和弦仍适用.
 
-/* start moving the chord's window with the cursor; the grab anchors at the
- * trigger button's press point (server->press_x/press_y), so the whole drag
- * distance is honored; a maximized window is restored first so the drag
- * grips its restored geometry (Windows behavior, same as the title-strip
- * drag).  A fullscreen window is not moved at all (early return, so the
- * chord neither grabs nor shows the move cursor). */
+// 用光标开始移动和弦的窗口; 抓取锚定在触发按钮的按压点
+// (server->press_x/press_y), 所以整个拖动距离都得到尊重;
+// 最大化窗口先还原, 使拖动抓住其还原后的几何 (Windows 行为, 与标题条拖动相同).
+// 全屏窗口完全不移动 (提前返回, 所以和弦既不抓取也不显示移动光标).
 static void begin_chord_move(struct server *server) {
 	struct toplevel *tl = server->chord_toplevel;
 	if (tl == NULL || server->moving || server->resizing || tl->fullscreen) {
@@ -997,10 +926,10 @@ static void begin_chord_move(struct server *server) {
 	double ref_x = server->press_x;
 	double ref_y = server->press_y;
 	if (tl->xdg_toplevel->current.maximized) {
-		restore_maximized_toplevel(tl, false); /* drag: grab owns the geometry */
+		restore_maximized_toplevel(tl, false); // 拖动: 抓取接管几何
 		struct wlr_box rb = tl->restore_box;
-		/* restore_maximized_toplevel clamps the restored position into the
-		 * work area, so grip the cursor on the window's actual box */
+		// restore_maximized_toplevel 会把还原位置钳进作区,
+		// 所以按窗口实际框抓住光标
 		rb.x = tl->scene_tree->node.x;
 		rb.y = tl->scene_tree->node.y;
 		if (tl->has_restore_box && rb.width > 0) {
@@ -1022,7 +951,7 @@ static void begin_chord_move(struct server *server) {
 	begin_move(server, tl, ref_x, ref_y);
 	move_toplevel_to(server, server->cursor->x, server->cursor->y);
 	server->chord_moving = true;
-	update_cursor_style(server); /* CONFIG_MOVE_CURSOR */
+	update_cursor_style(server); // CONFIG_MOVE_CURSOR
 }
 
 static void disarm_chord_timer(struct server *server) {
@@ -1031,8 +960,7 @@ static void disarm_chord_timer(struct server *server) {
 	}
 }
 
-/* the disambiguation timer fired while the trigger button is still held:
- * it is a hold, not the first click of a double-click -> move the window */
+// 判定定时器在触发按钮仍按住时到期: 这是按住, 不是双击的第一次点击 -> 移动窗口
 static int chord_timer_cb(void *data) {
 	struct server *server = data;
 	if (server->chord_active && server->chord_pending &&
@@ -1047,7 +975,7 @@ static int chord_timer_cb(void *data) {
 			begin_chord_move(server);
 		}
 	}
-	return 0; /* leave the source armed for the next chord */
+	return 0; // 保持源臂置, 供下一次和弦使用
 }
 
 static void arm_chord_timer(struct server *server) {
@@ -1057,14 +985,14 @@ static void arm_chord_timer(struct server *server) {
 		server->chord_timer =
 			wl_event_loop_add_timer(loop, chord_timer_cb, server);
 		if (server->chord_timer == NULL) {
-			return; /* no timer: double-click still works, hold can't move */
+			return; // 没有定时器: 双击仍可用, 按住无法移动
 		}
 	}
 	wl_event_source_timer_update(server->chord_timer,
 		CONFIG_DOUBLE_CLICK_NS / 1000000);
 }
 
-/* fully end a chord gesture and every grab it started */
+// 完全结束一次和弦手势及其启动的所有抓取
 static void end_chord(struct server *server) {
 	disarm_chord_timer(server);
 	disarm_zone_timer(server);
@@ -1081,16 +1009,16 @@ static void end_chord(struct server *server) {
 	server->chord_moving = false;
 }
 
-/* the double-click action depends on which button is held:
- * right held + double-click left -> toggle maximize / restore
- * left held + double-click right -> close the window */
+// 双击动作取决于按住的是哪个按钮:
+// 按住右键 + 双击左键 -> 切换最大化/还原
+// 按住左键 + 双击右键 -> 关闭窗口
 static void chord_double_click(struct server *server, uint32_t chord_button) {
 	struct toplevel *tl = server->chord_toplevel;
 	if (tl == NULL) {
 		return;
 	}
 	if (chord_button == BTN_LEFT) {
-		/* the held button is the right one */
+		// 按住的是右键
 		focus_toplevel(server, tl);
 		if (tl->xdg_toplevel->current.maximized) {
 			restore_maximized_toplevel(tl, true);
@@ -1098,14 +1026,13 @@ static void chord_double_click(struct server *server, uint32_t chord_button) {
 			set_maximized(server, tl, true);
 		}
 	} else {
-		/* the held button is the left one */
+		// 按住的是左键
 		close_toplevel(tl);
 	}
 }
 
-/* the other button was pressed while one is held: remember which presses
- * the compositor consumed (so their releases are swallowed too) and tell a
- * double-click (toggle maximize) from a hold (move) */
+// 一个按钮按住时另一个被按下: 记住合成器消费了哪些按压
+// (其释放也要吞掉), 并区分双击 (切换最大化) 和按住 (移动)
 static void begin_chord(struct server *server, uint32_t button) {
 	struct toplevel *tl = toplevel_at(server);
 	server->chord_active = true;
@@ -1114,7 +1041,7 @@ static void begin_chord(struct server *server, uint32_t button) {
 	server->chord_pending = false;
 	server->chord_moving = false;
 
-	/* the trigger button's press is swallowed by the compositor */
+	// 触发按钮的按压被合成器吞掉
 	server->press_x = server->cursor->x;
 	server->press_y = server->cursor->y;
 	if (button == BTN_LEFT) {
@@ -1122,66 +1049,59 @@ static void begin_chord(struct server *server, uint32_t button) {
 	} else {
 		server->chord_swallow_right = true;
 	}
-	/* NOTE: the held button's release needs no extra swallow flag here -
-	 * if its press was swallowed as a zone press it is already in
-	 * bound_buttons, and its release is swallowed either by
-	 * process_chord_button (zone_press) or by the generic release path
-	 * (was_bound). */
+	// 注意: 被按住按钮的释放不需要额外的吞掉标志 -
+	// 若其按压作为标题区按压被吞, 它已在 bound_buttons 里,
+	// 释放要么由 process_chord_button (zone_press) 吞掉,
+	// 要么由通用释放路径 (was_bound) 吞掉.
 
 	if (is_double_click(server, button)) {
-		/* double-clicked the other button: the action depends on which
-		 * button is held (right held -> maximize toggle, left held ->
-		 * close) */
-		server->last_was_click = false; /* consumed by the double click */
+		// 双击了另一个按钮: 动作取决于按住的是哪个
+		// (按住右键 -> 切换最大化, 按住左键 -> 关闭)
+		server->last_was_click = false; // 被双击消费
 		server->chord_active = false;
 		chord_double_click(server, button);
 		return;
 	}
 
-	/* first press: it may become a double-click (maximize) or a hold
-	 * (move); the timer disambiguates */
+	// 首次按下: 可能变成双击 (最大化) 或按住 (移动); 定时器负责判定
 	server->chord_pending = true;
 	arm_chord_timer(server);
 }
 
-/* button events while a chord is active: the trigger button decides
- * double-click vs hold; releasing either button ends the gesture */
+// 和弦活动期间的按钮事件: 触发按钮决定双击还是按住; 释放任一个都结束手势
 static void process_chord_button(struct server *server, uint32_t time_msec,
 		uint32_t button, enum wl_pointer_button_state state) {
 	if (button != BTN_LEFT && button != BTN_RIGHT) {
-		return; /* other buttons don't participate in the chord */
+		return; // 其他按钮不参与和弦
 	}
 
 	if (button == server->chord_button) {
 		if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-			/* this press is consumed by the chord: swallow its release
-			 * too (even when the chord ends right here) */
+			// 这次按压被和弦消费: 其释放也要吞掉 (即使和弦就此结束)
 			if (button == BTN_LEFT) {
 				server->chord_swallow_left = true;
 			} else {
 				server->chord_swallow_right = true;
 			}
-			/* second press within the double-click window: the user
-			 * double-clicked the other button -> maximize (right held)
-			 * or close (left held) */
+			// 双击窗口内的第二次按下: 用户双击了另一个按钮 ->
+			// 最大化 (按住右键) 或关闭 (按住左键)
 			if (is_double_click(server, button)) {
-				server->last_was_click = false; /* consumed */
+				server->last_was_click = false; // 已消费
 				end_chord(server);
 				chord_double_click(server, button);
 			}
 			return;
 		}
-		/* release of the trigger button */
+		// 触发按钮的释放
 		if (server->chord_pending) {
-			/* it was a click, not a hold: remember it so a quick second
-			 * press is recognized as a double-click */
+			// 这是一次点击, 不是按住: 记住它, 使很快的第二次按下被识别为双击
 			disarm_chord_timer(server);
 			clock_gettime(CLOCK_MONOTONIC, &server->last_release_time);
 			server->last_was_click = true;
 			server->last_click_button = button;
 			server->chord_pending = false;
 		} else if (server->chord_moving) {
-			/* release ends the move and restores the cursor style */
+			// 释放结束移动并恢复光标样式
 			end_chord(server);
 			update_cursor_style(server);
 		} else {
@@ -1195,13 +1115,12 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 		return;
 	}
 
-	/* the held button was released: end the chord; forward its release
-	 * only if its press reached the client (otherwise it was a swallowed
-	 * zone press and the release must stay swallowed) */
+	// 被按住的按钮被释放: 结束和弦; 只有其按压到达过客户端才转发其释放
+	// (否则它是一次被吞的标题区按压, 释放也必须保持被吞)
 	if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
 		bool zone = server->zone_press;
-		/* a swallowed zone press was recorded in bound_buttons; clear it
-		 * here so a stale entry can never swallow a later release */
+		// 被吞的标题区按压记在 bound_buttons 里; 这里清除它,
+		// 使过期条目绝不会吞掉之后的释放
 		bound_button_remove(&server->bound_buttons, button);
 		end_chord(server);
 		if (!zone) {
@@ -1217,14 +1136,13 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* cursor event processing                                            */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// 光标事件处理
+// ------------------------------------------------------------------
 
-/* surface-local coordinates of a layout point for a toplevel's surface,
- * even when the point lies outside the surface (used to keep forwarding
- * motion to the grabbed surface during an implicit grab).  Returns false
- * when the surface is not a toplevel surface. */
+// 布局点相对于某 toplevel surface 的 surface 局部坐标,
+// 即使点位于 surface 之外 (用于隐式抓取期间继续向被抓 surface 转发 motion).
+// surface 不是 toplevel surface 时返回 false.
 static bool toplevel_surface_coords(struct server *server,
 		struct wlr_surface *surface, double lx, double ly,
 		double *sx, double *sy) {
@@ -1247,7 +1165,7 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 			server->cursor->x, server->cursor->y);
 	}
 
-	/* keep the input method's candidate window glued to the cursor */
+	// 让输入法的候选窗贴着光标
 	ime_update_popup(server);
 
 	if (server->moving && server->move_toplevel != NULL) {
@@ -1262,9 +1180,8 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 		return;
 	}
 
-	/* a chord's trigger is held and the cursor moves: start the move right
-	 * away instead of waiting for the disambiguation timer (a quick release
-	 * without motion stays a click, so double-clicks still work) */
+	// 和弦的触发键按住且光标移动: 立即开始移动, 而不等待判定定时器
+	// (没有移动的快速释放仍算点击, 所以双击仍可用)
 	if (server->chord_active && server->chord_pending &&
 			!server->chord_moving && !server->moving) {
 		double dx = server->cursor->x - server->press_x;
@@ -1272,7 +1189,7 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 		if (dx * dx + dy * dy > CONFIG_DRAG_THRESHOLD * CONFIG_DRAG_THRESHOLD) {
 			server->chord_pending = false;
 			begin_chord_move(server);
-			return; /* this motion started the move; don't forward it */
+			return; // 这次 motion 启动了移动; 不转发它
 		}
 	}
 
@@ -1282,7 +1199,7 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 			double dx = server->cursor->x - server->press_x;
 			double dy = server->cursor->y - server->press_y;
 			if (dx * dx + dy * dy > CONFIG_DRAG_THRESHOLD * CONFIG_DRAG_THRESHOLD) {
-				/* a press on the title strip that moves becomes a move grab */
+				// 标题条上会移动的按压变成移动抓取
 				begin_zone_drag(server);
 			}
 		} else if (server->moving) {
@@ -1291,18 +1208,15 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 		return;
 	}
 
-	/* normal path: forward pointer motion to the surface under the cursor */
+	// 常规路径: 把指针 motion 转发给光标下的 surface
 	double sx, sy;
 	struct wlr_surface *surface = NULL;
-	/* While a window morphs (animate.c: maximize/restore zoom, or the
-	 * scale part of an open/close fade) its visible content is the rounded
-	 * FBO scaled into the morph box, but the scene only ever hit-tests the
-	 * raw client surface at its natural geometry.  A cursor over the
-	 * morphing window's visible area that the scene attributes to a window
-	 * below (restore / shrink zoom) must reach the morphing window
-	 * instead, with coordinates mapped through the morph scale.  Popups
-	 * and layer-shell surfaces float above the windows and always win.
-	 * The extra hit tests only run while some window actually morphs. */
+	// 窗口形变时 (animate.c: 最大化/还原缩放, 或打开/关闭淡变的缩放部分)
+	// 其可见内容是缩放进形态框的圆角 FBO, 但场景只在自然几何上命中测试原始客户端 surface.
+	// 光标位于形变窗口可见区域内、而场景把它归给下方窗口 (还原/缩小缩放) 时,
+	// 它必须改为到达形变窗口, 坐标经形态缩放映射.
+	// popup 和 layer-shell surface 浮在窗口之上, 总是优先.
+	// 只有确实有窗口在形变时才做额外命中测试.
 	struct toplevel *morph_tl = NULL;
 	bool any_morph = false;
 	{
@@ -1326,8 +1240,7 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 		surface = morph_tl->xdg_toplevel->base->surface;
 		if (morph_tl->morph_w > 0 && morph_tl->morph_h > 0 &&
 				box.width > 0 && box.height > 0) {
-			/* map the cursor (inside the morph box) through the morph
-			 * scale onto the content's natural geometry */
+			// 把光标 (位于形态框内) 经形态缩放映射到内容的自然几何上
 			sx = (server->cursor->x - morph_tl->morph_x) *
 				(double)box.width / (double)morph_tl->morph_w;
 			sy = (server->cursor->y - morph_tl->morph_y) *
@@ -1348,16 +1261,15 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 			if (scene_surface != NULL) {
 				surface = scene_surface->surface;
 			} else {
-				/* the hit buffer is the compositor's rounded-corner masked
-				 * content re-render: resolve the xdg surface via the scene
-				 * tag on its tree */
+				// 命中的 buffer 是合成器圆角掩码内容的重绘:
+				// 通过其树上的场景标签解析 xdg surface
 				struct wlr_scene_node *n = node;
 				while (n != NULL) {
 					if (n->data != NULL) {
 						struct scene_tag *tag = n->data;
 						if (tag->type == TAG_POPUP) {
-							/* a rounded popup (Qt menu): the hit buffer is its
-							 * masked re-render; resolve the popup surface */
+							// 圆角 popup (Qt 菜单): 命中的 buffer 是它的
+							// 掩码重绘; 解析出 popup surface
 							struct wlr_xdg_popup *popup = tag->ptr;
 							if (popup != NULL && popup->base != NULL) {
 								surface = popup->base->surface;
@@ -1368,7 +1280,7 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 								surface = tl->xdg_toplevel->base->surface;
 							}
 						}
-						break; /* a closer tagged object won the hit test */
+						break; // 更近的带标签对象赢得命中测试
 					}
 					n = n->parent != NULL ? &n->parent->node : NULL;
 				}
@@ -1376,10 +1288,9 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 		}
 	}
 
-	/* implicit grab: a client holds a pointer button (e.g. text selection).
-	 * Keep the pointer focused on the grabbed surface and keep forwarding
-	 * motion to it, without switching focus or changing the cursor, until
-	 * the button is released. */
+	// 隐式抓取: 客户端按住一个指针按钮 (如文本选择).
+	// 保持指针聚焦在被抓 surface 上并继续向它转发 motion,
+	// 不切换焦点也不改光标, 直到按钮释放.
 	if (server->seat->pointer_state.button_count > 0) {
 		struct wlr_surface *focused =
 			server->seat->pointer_state.focused_surface;
@@ -1416,15 +1327,13 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 
 static void process_cursor_button(struct server *server, uint32_t time_msec,
 		uint32_t button, enum wl_pointer_button_state state) {
-	/* while the client holds the pointer (pointer-constraints lock/confine,
-	 * e.g. QEMU's Ctrl+Alt+G grab), every button belongs to it - a chord or
-	 * title-strip grab here would otherwise drag the captured window on
-	 * left+right.  Forward the button and keep no compositor gesture state. */
+	// 客户端持有指针期间 (pointer-constraints 锁定/限定, 如 QEMU 的 Ctrl+Alt+G 抓取),
+	// 每个按钮都属于它 - 否则这里的和弦或标题条抓取会在左右键同时按时拖动被捕获窗口.
+	// 转发按钮并保持无合成器手势状态.
 	if (pointer_constraint_active(server)) {
-		/* the client owns the pointer.  A release is forwarded only when its
-		 * press reached the client; a press the compositor swallowed before
-		 * the constraint was activated (a grab that was in flight) keeps its
-		 * release swallowed, so no orphan release is delivered. */
+		// 客户端拥有指针. 只有其按压到达过客户端时才转发释放;
+		// 约束激活前被合成器吞掉的按压 (正在进行的抓取) 保持其释放被吞,
+		// 所以不会投递孤立的释放.
 		if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
 			bool swallow = bound_button_contains(&server->bound_buttons,
 				button);
@@ -1442,26 +1351,32 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 			if (swallow) {
 				return;
 			}
+		} else {
+			// 这里也记录按下状态: 被捕获期间按下的键会转发给客户端,
+			// 但捕获提前结束时仍需为和弦/滚轮手势保留正确的按钮状态
+			if (button == BTN_LEFT) {
+				server->left_button_held = true;
+			} else if (button == BTN_RIGHT) {
+				server->right_button_held = true;
+			}
 		}
 		wlr_seat_pointer_notify_button(server->seat, time_msec, button,
 			state);
 		return;
 	}
 
-	/* A layer-shell overlay (e.g. the start menu) can be destroyed while the
-	 * cursor is over it; wlroots then clears the pointer focus and it is
-	 * only re-established by a motion event, so the first click after the
-	 * overlay disappears would be dropped by the seat. Re-run the hit test
-	 * on the first press so the surface under the cursor gets the click. */
+	// layer-shell 覆盖层 (如开始菜单) 可能在光标位于其上时被销毁;
+	// wlroots 随后会清除指针焦点, 而它只由 motion 事件重建,
+	// 所以覆盖层消失后的第一次点击会被 seat 丢掉.
+	// 在第一次按压时重跑命中测试, 让光标下的 surface 收到点击.
 	if (state == WL_POINTER_BUTTON_STATE_PRESSED
 			&& server->seat->pointer_state.button_count == 0
 			&& server->seat->pointer_state.focused_surface == NULL) {
 		process_cursor_motion(server, time_msec);
 	}
 
-	/* remember whether each button is held: the wheel gestures (scroll up =
-	 * maximize, scroll down = minimize) key off the right button, and the
-	 * chord gestures key off both */
+	// 记住每个按钮是否按住: 滚轮手势 (上滚 = 最大化, 下滚 = 最小化)
+	// 依赖右键, 和弦手势依赖两者
 	if (button == BTN_LEFT) {
 		server->left_button_held =
 			state == WL_POINTER_BUTTON_STATE_PRESSED;
@@ -1470,7 +1385,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		server->right_button_held =
 			state == WL_POINTER_BUTTON_STATE_PRESSED;
 		if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
-			/* a fresh press starts a fresh scroll burst */
+			// 新的一次按压开始新的滚动突发
 			server->wheel_burst_start.tv_sec = 0;
 			server->wheel_burst_start.tv_nsec = 0;
 			server->wheel_last_tick.tv_sec = 0;
@@ -1483,10 +1398,9 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		return;
 	}
 
-	/* start a chord: one button is held and the other one is pressed.
-	 * Gated on CONFIG_WHEEL_DEBOUNCE_ENABLED: with the gestures master
-	 * switch off, chords never start and both presses fall through to
-	 * the client as ordinary clicks. */
+	// 开始和弦: 一个按钮按住, 另一个被按下.
+	// 由 CONFIG_WHEEL_DEBOUNCE_ENABLED 设门控: 手势总开关关闭时,
+	// 和弦从不启动, 两次按压都作为普通点击落到客户端.
 	if (CONFIG_WHEEL_DEBOUNCE_ENABLED &&
 			state == WL_POINTER_BUTTON_STATE_PRESSED &&
 			!server->resizing && !server->moving &&
@@ -1497,16 +1411,14 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	}
 
 	if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
-		/* single decision point (labwc-style): every press the compositor
-		 * swallowed was recorded in bound_buttons, so the release reaches
-		 * the client only when it was NOT recorded. */
+		// 单一决策点 (labwc 风格): 合成器吞掉的每次按压都记录在 bound_buttons,
+		// 所以只有未被记录的释放才到达客户端.
 		bool was_bound = bound_button_contains(&server->bound_buttons,
 			button);
 		bound_button_remove(&server->bound_buttons, button);
 
-		/* a chord consumed this button's press but ended earlier (e.g. the
-		 * held button was released first): swallow the release so the client
-		 * never sees an orphan release without a matching press */
+		// 和弦消费了该按钮的按压但提前结束 (如被按住的按钮先释放):
+		// 吞掉释放, 使客户端绝不会看到没有匹配按压的孤立释放
 		if ((button == BTN_LEFT && server->chord_swallow_left) ||
 				(button == BTN_RIGHT && server->chord_swallow_right)) {
 			if (button == BTN_LEFT) {
@@ -1520,8 +1432,8 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		if (server->resizing) {
 			end_resize(server);
 			if (!was_bound) {
-				/* client-initiated resize (xdg_toplevel.resize): its press
-				 * was forwarded, so the release must be too */
+				// 客户端发起的缩放 (xdg_toplevel.resize): 其按压被转发过,
+				// 所以释放也必须转发
 				wlr_seat_pointer_notify_button(server->seat, time_msec,
 					button, state);
 				wlr_seat_pointer_notify_frame(server->seat);
@@ -1532,8 +1444,8 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		if (server->moving) {
 			end_move(server);
 			if (!was_bound) {
-				/* client-initiated move (xdg_toplevel.move): its press was
-				 * forwarded, so the release must be too */
+				// 客户端发起的移动 (xdg_toplevel.move): 其按压被转发过,
+				// 所以释放也必须转发
 				wlr_seat_pointer_notify_button(server->seat, time_msec,
 					button, state);
 				wlr_seat_pointer_notify_frame(server->seat);
@@ -1542,15 +1454,14 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 			return;
 		}
 		if (server->zone_press) {
-			/* release of a swallowed zone press */
+			// 被吞的标题区按压的释放
 			struct toplevel *tl = server->zone_toplevel;
 			server->zone_press = false;
 			server->zone_toplevel = NULL;
 			disarm_zone_timer(server);
 			if (!server->dragged) {
 				if (server->zone_action != ZONE_NONE && tl != NULL) {
-					/* the second click of a double click on the title strip:
-					 * the segment under the cursor decides the action */
+					// 标题条上双击的第二次点击: 光标下的段决定动作
 					switch (server->zone_action) {
 					case ZONE_MINIMIZE:
 						set_minimized(server, tl, true);
@@ -1583,9 +1494,8 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 			update_cursor_style(server);
 			return;
 		}
-		/* normal path: forward the release only if its press reached the
-		 * client.  A swallowed press whose grab ended early (e.g. its window
-		 * was destroyed) has its release swallowed here, never orphaned. */
+		// 常规路径: 只有其按压到达过客户端时才转发释放.
+		// 抓取提前结束 (如窗口被销毁) 的被吞按压在这里吞掉其释放, 绝不孤立.
 		if (!was_bound) {
 			wlr_seat_pointer_notify_button(server->seat, time_msec,
 				button, state);
@@ -1594,24 +1504,22 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		return;
 	}
 
-	/* WLR_BUTTON_PRESSED */
+	// WLR_BUTTON_PRESSED
 	if (server->moving || server->zone_press || server->resizing) {
 		bound_button_add(&server->bound_buttons, button);
-		return; /* already grabbed: swallow, release must be swallowed too */
+		return; // 已经抓取: 吞掉, 释放也必须吞掉
 	}
 
-	/* the cursor is on a layer-shell surface (taskbar / menu overlay): the
-	 * click belongs to it, never start a window move/resize grab through it */
+	// 光标位于 layer-shell surface (任务栏/菜单覆盖层) 上:
+	// 点击属于它, 绝不要穿过它开始窗口移动/缩放抓取
 	if (pointer_over_layer_surface(server)) {
 		wlr_seat_pointer_notify_button(server->seat, time_msec, button, state);
 		return;
 	}
 
-	/* an implicit grab is active: a previous press was forwarded to the
-	 * client and is still held (buttons > 0). Forward this press too
-	 * instead of hijacking it for a resize/move grab, so the client sees
-	 * the whole multi-button gesture and the cursor stays under the
-	 * implicit-grab rules. */
+	// 隐式抓取活动: 之前的按压已转发给客户端且仍按住 (buttons > 0).
+	// 这次按压也转发, 而不是劫持为缩放/移动抓取,
+	// 让客户端看到完整的多按钮手势, 光标也留在隐式抓取规则之下.
 	if (server->seat->pointer_state.button_count > 0) {
 		struct toplevel *tl = toplevel_nearby(server);
 		if (tl != NULL && !tl->minimized) {
@@ -1625,8 +1533,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	struct toplevel *tl = toplevel_nearby(server);
 	if (tl != NULL && !tl->minimized) {
 		uint32_t edges = toplevel_resize_edges(server, tl);
-		/* the corner resize zones win over the title strip; everywhere
-		 * else the top strip stays the title bar */
+		// 角落缩放区优先于标题条; 其他地方顶部条保持为标题栏
 		if (edges != 0 &&
 				((edges & WLR_EDGE_TOP) != 0 ||
 				 !is_in_titlebar_zone(server, tl))) {
@@ -1636,7 +1543,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		}
 	}
 	if (tl != NULL && !tl->minimized && is_in_titlebar_zone(server, tl)) {
-		/* take over: the colored top strip is our visible title bar */
+		// 接管: 彩色顶部条是我们可见的标题栏
 		focus_toplevel(server, tl);
 		bound_button_add(&server->bound_buttons, button);
 		server->zone_press = true;
@@ -1646,15 +1553,13 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		server->press_y = server->cursor->y;
 		server->dragged = false;
 		if (is_double_click(server, button)) {
-			/* second click of a double click: arm the action for the
-			 * segment under the cursor (release triggers it) */
-			server->last_was_click = false; /* consumed by the double click */
+			// 双击的第二次点击: 为光标下的段臂置动作 (释放时触发)
+			server->last_was_click = false; // 被双击消费
 			server->zone_action = title_strip_action(server, tl);
 		} else {
 			server->zone_action = ZONE_NONE;
-			/* a quick release stays a click (two clicks = double click);
-			 * holding still past CONFIG_LONG_PRESS_NS grabs the window for
-			 * moving - the timer disambiguates */
+			// 快速释放算点击 (两次点击 = 双击);
+			// 静止按住超过 CONFIG_LONG_PRESS_NS 则抓取窗口移动 - 定时器负责判定
 			arm_zone_timer(server);
 		}
 		return;
@@ -1666,17 +1571,14 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	wlr_seat_pointer_notify_button(server->seat, time_msec, button, state);
 }
 
-/* right-hold + wheel gestures (wheel up toggles maximize/restore, wheel
- * down minimizes): a trackpad flick or a high-resolution wheel delivers
- * many ticks in one burst, which would toggle the state several times.
- * Two thresholds decide whether a tick is the same gesture or the next
- * action (only reached when CONFIG_WHEEL_DEBOUNCE_ENABLED is true - the
- * caller gates the whole gesture on the master switch):
- *   - CONFIG_WHEEL_BURST_NS: one continuous scroll (however fast) counts
- *     as one action for at most this long; ticks past the burst start +
- *     this are a new action.
- *   - CONFIG_WHEEL_TICK_GAP_NS: two ticks at least this far apart are the
- *     next action, even inside the burst window. */
+// 按住右键 + 滚轮手势 (上滚切换最大化/还原, 下滚最小化):
+// 触控板轻扫或高分辨率滚轮一次突发会投递很多 tick, 会把状态切换很多次.
+// 两个阈值决定一个 tick 是同一手势还是下一个动作
+// (只有 CONFIG_WHEEL_DEBOUNCE_ENABLED 为真时才会走到 - 调用方用总开关门控整个手势):
+//   - CONFIG_WHEEL_BURST_NS: 一次连续滚动 (无论多快) 最多算一个动作这么久;
+//     tick 超过突发起点 + 这个值即新动作.
+//   - CONFIG_WHEEL_TICK_GAP_NS: 两个 tick 至少相隔这么远就是下一个动作,
+//     即使仍在突发窗口内.
 static bool wheel_action_allowed(struct server *server) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1687,18 +1589,15 @@ static bool wheel_action_allowed(struct server *server) {
 	server->wheel_last_tick = now;
 	if (gap >= 0 && gap < CONFIG_WHEEL_TICK_GAP_NS &&
 			dur >= 0 && dur <= CONFIG_WHEEL_BURST_NS) {
-		return false; /* same gesture: tick came fast and the burst is
-		                * still within its max length */
+		return false; // 同一手势: tick 来得快且突发仍在最大长度内
 	}
-	/* a new gesture: either the previous tick was too long ago (gap) or
-	 * the burst outlived its max length (duration) */
+	// 新手势: 要么上一个 tick 太久远 (gap), 要么突发超过了最大长度 (duration)
 	server->wheel_burst_start = now;
 	return true;
 }
 
-/* the toplevel the wheel gesture acts on: the window under the cursor, or
- * - when the cursor is over the spot of a minimized (hidden) window - that
- * window, so scrolling down can restore it */
+// 滚轮手势作用的 toplevel: 光标下的窗口, 或 - 光标位于最小化 (隐藏) 窗口的
+// 位置时 - 那个窗口, 使下滚可以还原它
 static struct toplevel *toplevel_at_or_minimized(struct server *server) {
 	struct toplevel *tl = toplevel_at(server);
 	if (tl != NULL && !tl->minimized && !tl->closing) {
@@ -1724,32 +1623,29 @@ static struct toplevel *toplevel_at_or_minimized(struct server *server) {
 static void process_cursor_axis(struct server *server, uint32_t time_msec,
 		struct wlr_pointer_axis_event *event) {
 	struct toplevel *tl = toplevel_at_or_minimized(server);
-	/* gated on the gestures master switch: with CONFIG_WHEEL_DEBOUNCE_
-	 * ENABLED false the wheel does not grab the scroll - it is forwarded
-	 * to the client below like any ordinary scroll */
+	// 由手势总开关门控: CONFIG_WHEEL_DEBOUNCE_ENABLED 为 false 时
+	// 滚轮不抓取滚动 - 它像普通滚动一样在下面转发给客户端
 	if (CONFIG_WHEEL_DEBOUNCE_ENABLED && tl != NULL &&
 			server->right_button_held &&
 			!pointer_constraint_active(server) &&
 			event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL &&
 			event->delta_discrete != 0) {
-		/* while holding the right mouse button over a window:
-		 * wheel up (negative axis value) toggles maximize / restore,
-		 * wheel down (positive axis value) toggles minimize / restore.
-		 * Two thresholds coalesce rapid ticks: one continuous scroll is
-		 * one action for at most CONFIG_WHEEL_BURST_NS, and two ticks at
-		 * least CONFIG_WHEEL_TICK_GAP_NS apart are the next action. */
+		// 在窗口上按住右键时:
+		// 上滚 (负轴值) 切换最大化/还原, 下滚 (正轴值) 切换最小化/还原.
+		// 两个阈值合并快速 tick: 一次连续滚动最多 CONFIG_WHEEL_BURST_NS 算一个动作,
+		// 两个 tick 至少相隔 CONFIG_WHEEL_TICK_GAP_NS 即下一个动作.
 		if (!wheel_action_allowed(server)) {
-			return; /* swallowed: still inside the same gesture */
+			return; // 吞掉: 仍在同一手势内
 		}
 		if (event->delta_discrete < 0) {
 			if (tl->xdg_toplevel->current.maximized) {
-				/* already maximized: restore the saved geometry */
+				// 已最大化: 还原保存的几何
 				restore_maximized_toplevel(tl, true);
 			} else {
 				set_maximized(server, tl, true);
 			}
 		} else if (tl->minimized) {
-			/* already minimized: restore (show) the window */
+			// 已最小化: 还原 (显示) 窗口
 			set_minimized(server, tl, false);
 		} else {
 			set_minimized(server, tl, true);
@@ -1761,31 +1657,26 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 		event->relative_direction);
 }
 
-/* ------------------------------------------------------------------ */
-/* pointer constraints (lock / confine) + relative pointer             */
-/* ------------------------------------------------------------------ */
+// ------------------------------------------------------------------
+// pointer constraints (锁定/限定) + relative pointer
+// ------------------------------------------------------------------
 
-/* A client that needs captured mouse input (QEMU's grab, a game's
- * mouselook, a remote-desktop viewer) asks pointer-constraints-v1 to lock
- * or confine the pointer to one of its surfaces.  At most one constraint is
- * active - the one on the surface that currently has the pointer focus -
- * and it is applied to every motion event: a confined pointer is clamped to
- * the constraint region, a locked pointer does not move the compositor
- * cursor at all.  In both cases the raw deltas still reach the client
- * through relative-pointer-v1, which is what actually drives its own
- * cursor.  (pointer-gestures-v1 is unrelated: it carries touchpad
- * pinch/swipe/hold events, not mouse capture.) */
+// 需要捕获鼠标输入的客户端 (QEMU 抓取、游戏 mouselook、远程桌面查看器)
+// 请求 pointer-constraints-v1 把指针锁定/限定到自己的某个 surface.
+// 同一时刻最多一个约束活动 - 当前拥有指针焦点的 surface 上的那个 -
+// 并作用于每个 motion 事件: 限定指针被钳制在约束区域内,
+// 锁定指针则完全不动合成器光标. 两种情况下原始增量仍通过 relative-pointer-v1
+// 到达客户端, 那才是实际驱动客户端自己光标的东西.
+// (pointer-gestures-v1 无关: 它承载触控板捏合/滑动/长按事件, 不是鼠标捕获.)
 
-/* per-constraint bookkeeping: the client may destroy the constraint at any
- * time, and the active pointer must then be dropped */
+// 每约束记账: 客户端可随时销毁约束, 此时活动指针必须被丢弃
 struct pointer_constraint {
 	struct server *server;
 	struct wlr_pointer_constraint_v1 *constraint;
 	struct wl_listener destroy;
 };
 
-/* stop watching the active constraint surface's commits (safe to call when
- * nothing is being watched) */
+// 停止监视活动约束 surface 的 commit (没有在监视时调用也安全)
 static void constraint_commit_untrack(struct server *server) {
 	if (server->constraint_commit.link.prev != NULL) {
 		wl_list_remove(&server->constraint_commit.link);
@@ -1798,16 +1689,15 @@ static void pointer_constraint_destroy(struct wl_listener *listener,
 		wl_container_of(listener, pc, destroy);
 	if (pc->server->active_constraint == pc->constraint) {
 		pc->server->active_constraint = NULL;
-		/* the surface is going away with the constraint: detach the commit
-		 * listener before wlroots asserts the commit signal is empty */
+		// surface 随约束一起消失: 在 wlroots 断言 commit 信号为空之前摘掉 commit 监听器
 		constraint_commit_untrack(pc->server);
 	}
 	wl_list_remove(&pc->destroy.link);
 	free(pc);
 }
 
-/* origin (layout coordinates) of a toplevel's surface content, geometry
- * offset included, so surface-local coordinates map back to the layout */
+// toplevel surface 内容在布局坐标下的原点 (含 geometry 偏移),
+// 使 surface 局部坐标能映射回布局
 static bool toplevel_surface_origin(struct server *server,
 		struct wlr_surface *surface, double *ox, double *oy) {
 	struct toplevel *tl;
@@ -1823,8 +1713,7 @@ static bool toplevel_surface_origin(struct server *server,
 	return false;
 }
 
-/* place the cursor on the constraint's requested hint (a locked pointer may
- * ask to be warped to a surface-local spot when it is activated) */
+// 把光标放到约束请求的提示位置 (锁定指针激活时可能要求 warp 到某个 surface 局部点)
 static void pointer_warp_to_hint(struct server *server,
 		struct wlr_pointer_constraint_v1 *constraint) {
 	if (!constraint->current.cursor_hint.enabled ||
@@ -1842,9 +1731,8 @@ static void pointer_warp_to_hint(struct server *server,
 	wlr_seat_pointer_warp(constraint->seat, sx, sy);
 }
 
-/* the client sets the locked pointer's cursor hint as a synced request: it
- * only reaches `current` on the surface commit that follows the lock, so the
- * hint has to be re-applied here, not only at activation */
+// 客户端把锁定指针的光标提示作为同步请求设置: 它只在锁定后的那次 surface commit
+// 才进入 `current`, 所以提示必须在这里重新应用, 而不只在激活时
 static void pointer_constraint_commit(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		constraint_commit);
@@ -1862,12 +1750,10 @@ static void constraint_commit_track(struct server *server,
 	}
 }
 
-/* A client that just captured the pointer (lock/confine) now owns every
- * button: a compositor gesture that was in flight would never see its
- * release - the constraint path consumes it - and would leave the grab state
- * stuck, so end it.  Presses the compositor already swallowed stay recorded
- * in bound_buttons / the chord swallow flags, so their releases are still not
- * delivered to the client as orphans. */
+// 刚捕获指针 (锁定/限定) 的客户端现在拥有每个按钮:
+// 正在进行的合成器手势永远看不到其释放 - 约束路径会消费它 - 从而让抓取状态卡住,
+// 所以要结束它. 合成器已吞掉的按压仍记录在 bound_buttons / 和弦吞掉标志里,
+// 所以它们的释放仍不会作为孤立事件投递给客户端.
 static void cancel_compositor_gestures(struct server *server) {
 	if (server->moving) {
 		end_move(server);
@@ -1881,8 +1767,7 @@ static void cancel_compositor_gestures(struct server *server) {
 	}
 }
 
-/* activate the constraint owned by `surface` (if any) and deactivate the
- * previous one; called whenever the pointer focus changes */
+// 激活 `surface` 拥有的约束 (若有) 并停用上一个; 指针焦点变化时调用
 static void set_active_constraint(struct server *server,
 		struct wlr_surface *surface) {
 	struct wlr_pointer_constraint_v1 *constraint = NULL;
@@ -1894,17 +1779,15 @@ static void set_active_constraint(struct server *server,
 		return;
 	}
 	struct wlr_pointer_constraint_v1 *old = server->active_constraint;
-	/* the client is about to own the pointer: drop any compositor gesture
-	 * in flight so it cannot leave the grab state stuck */
+	// 客户端即将拥有指针: 丢弃正在进行的合成器手势, 使其无法让抓取状态卡住
 	if (constraint != NULL) {
 		cancel_compositor_gestures(server);
 	}
-	/* point at the replacement first: send_deactivated() may destroy the
-	 * old constraint, and its destroy handler must not clear the new one */
+	// 先指向替代者: send_deactivated() 可能销毁旧约束,
+	// 其 destroy 处理器绝不能清除新的那个
 	server->active_constraint = constraint;
 	if (old != NULL) {
-		/* the old constraint no longer owns the pointer: stop tracking its
-		 * surface commits before it may be destroyed */
+		// 旧约束不再拥有指针: 在它可能被销毁前停止跟踪其 surface commit
 		constraint_commit_untrack(server);
 		wlr_pointer_constraint_v1_send_deactivated(old);
 	}
@@ -1912,15 +1795,13 @@ static void set_active_constraint(struct server *server,
 		wlr_pointer_constraint_v1_send_activated(constraint);
 		constraint_commit_track(server, constraint->surface);
 		pointer_warp_to_hint(server, constraint);
-		/* a captured pointer is drawn by the client: drop the compositor's
-		 * own frame cursor right away */
+		// 被捕获的指针由客户端绘制: 立即丢弃合成器自己的边框光标
 		update_cursor_style(server);
 	}
 }
 
-/* is a constraint (lock/confine) active on the surface that has the pointer
- * focus?  While it is, the client owns the pointer: no compositor gesture
- * may intercept its buttons or show its own cursor. */
+// 拥有指针焦点的 surface 上是否有约束 (锁定/限定) 活动?
+// 有活动约束期间客户端拥有指针: 任何合成器手势都不得拦截其按钮或显示自己的光标.
 bool pointer_constraint_active(struct server *server) {
 	struct wlr_pointer_constraint_v1 *constraint = server->active_constraint;
 	return constraint != NULL &&
@@ -1941,8 +1822,8 @@ void new_pointer_constraint(struct wl_listener *listener, void *data) {
 	pc->destroy.notify = pointer_constraint_destroy;
 	wl_signal_add(&constraint->events.destroy, &pc->destroy);
 
-	/* a client (QEMU on a click into the VM) locks the pointer while its
-	 * surface already has the focus: activate the constraint right away */
+	// 客户端 (QEMU 点击进入虚拟机时) 在其 surface 已有焦点时锁定指针:
+	// 立即激活约束
 	if (constraint->surface ==
 			server->seat->pointer_state.focused_surface) {
 		set_active_constraint(server, constraint->surface);
@@ -1956,9 +1837,8 @@ void pointer_focus_change(struct wl_listener *listener, void *data) {
 	set_active_constraint(server, event->new_surface);
 }
 
-/* raw deltas for relative-pointer clients (QEMU's relative mouse mode); sent
- * on every motion, locked or not - the compositor cursor may not move, but
- * the client's own cursor must */
+// relative-pointer 客户端的原始增量 (QEMU 相对鼠标模式);
+// 每次 motion 都发送, 无论是否锁定 - 合成器光标可能不动, 但客户端自己的光标必须动
 static void pointer_send_relative_motion(struct server *server,
 		uint32_t time_msec, double dx, double dy,
 		double dx_unaccel, double dy_unaccel) {
@@ -1970,8 +1850,7 @@ static void pointer_send_relative_motion(struct server *server,
 		(uint64_t)time_msec * 1000, dx, dy, dx_unaccel, dy_unaccel);
 }
 
-/* adjust a pending relative motion for the active constraint.  Returns false
- * when the cursor must not move at all (locked pointer). */
+// 为活动约束调整待应用的相对移动. 光标完全不能移动 (锁定指针) 时返回 false.
 static bool pointer_constraint_apply(struct server *server,
 		double *dx, double *dy) {
 	struct wlr_pointer_constraint_v1 *constraint = server->active_constraint;
@@ -1983,16 +1862,15 @@ static bool pointer_constraint_apply(struct server *server,
 	if (constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
 		return false;
 	}
-	/* confined: clamp the destination so the cursor stays inside the
-	 * surface-local region.  The seat stores the cursor's current
-	 * surface-local position, which is valid for any surface kind (toplevel,
-	 * popup, layer surface) without reconstructing a scene origin. */
+	// 限定: 钳制目标点, 让光标留在 surface 局部区域内.
+	// seat 存储光标当前的 surface 局部位置, 对任何 surface 类型
+	// (toplevel、popup、layer surface) 都有效, 无需重建场景原点.
 	double sx = server->seat->pointer_state.sx;
 	double sy = server->seat->pointer_state.sy;
 	double cx, cy;
 	if (!wlr_region_confine(&constraint->region, sx, sy,
 			sx + *dx, sy + *dy, &cx, &cy)) {
-		return true; /* cursor not inside the region: leave it alone */
+		return true; // 光标不在区域内: 不动它
 	}
 	*dx = cx - sx;
 	*dy = cy - sy;
@@ -2007,7 +1885,7 @@ void cursor_motion(struct wl_listener *listener, void *data) {
 	pointer_send_relative_motion(server, event->time_msec, dx, dy,
 		event->unaccel_dx, event->unaccel_dy);
 	if (!pointer_constraint_apply(server, &dx, &dy)) {
-		return; /* locked pointer: the compositor cursor stays put */
+		return; // 锁定指针: 合成器光标保持不动
 	}
 	wlr_cursor_move(server->cursor, &event->pointer->base, dx, dy);
 	process_cursor_motion(server, event->time_msec);
@@ -2017,9 +1895,8 @@ void cursor_motion_absolute(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		cursor_motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
-	/* an absolute device carries no delta; derive one so relative-pointer
-	 * clients still get motion, then let the constraint decide where the
-	 * cursor may land */
+	// 绝对设备不带增量; 推导一个, 使 relative-pointer 客户端仍收到 motion,
+	// 再让约束决定光标可以落在哪里
 	double lx, ly;
 	wlr_cursor_absolute_to_layout_coords(server->cursor,
 		&event->pointer->base, event->x, event->y, &lx, &ly);
@@ -2027,10 +1904,10 @@ void cursor_motion_absolute(struct wl_listener *listener, void *data) {
 	double dy = ly - server->cursor->y;
 	pointer_send_relative_motion(server, event->time_msec, dx, dy, dx, dy);
 	if (!pointer_constraint_apply(server, &dx, &dy)) {
-		return; /* locked pointer: the compositor cursor stays put */
+		return; // 锁定指针: 合成器光标保持不动
 	}
-	/* clamp like wlr_cursor_warp_absolute() did: wlr_cursor_warp() would
-	 * silently drop a point that rounds just outside the device mapping */
+	// 像 wlr_cursor_warp_absolute() 一样钳制: wlr_cursor_warp() 会静默丢弃
+	// 取整后刚好落在设备映射之外的点
 	wlr_cursor_warp_closest(server->cursor, &event->pointer->base,
 		server->cursor->x + dx, server->cursor->y + dy);
 	process_cursor_motion(server, event->time_msec);

@@ -1,49 +1,34 @@
-/*
- * rounded.c - offscreen rounded-corner compositing (wlroots gles2 + FBO)
- *
- * Each toplevel keeps a cached, rounded copy of its client content in an
- * offscreen FBO pair:
- *
- *   1. the client content (the xdg surface plus its subsurfaces, excluding
- *      popups) is composited into a first DMA-BUF via a normal wlroots
- *      render pass;
- *   2. a GLES2 fragment shader re-draws that buffer into a second DMA-BUF
- *      through a rounded-rectangle signed-distance-field mask.
- *
- * The rounded result is shown as a wlr_scene_buffer placed *underneath* the
- * client content.  The client content itself stays in the scene (so it keeps
- * receiving input, frame callbacks and popup stacking) but its opacity is set
- * to zero, so the scene only ever draws the rounded FBO copy on screen.
- *
- * The FBO pair is a cache: it is only re-rendered when the content is marked
- * dirty (client commit, subsurface commit, geometry change).  While the
- * content is unchanged the cached buffer is reused without any redraw.
- *
- * Two refinements keep the re-render cost proportional to what actually
- * changed:
- *
- *   - Damage-driven partial re-renders: every surface commit (main surface
- *     and subsurfaces) collects its buffer damage into per-surface regions.
- *     At render time the accumulated damage is mapped into FBO coordinates
- *     and both passes are scissored to it, so a small commit (a typed
- *     character, a blinking cursor) only re-composites and re-masks the
- *     pixels that changed, and only that region is republished to the
- *     scene.  Damage touching the border ring is expanded so ring pixels
- *     that blend the changed content are re-rendered too.
- *
- *   - Mask-only re-renders: border/shadow parameters (focus transitions)
- *     can change without any content change.  The content pass is then
- *     skipped entirely and only the SDF mask pass is re-run over the cached
- *     content.  To make this possible the FBO always reserves the maximum
- *     shadow padding, so a focus change never resizes the buffers.
- *
- * The offscreen FBO is sized to the xdg window geometry, so client-drawn
- * decorations outside the geometry (CSD shadow margins) are clipped away;
- * undecorated windows (geometry == surface) are unaffected.
- *
- * The composited result never leaves the GPU: no glReadPixels is used
- * anywhere in this file.
- */
+// rounded.c - 离屏圆角合成 (wlroots gles2 + FBO)
+//
+// 每个 toplevel 在离屏 FBO 对里缓存一份圆角化的客户端内容副本:
+//
+//   1. 客户端内容 (xdg surface 加其 subsurface, 不含 popup) 通过普通 wlroots
+//      渲染 pass 合成到第一个 DMA-BUF;
+//   2. 一个 GLES2 片元着色器把该 buffer 经圆角矩形 SDF 掩码重绘到第二个 DMA-BUF.
+//
+// 圆角结果作为 wlr_scene_buffer 显示在客户端内容"下面". 客户端内容本身留在场景里
+// (继续接收输入、frame 回调并处理 popup 堆叠), 但透明度设为零,
+// 所以场景实际只绘制圆角 FBO 副本.
+//
+// FBO 对是缓存: 只有内容被标记为脏 (客户端 commit、subsurface commit、几何变化) 时才重绘.
+// 内容不变时直接复用缓存 buffer, 不做任何重绘.
+//
+// 两项优化让重绘开销与实际变化成正比:
+//
+//   - damage 驱动的局部重绘: 每次 surface commit (主 surface 和 subsurface)
+//     把 buffer damage 收集到每 surface 的区域. 渲染时把累积 damage 映射到 FBO 坐标,
+//     两个 pass 都按它做 scissor, 所以小提交 (输入一个字、光标闪烁) 只重新合成和掩码
+//     变化的像素, 且只把该区域重新发布到场景. 触及边框环的 damage 会扩大,
+//     好让混合了变化内容的环像素也重绘.
+//
+//   - 仅掩码重绘: 边框/阴影参数 (焦点切换) 可以只变参数而不变内容.
+//     此时完全跳过内容 pass, 只对缓存内容重跑 SDF 掩码 pass.
+//     为此 FBO 始终预留最大阴影边距, 焦点切换永远不会改变 buffer 尺寸.
+//
+// 离屏 FBO 尺寸取 xdg 窗口 geometry, 所以客户端自绘装饰在 geometry 之外的
+// (CSD 阴影边距) 会被裁掉; 无装饰窗口 (geometry == surface) 不受影响.
+//
+// 合成结果从不离开 GPU: 本文件任何地方都没有用 glReadPixels.
 
 #include "server.h"
 
@@ -68,12 +53,10 @@
 #include <wlr/util/log.h>
 #include <wlr/util/transform.h>
 
-/*
- * Fullscreen-quad vertex shader.  a_pos is in [0,1] with (0,0) at the top
- * left.  The y mapping (clip.y = 2*y - 1) matches wlroots' gles2 renderer,
- * which renders buffers with the first row at the bottom of the GL
- * framebuffer and samples textures with UV (0,0) at the buffer's top row.
- */
+// 全屏四边形顶点着色器. a_pos 在 [0,1], (0,0) 在左上角.
+// y 映射 (clip.y = 2*y - 1) 与 wlroots 的 gles2 渲染器一致:
+// 它以 buffer 第一行在 GL framebuffer 底部的方式渲染, 并用 UV (0,0)
+// 采样 buffer 顶行.
 static const char *rounded_vert_src =
 	"attribute vec2 a_pos;\n"
 	"varying vec2 v_uv;\n"
@@ -82,18 +65,16 @@ static const char *rounded_vert_src =
 	"  gl_Position = vec4(a_pos.x * 2.0 - 1.0, a_pos.y * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
-/* Rounded-rectangle SDF mask over the sampled content texture, plus an
- * optional border ring drawn just inside the rounded edge.  The top band of
- * the ring is split into three thirds (left / middle / right), each with its
- * own color, matching the title-strip gesture zones; the rest of the ring
- * uses the focus-dependent base color.
- *
- * A soft gaussian drop shadow is drawn outside the rounded rect (only
- * when u_shadow_sigma > 0, i.e. for the focused window).  Its color and
- * peak opacity come from u_shadow_color / u_shadow_alpha and are
- * independent of the border color; the falloff is exp(-d^2 / 2 sigma^2)
- * in the SDF distance, which reads as a scenefx-style blurred box
- * shadow instead of a hard outward-fading ring. */
+// 在采样内容纹理上的圆角矩形 SDF 掩码, 可选地在圆角边缘内侧画边框环.
+// 环的顶部被分成三段 (左/中/右), 各有颜色, 对应标题栏手势区;
+// 其余部分用依赖焦点的基础色.
+//
+// 圆角矩形外侧绘制柔和的高斯投影 (仅当 u_shadow_sigma > 0, 即聚焦窗口).
+// 其颜色与峰值透明度来自 u_shadow_color / u_shadow_alpha, 与边框色无关;
+// 衰减是 SDF 距离上的 exp(-d^2 / 2 sigma^2), 呈现为 scenefx 风格的模糊盒阴影,
+// 而不是生硬的向外渐隐环.
+//
+// (着色器内注释保持 ASCII: GLSL ES 1.00 源码字符集是 ASCII.)
 static const char *rounded_frag_src =
 	"precision mediump float;\n"
 	"varying vec2 v_uv;\n"
@@ -121,39 +102,38 @@ static const char *rounded_frag_src =
 	"  float inner = 1.0 - smoothstep(-aa, aa, sd + u_border_width);\n"
 	"  float border = outer - inner;\n"
 	"  float third = u_window_size.x / 3.0;\n"
-	"  /* horizontal: blend across the two junctions instead of hard cuts */\n"
+	"  // horizontal: blend across the two junctions instead of hard cuts\n"
 	"  float t1 = smoothstep(third - u_border_gradient, third + u_border_gradient, p.x);\n"
 	"  float t2 = smoothstep(2.0 * third - u_border_gradient, 2.0 * third + u_border_gradient, p.x);\n"
 	"  vec4 top_color = mix(u_border_top_left, u_border_top_mid, t1);\n"
 	"  top_color = mix(top_color, u_border_top_right, t2);\n"
-	"  /* vertical fade: the top accent colors bleed down the left/right\n"
-	"     edges over u_border_gradient px, then fall back to base color */\n"
+	"  // vertical fade: the top accent colors bleed down the left/right\n"
+	"  // edges over u_border_gradient px, then fall back to base color\n"
 	"  float vfade = 1.0 - smoothstep(u_border_width, u_border_width + u_border_gradient, p.y);\n"
 	"  vec4 bcolor = mix(u_border_color, top_color, vfade);\n"
 	"  vec4 c = texture2D(u_tex, v_uv);\n"
-	"  /* window (content + border), premultiplied */\n"
+	"  // window (content + border), premultiplied\n"
 	"  vec3 win_rgb = c.rgb * inner + bcolor.rgb * bcolor.a * border;\n"
 	"  float win_a = c.a * inner + bcolor.a * border;\n"
-	"  /* soft gaussian drop shadow outside the rounded rect */\n"
+	"  // soft gaussian drop shadow outside the rounded rect\n"
 	"  float shadow_a = 0.0;\n"
 	"  if (u_shadow_sigma > 0.0) {\n"
-	"    /* soft gaussian drop shadow: exp(-d^2/2s^2) in the SDF distance,\n"
-	"       a blurred box shadow (scenefx style) instead of the old hard\n"
-	"       outward-fading ring.  The FBO padding (3.5 * sigma) is where\n"
-	"       the gaussian has faded to ~0.2%, so the cut at the padding\n"
-	"       edge is invisible. */\n"
+	"    // soft gaussian drop shadow: exp(-d^2/2s^2) in the SDF distance,\n"
+	"    // a blurred box shadow (scenefx style) instead of the old hard\n"
+	"    // outward-fading ring.  The FBO padding (3.5 * sigma) is where\n"
+	"    // the gaussian has faded to ~0.2%, so the cut at the padding\n"
+	"    // edge is invisible.\n"
 	"    float s2 = u_shadow_sigma * u_shadow_sigma;\n"
 	"    shadow_a = u_shadow_alpha * exp(-0.5 * sd * sd / s2);\n"
 	"  }\n"
-	"  /* composite: window over its shadow (both premultiplied); the\n"
-	"     shadow color is independent of the border color */\n"
+	"  // composite: window over its shadow (both premultiplied); the\n"
+	"  // shadow color is independent of the border color\n"
 	"  vec3 rgb = win_rgb + u_shadow_color.rgb * shadow_a * (1.0 - win_a);\n"
 	"  float a = win_a + shadow_a * (1.0 - win_a);\n"
 	"  gl_FragColor = vec4(rgb, a);\n"
 	"}\n";
 
-/* partial re-renders are only worth it while the damage region stays
- * simple; a heavily fragmented region falls back to a full re-render */
+// 只要 damage 区域还简单, 局部重绘就划算; 过度碎片化的区域退回整幅重绘
 #define ROUNDED_MAX_DAMAGE_RECTS 64
 
 struct rounded_cache {
@@ -161,42 +141,38 @@ struct rounded_cache {
 	struct toplevel *tl;
 	struct wlr_scene_buffer *node;
 
-	/* offscreen cache: content is composited here, then masked into the
-	 * rounded buffer which is what the scene actually shows */
+	// 离屏缓存: 内容先合成到这里, 再掩码进 rounded_buf, 后者才是场景实际显示的
 	struct wlr_buffer *content_buf;
 	struct wlr_buffer *rounded_buf;
-	GLuint content_tex;              /* GPU-side copy of content_buf */
+	GLuint content_tex;              // content_buf 的 GPU 侧副本
 	int content_tex_width, content_tex_height;
 
-	int fbo_width, fbo_height;       /* current FBO size in physical pixels */
-	int window_pw, window_ph;        /* window size in physical pixels */
-	int shadow_px;                   /* shadow padding in physical pixels */
-	int logical_width, logical_height; /* window size in layout pixels */
-	float shadow_logical;            /* shadow width in layout pixels */
-	float scale;                     /* output scale the FBO was rendered at */
+	int fbo_width, fbo_height;       // 当前 FBO 尺寸 (物理像素)
+	int window_pw, window_ph;        // 窗口尺寸 (物理像素)
+	int shadow_px;                   // 阴影边距 (物理像素)
+	int logical_width, logical_height; // 窗口尺寸 (布局像素)
+	float shadow_logical;            // 阴影宽度 (布局像素)
+	float scale;                     // FBO 渲染时使用的输出缩放
 
-	bool content_dirty;              /* client content changed: both passes run */
-	bool mask_dirty;                 /* only border/shadow params changed: mask pass only */
-	bool gl_ready;                   /* shader program compiled + linked */
-	bool failed;                     /* permanently disabled (no gles2/GL) */
+	bool content_dirty;              // 客户端内容变化: 两个 pass 都跑
+	bool mask_dirty;                 // 仅边框/阴影参数变化: 只跑掩码 pass
+	bool gl_ready;                   // 着色器程序已编译 + 链接
+	bool failed;                     // 永久禁用 (无 gles2/GL)
 
-	/* accumulated damage since the last FBO render.  content_damage is the
-	 * main surface's damage in surface-local coordinates (fed by
-	 * rounded_cache_content_commit); fbo_damage is the per-render scratch
-	 * region in FBO physical coordinates */
+	// 自上次 FBO 渲染以来累积的 damage. content_damage 是主 surface 的
+	// surface 局部 damage (由 rounded_cache_content_commit 填入);
+	// fbo_damage 是每次渲染的暂存区域, 采用 FBO 物理坐标
 	pixman_region32_t content_damage;
 	pixman_region32_t fbo_damage;
-	/* main-surface geometry at the last publish, so commits that resize the
-	 * surface, change its scale/transform or its viewport source without
-	 * attaching buffer damage still trigger a full re-render */
+	// 上次发布时主 surface 的几何, 这样调整 surface 尺寸、改缩放/变换或
+	// viewport source 而不带 buffer damage 的提交也会触发整幅重绘
 	int surf_w, surf_h;
 	int surf_scale;
 	enum wl_output_transform surf_transform;
 	bool vp_has_src;
 	struct wlr_fbox vp_src;
-	/* snapshot of the main surface's direct subsurface stacking order
-	 * (struct wlr_subsurface *), used to detect place_above/place_below
-	 * restacks that attach no buffer damage */
+	// 主 surface 直接 subsurface 堆叠顺序的快照 (struct wlr_subsurface *),
+	// 用于检测不带 buffer damage 的 place_above/place_below 重排
 	struct wl_array subsurface_order;
 
 	GLuint program;
@@ -218,11 +194,10 @@ struct rounded_cache {
 	GLint u_shadow_alpha;
 };
 
-/* forward decls: used by the commit collectors below, defined near
- * rounded_note_surface_state() */
+// 前向声明: 供下面的 commit 收集器使用, 定义在 rounded_note_surface_state() 附近
 static bool rounded_subsurface_order_changed(struct rounded_cache *rc);
 
-/* --- small GL helpers -------------------------------------------------- */
+// --- 少量 GL 辅助 ---
 
 struct egl_context_state {
 	EGLDisplay display;
@@ -324,10 +299,10 @@ static bool rounded_gl_init(struct rounded_cache *rc) {
 	rc->u_shadow_alpha = glGetUniformLocation(rc->program, "u_shadow_alpha");
 
 	static const float quad[] = {
-		0.0f, 0.0f, /* top-left */
-		1.0f, 0.0f, /* top-right */
-		0.0f, 1.0f, /* bottom-left */
-		1.0f, 1.0f, /* bottom-right */
+		0.0f, 0.0f, // 左上
+		1.0f, 0.0f, // 右上
+		0.0f, 1.0f, // 左下
+		1.0f, 1.0f, // 右下
 	};
 	glGenBuffers(1, &rc->vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, rc->vbo);
@@ -350,7 +325,7 @@ static void rounded_gl_fini(struct rounded_cache *rc) {
 	}
 }
 
-/* --- buffer cache ------------------------------------------------------ */
+// --- buffer 缓存 ---
 
 static struct wlr_buffer *rounded_alloc_buffer(struct rounded_cache *rc,
 		int width, int height) {
@@ -397,7 +372,7 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 		return false;
 	}
 
-	/* reuse the existing pair while the FBO size stays the same */
+	// FBO 尺寸不变时复用现有的一对
 	if (rc->content_buf != NULL && rc->rounded_buf != NULL &&
 			rc->fbo_width == fw && rc->fbo_height == fh) {
 		rc->logical_width = logical_width;
@@ -410,7 +385,7 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 		return true;
 	}
 
-	/* size changed: allocate a fresh pair and drop the old one afterwards */
+	// 尺寸变化: 分配新的一对, 之后再丢弃旧的
 	struct wlr_buffer *content_buf = rounded_alloc_buffer(rc, fw, fh);
 	struct wlr_buffer *rounded_buf = rounded_alloc_buffer(rc, fw, fh);
 	if (content_buf == NULL || rounded_buf == NULL) {
@@ -423,8 +398,8 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 		return false;
 	}
 
-	rounded_drop_buffers(rc); /* the scene node keeps its own ref to the old
-	                             rounded buffer until it is re-published */
+	rounded_drop_buffers(rc); // 场景节点对旧的 rounded buffer 保留自己的引用,
+	                           // 直到它被重新发布
 	rc->content_buf = content_buf;
 	rc->rounded_buf = rounded_buf;
 	rc->fbo_width = fw;
@@ -439,11 +414,11 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 	return true;
 }
 
-/* --- content compositing pass (wlroots render pass) -------------------- */
+// --- 内容合成 pass (wlroots render pass) ---
 
 struct content_texture {
 	struct wlr_texture *texture;
-	bool owned; /* created by us, must be destroyed after the pass */
+	bool owned; // 由我们创建, pass 之后必须销毁
 };
 
 struct content_pass_ctx {
@@ -451,20 +426,19 @@ struct content_pass_ctx {
 	struct wlr_render_pass *pass;
 	struct wlr_surface *root_surface;
 	float scale;
-	const pixman_region32_t *clip; /* NULL = render the whole FBO */
+	const pixman_region32_t *clip; // NULL = 渲染整个 FBO
 	bool rendered_main;
 	bool main_texture_failed;
-	struct wl_array textures; /* struct content_texture */
+	struct wl_array textures; // struct content_texture
 };
 
-/* destination box of a scene buffer inside the offscreen FBO (physical
- * pixels); shared by the content pass and the damage collection walk */
+// 场景 buffer 在离屏 FBO 内的目标框 (物理像素);
+// 内容 pass 和 damage 收集遍历共用
 static void rounded_buffer_dst_box(struct rounded_cache *rc,
 		struct wlr_scene_buffer *buffer, int sx, int sy,
 		struct wlr_box *dst_box) {
-	/* wlr_scene_node_for_each_buffer() reports layout (absolute) coordinates;
-	 * the FBO is anchored at the scene tree's origin, so make the position
-	 * tree-relative before scaling */
+	// wlr_scene_node_for_each_buffer() 报告布局 (绝对) 坐标;
+	// FBO 锚定在场景树原点, 所以缩放前先把位置变成树相对坐标
 	int rel_x = sx - rc->tl->scene_tree->node.x;
 	int rel_y = sy - rc->tl->scene_tree->node.y;
 	*dst_box = (struct wlr_box){
@@ -475,7 +449,7 @@ static void rounded_buffer_dst_box(struct rounded_cache *rc,
 	};
 }
 
-/* root surface of a surface's subsurface chain (itself if not a subsurface) */
+// surface 的 subsurface 链的根 surface (不是 subsurface 时就是它自己)
 static struct wlr_surface *rounded_surface_root(struct wlr_surface *surface) {
 	struct wlr_subsurface *sub = wlr_subsurface_try_from_wlr_surface(surface);
 	while (sub != NULL && sub->parent != NULL) {
@@ -489,8 +463,8 @@ static void rounded_content_pass_cb(struct wlr_scene_buffer *buffer,
 		int sx, int sy, void *data) {
 	struct content_pass_ctx *ctx = data;
 
-	/* only the toplevel's own surface tree (surface + subsurfaces) is
-	 * composited; popups and our own rounded node are skipped */
+	// 只合成 toplevel 自己的 surface 树 (surface + subsurface);
+	// 跳过 popup 和我们自己的圆角节点
 	struct wlr_scene_surface *scene_surface =
 		wlr_scene_surface_try_from_buffer(buffer);
 	if (scene_surface == NULL) {
@@ -506,11 +480,9 @@ static void rounded_content_pass_cb(struct wlr_scene_buffer *buffer,
 	struct wlr_texture *texture = NULL;
 	bool owns_texture = false;
 
-	/* Prefer the client buffer's cached texture - exactly the one the scene
-	 * renderer samples.  Calling wlr_texture_from_buffer() here instead would
-	 * re-import the buffer and, for SHM buffers whose source has already been
-	 * released by the client, that data-pointer access fails (source == NULL),
-	 * leaving the FBO stale. */
+	// 优先使用客户端 buffer 的缓存纹理 - 正是场景渲染器采样的那个.
+	// 这里若改用 wlr_texture_from_buffer() 会重新导入 buffer, 而对源已被客户端
+	// 释放的 SHM buffer, 那次 data 指针访问会失败 (source == NULL), 让 FBO 变陈旧.
 	struct wlr_client_buffer *client_buffer =
 		wlr_client_buffer_get(buffer->buffer);
 	if (client_buffer != NULL && client_buffer->texture != NULL) {
@@ -531,9 +503,8 @@ static void rounded_content_pass_cb(struct wlr_scene_buffer *buffer,
 		owns_texture = true;
 	}
 
-	/* honour explicit buffer synchronization (linux-drm-syncobj-v1), exactly
-	 * like wlroots' scene renderer does: wait for the client's acquire
-	 * timeline before sampling the buffer */
+	// 遵守显式 buffer 同步 (linux-drm-syncobj-v1), 与 wlroots 的场景渲染器一致:
+	// 采样 buffer 前等待客户端的 acquire timeline
 	struct wlr_linux_drm_syncobj_surface_v1_state *syncobj_state =
 		wlr_linux_drm_syncobj_v1_get_surface_state(scene_surface->surface);
 	struct wlr_drm_syncobj_timeline *wait_timeline = NULL;
@@ -554,11 +525,9 @@ static void rounded_content_pass_cb(struct wlr_scene_buffer *buffer,
 	slot->texture = texture;
 	slot->owned = owns_texture;
 
-	float alpha = 1.0f; /* content is hidden in the scene via opacity 0, but
-	                       the FBO copy passes the client alpha through
-	                       untouched (multiplier 1.0, not 0) */
-	/* match wlroots' scene renderer: invert the buffer transform for our
-	 * non-rotated offscreen FBO */
+	float alpha = 1.0f; // 内容在场景里通过透明度 0 隐藏, 但 FBO 副本原样传递
+	                    // 客户端透明度 (乘数 1.0, 不是 0)
+	// 与 wlroots 场景渲染器一致: 为我们不旋转的离屏 FBO 反转 buffer 变换
 	enum wl_output_transform transform =
 		wlr_output_transform_invert(buffer->transform);
 	struct wlr_box dst_box;
@@ -594,11 +563,9 @@ static bool rounded_render_content(struct rounded_cache *rc,
 		return false;
 	}
 
-	/* clear the cache buffer to transparent black first, so areas not
-	 * covered by the content surface stay transparent instead of showing
-	 * uninitialized DMA-BUF memory.  On a partial re-render only the
-	 * damaged region is cleared: untouched pixels keep their (still
-	 * correct) previous content. */
+	// 先把缓存 buffer 清成透明黑, 未被内容 surface 覆盖的区域才不会显示
+	// 未初始化的 DMA-BUF 内存. 局部重绘时只清 damage 区域:
+	// 未触及的像素保留 (仍然正确的) 之前内容.
 	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
 		.box = { .x = 0, .y = 0,
 			.width = rc->fbo_width, .height = rc->fbo_height },
@@ -638,9 +605,8 @@ static bool rounded_render_content(struct rounded_cache *rc,
 			"falling back to raw content");
 		return false;
 	}
-	/* only treat the composite as valid if the main surface was actually
-	 * rendered; otherwise the FBO would be empty/partial and hiding the
-	 * client content would leave the window transparent */
+	// 只有主 surface 确实被渲染过才认为合成有效; 否则 FBO 会空/不完整,
+	// 隐藏客户端内容会让窗口变透明
 	if (!ctx.rendered_main) {
 		wlr_log(WLR_DEBUG, "rounded: main surface not rendered into FBO, "
 			"falling back to raw content");
@@ -649,16 +615,13 @@ static bool rounded_render_content(struct rounded_cache *rc,
 	return true;
 }
 
-/* --- rounded mask pass (raw GLES2) ------------------------------------- */
+// --- 圆角掩码 pass (原生 GLES2) ---
 
-/* Draw the SDF mask over the content into the output FBO.  With region NULL
- * the whole FBO is refreshed: a full copy of the content FBO into the
- * content texture (which also repairs any staleness left by earlier partial
- * passes) followed by one fullscreen quad.  With a region, only its rects
- * are copied and drawn under glScissor, so a partial re-render costs only
- * its damage area.  glCopyTexSubImage2D honours the scissor test and the
- * shader never samples outside it, so stale texels outside the scissor are
- * never read. */
+// 把 SDF 掩码画到内容之上的输出 FBO. region 为 NULL 时刷新整个 FBO:
+// 把内容 FBO 完整拷贝进内容纹理 (同时修复早前局部 pass 留下的陈旧), 再画一个全屏四边形.
+// 指定 region 时只拷贝并绘制它的矩形, 用 glScissor 限定, 所以局部重绘只花其 damage 面积.
+// glCopyTexSubImage2D 遵守 scissor 测试, 且着色器绝不采样 scissor 之外,
+// 所以 scissor 外的陈旧纹素永远不会被读到.
 static bool rounded_render_mask(struct rounded_cache *rc,
 		const pixman_region32_t *region) {
 	struct wlr_renderer *renderer = rc->server->renderer;
@@ -679,7 +642,7 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		return false;
 	}
 
-	/* (re)allocate the GPU-side content texture when the FBO size changes */
+	// FBO 尺寸变化时 (重新) 分配 GPU 侧内容纹理
 	if (rc->content_tex == 0 || rc->content_tex_width != rc->fbo_width ||
 			rc->content_tex_height != rc->fbo_height) {
 		if (rc->content_tex != 0) {
@@ -704,12 +667,12 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		boxes = pixman_region32_rectangles(region, &n_rects);
 	}
 
-	/* rounded-rectangle mask pass into the output FBO */
+	// 圆角矩形掩码 pass 写入输出 FBO
 	glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
 	glViewport(0, 0, rc->fbo_width, rc->fbo_height);
 	glDisable(GL_DEPTH_TEST);
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-	glDisable(GL_BLEND); /* the mask pass overwrites the drawn region */
+	glDisable(GL_BLEND); // 掩码 pass 覆盖所绘区域
 
 	glUseProgram(rc->program);
 
@@ -721,9 +684,8 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		(float)rc->shadow_px);
 	glUniform2f(rc->u_window_size, (float)rc->window_pw,
 		(float)rc->window_ph);
-	/* the padding is constant (always the maximum gaussian shadow extent);
-	 * whether a shadow is drawn at all follows focus: sigma is 0 for
-	 * unfocused windows.  The shadow color is independent of the border. */
+	// 边距是常量 (始终是最大高斯阴影范围); 是否画阴影跟随焦点:
+	// 未聚焦窗口 sigma 为 0. 阴影颜色与边框无关.
 	glUniform1f(rc->u_shadow_sigma, shadow_sigma(rc->tl) * rc->scale);
 	glUniform1f(rc->u_shadow_alpha, shadow_alpha());
 	struct wlr_render_color shcol = shadow_color();
@@ -748,11 +710,9 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 	glVertexAttribPointer(rc->a_pos, 2, GL_FLOAT, GL_FALSE, 0, NULL);
 
 	if (partial) {
-		/* per-rect: copy the freshly composited content into the texture
-		 * (a pure GPU-side copy, no glReadPixels), then draw the quad under
-		 * the same scissor.  Both copy and draw coordinates are buffer
-		 * coordinates: the shader's y mapping is the identity between
-		 * buffer rows and GL window rows. */
+		// 逐矩形: 把刚合成的内容拷进纹理 (纯 GPU 拷贝, 没有 glReadPixels),
+		// 然后在同一 scissor 下画四边形. 拷贝与绘制的坐标都是 buffer 坐标:
+		// 着色器的 y 映射在 buffer 行与 GL 窗口行之间是恒等的.
 		glEnable(GL_SCISSOR_TEST);
 		for (int i = 0; i < n_rects; i++) {
 			const pixman_box32_t *b = &boxes[i];
@@ -760,8 +720,7 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 			int w = b->x2 - b->x1, h = b->y2 - b->y1;
 			glScissor(x, y, w, h);
 			glBindFramebuffer(GL_FRAMEBUFFER, content_fbo);
-			/* both the texture offset and the framebuffer source use the
-			 * rect's coordinates: the texture mirrors the FBO row for row */
+			// 纹理偏移和 framebuffer 源都用该矩形的坐标: 纹理逐行镜像 FBO
 			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, y, x, y, w, h);
 			glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
 			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -780,18 +739,17 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
-	/* the mask draw commands are ordered before the scene render in the same
-	 * GL context, so the freshly written rounded FBO is visible when the
-	 * scene samples it */
+	// 掩码绘制命令在同一 GL 上下文中排在场景渲染之前,
+	// 所以场景采样时能立即看到刚写入的圆角 FBO
 
 	rounded_end_gl(&saved);
 	return true;
 }
 
-/* --- public API -------------------------------------------------------- */
+// --- 公共 API ---
 
-/* the rounded node never intercepts pointer input: the (transparent) client
- * content above it is what receives clicks, so hit-testing is unchanged */
+// 圆角节点绝不拦截指针输入: 位于其上方的 (透明) 客户端内容才接收点击,
+// 所以命中测试行为不变
 static bool rounded_no_input(struct wlr_scene_buffer *buffer,
 		double *sx, double *sy) {
 	(void)buffer;
@@ -841,24 +799,19 @@ void rounded_cache_hide_content(struct toplevel *tl) {
 	if (rc == NULL || rc->failed || rc->node == NULL) {
 		return;
 	}
-	/* Only hide the client content once there is a valid rounded FBO to
-	 * show in its place.  Before the first successful publish (or while a
-	 * re-render is in progress and the old FBO has been dropped) the raw
-	 * content must stay visible: hiding it here would leave a fully
-	 * transparent window. */
+	// 只有存在有效圆角 FBO 可替代时才隐藏客户端内容.
+	// 在首次成功发布之前 (或重绘进行中且旧 FBO 已丢弃时), 必须让原始内容保持可见:
+	// 这里隐藏会让窗口完全透明.
 	if (rc->node->buffer == NULL) {
 		return;
 	}
 	rounded_set_content_opacity(rc, 0.0f);
 }
 
-/* fade the whole on-screen window (animate.c).  Normally the only visible
- * window buffer is the rounded FBO node - the raw client content is hidden
- * at opacity 0 - so a fade animates just that node (border and shadow are
- * part of the same FBO and fade along).  Before the first FBO publish (or
- * with rounded corners disabled) the raw content is what the scene draws:
- * every scene buffer under the window tree (main surface + subsurfaces +
- * popups) is faded instead. */
+// 淡变整个屏幕上的窗口 (animate.c). 通常唯一可见的窗口 buffer 是圆角 FBO 节点 -
+// 原始客户端内容以透明度 0 隐藏 - 所以淡变只作用该节点 (边框和阴影都在同一个 FBO 里,
+// 随之一同淡变). 在首次 FBO 发布之前 (或关闭圆角时), 场景绘制的是原始内容:
+// 此时改为淡变窗口树下每个场景 buffer (主 surface + subsurface + popup).
 static void rounded_window_opacity_cb(struct wlr_scene_buffer *buffer,
 		int sx, int sy, void *data) {
 	(void)sx;
@@ -941,33 +894,27 @@ void rounded_cache_dirty(struct toplevel *tl) {
 	}
 	tl->rounded->content_dirty = true;
 	tl->rounded->mask_dirty = true;
-	/* Invalidating the cache does not necessarily damage the scene: entering
-	 * fullscreen from a maximized window whose box already equals the output
-	 * (no layer-shell bar shrinking the work area) keeps the geometry
-	 * unchanged, and a configure ack with no buffer change carries no damage
-	 * either.  Nothing would then schedule a frame, so rounded_render_all
-	 * would never re-render the FBO and the border (whose width/color depend
-	 * on the fullscreen state) would keep its old appearance.  Schedule a
-	 * frame like rounded_cache_dirty_mask does. */
+	// 让缓存失效不一定损坏场景: 从最大化进入全屏且窗口框已等于输出
+	// (没有 layer-shell 状态栏缩小作区) 时几何不变, 而没有任何 buffer 变化的
+	// configure ack 也不带 damage. 那样就不会有帧被调度, rounded_render_all 永远不会
+	// 重绘 FBO, 边框 (宽度/颜色依赖全屏状态) 会保持旧样.
+	// 像 rounded_cache_dirty_mask 一样调度一帧.
 	struct wlr_output *output = toplevel_output(tl->server, tl);
 	if (output != NULL) {
 		wlr_output_schedule_frame(output);
 	}
 }
 
-/* content-only invalidation: surface commits that attached damage */
+// 仅内容失效: 附带了 damage 的 surface 提交
 void rounded_cache_dirty_content(struct toplevel *tl) {
 	if (tl->rounded != NULL) {
 		tl->rounded->content_dirty = true;
 	}
 }
 
-/* mask-only invalidation: border/shadow parameters changed (focus) while
- * the content is untouched; the cached content pass is reused.  A focus
- * change damages nothing in the scene by itself (content commits do, via
- * the scene surface's own damage), so explicitly schedule a frame on the
- * toplevel's output - the publish after the re-render then damages the
- * affected outputs for the repaint. */
+// 仅掩码失效: 内容未变而边框/阴影参数变化 (焦点); 复用缓存的内容 pass.
+// 焦点变化本身不损坏场景中的任何东西 (内容提交通过 scene surface 自己的 damage 损坏),
+// 所以显式在 toplevel 的输出上调度一帧 - 重绘后的发布才会损坏受影响的输出以重绘.
 void rounded_cache_dirty_mask(struct toplevel *tl) {
 	if (tl->rounded == NULL) {
 		return;
@@ -979,9 +926,8 @@ void rounded_cache_dirty_mask(struct toplevel *tl) {
 	}
 }
 
-/* main-surface commit: collect the commit's damage for a partial re-render.
- * Resizes and scale/transform/viewport-source changes carry no buffer
- * damage of their own, so they fall back to full-surface damage. */
+// 主 surface 提交: 收集本次提交的 damage 供局部重绘.
+// 缩放以及缩放/变换/viewport source 变化自身不带 buffer damage, 所以退回整 surface damage.
 void rounded_cache_content_commit(struct toplevel *tl) {
 	struct rounded_cache *rc = tl->rounded;
 	if (rc == NULL || rc->failed) {
@@ -993,8 +939,8 @@ void rounded_cache_content_commit(struct toplevel *tl) {
 	}
 	struct wlr_surface *surface = base->surface;
 
-	/* wlroots re-applies opacity 1.0 to the committed surface; re-hide it
-	 * (only if a valid rounded FBO is already published) */
+	// wlroots 在提交后会把透明度重新应用为 1.0; 再次隐藏它
+	// (仅当已经发布了有效的圆角 FBO)
 	rounded_cache_hide_content(tl);
 
 	pixman_region32_t dmg;
@@ -1012,9 +958,8 @@ void rounded_cache_content_commit(struct toplevel *tl) {
 			  state->viewport.src.width != rc->vp_src.width ||
 			  state->viewport.src.height != rc->vp_src.height)) ||
 			rounded_subsurface_order_changed(rc)) {
-		/* geometry changed without buffer damage: cover the new surface
-		 * area and the vacated old one (a shrink must clear the pixels
-		 * beyond the new size) */
+		// 几何变化但没有 buffer damage: 覆盖新 surface 区域和被腾空的旧区域
+		// (缩小时必须清除新尺寸之外的像素)
 		pixman_region32_union_rect(&dmg, &dmg, 0, 0, state->width,
 			state->height);
 		pixman_region32_union_rect(&dmg, &dmg, 0, 0, rc->surf_w,
@@ -1029,11 +974,10 @@ void rounded_cache_content_commit(struct toplevel *tl) {
 	pixman_region32_fini(&dmg);
 }
 
-/* subsurface commit: collect damage (surface-local coordinates) plus the
- * old-position area when the subsurface moved or resized, so both the new
- * and the vacated region are re-rendered.  A subsurface that unmapped
- * (attach NULL) falls back to a full re-render: it is rare and its old
- * content spans an area the commit does not damage. */
+// subsurface 提交: 收集 damage (surface 局部坐标) 以及 subsurface 移动或改尺寸时
+// 的旧位置区域, 这样新区域和被腾空区域都会重绘.
+// unmaps 的 subsurface (attach NULL) 退回整幅重绘: 这种情况罕见, 且其旧内容
+// 覆盖的区域不是本次提交能损坏的.
 void rounded_cache_subsurface_commit(struct toplevel *tl,
 		struct toplevel_subsurface *ts) {
 	struct rounded_cache *rc = tl->rounded;
@@ -1051,8 +995,7 @@ void rounded_cache_subsurface_commit(struct toplevel *tl,
 	int cur_h = surface->current.height;
 
 	if (surface->current.buffer == NULL) {
-		/* unmapped: everything it used to cover must be re-rendered; the
-		 * geometry tracking restarts at zero for a future remap */
+		// 未映射: 它曾覆盖的一切都必须重绘; 几何跟踪归零, 供将来重新映射
 		ts->prev_x = cur_x;
 		ts->prev_y = cur_y;
 		ts->prev_w = 0;
@@ -1063,15 +1006,14 @@ void rounded_cache_subsurface_commit(struct toplevel *tl,
 
 	pixman_region32_t dmg;
 	pixman_region32_init(&dmg);
-	/* A commit can also reorder subsurfaces (place_above/below) without
-	 * attaching any buffer damage, so always cover the surface's own area:
-	 * re-compositing it re-applies the new stacking order. */
+	// 一次提交也可能重排 subsurface (place_above/below) 而不带任何 buffer damage,
+	// 所以总是覆盖该 surface 自己的区域: 重新合成它会应用新的堆叠顺序
 	pixman_region32_union_rect(&dmg, &dmg, 0, 0, cur_w, cur_h);
 
 	if (cur_x != ts->prev_x || cur_y != ts->prev_y ||
 			cur_w != ts->prev_w || cur_h != ts->prev_h) {
-		/* vacated old area, in the surface's own coordinates (shifted by
-		 * the move): it must be cleared and re-composited */
+		// 被腾空的旧区域, 用 surface 自己的坐标 (按移动偏移):
+		// 必须清除并重新合成
 		pixman_region32_union_rect(&dmg, &dmg,
 			ts->prev_x - cur_x, ts->prev_y - cur_y,
 			ts->prev_w, ts->prev_h);
@@ -1092,23 +1034,20 @@ void rounded_cache_subsurface_commit(struct toplevel *tl,
 	pixman_region32_fini(&dmg);
 }
 
-/* Keep showing the last published rounded FBO when a re-render fails
- * transiently, instead of revealing the raw (unrounded) content.  Only when
- * no rounded buffer was ever published do we fall back to raw content -
- * otherwise the window would be fully transparent. */
+// 重绘短暂失败时继续显示上次发布的圆角 FBO, 而不是露出原始 (无圆角) 内容.
+// 只有从未发布过圆角 buffer 时才退回原始内容 - 否则窗口会完全透明.
 static void rounded_fallback(struct rounded_cache *rc) {
 	if (rc->node->buffer == NULL) {
 		rounded_set_content_opacity(rc, 1.0f);
 	} else {
-		/* re-hide in case a surface commit reset the opacity to 1.0 */
+		// 重新隐藏, 以防某次 surface 提交把透明度重置为 1.0
 		rounded_cache_hide_content(rc->tl);
 	}
 }
 
-/* --- damage collection and publishing ---------------------------------- */
+// --- damage 收集与发布 ---
 
-/* map a surface-local damage region into FBO coordinates through the
- * buffer's destination box */
+// 把 surface 局部 damage 区域经 buffer 的目标框映射到 FBO 坐标
 static void rounded_map_damage(pixman_region32_t *dst,
 		const pixman_region32_t *src, const struct wlr_box *dst_box,
 		int dst_width, int dst_height) {
@@ -1130,8 +1069,7 @@ static void rounded_map_damage(pixman_region32_t *dst,
 	}
 }
 
-/* find the subsurface bookkeeping entry for a surface in the toplevel's
- * subsurface tree */
+// 在 toplevel 的 subsurface 树里找某个 surface 的记账项
 static struct toplevel_subsurface *rounded_find_subsurface(struct toplevel *tl,
 		struct wlr_surface *surface) {
 	struct toplevel_subsurface *ts;
@@ -1153,8 +1091,8 @@ static void rounded_collect_damage_cb(struct wlr_scene_buffer *buffer,
 	struct damage_collect_ctx *ctx = data;
 	struct rounded_cache *rc = ctx->rc;
 
-	/* same filtering as the content pass: only the toplevel's own surface
-	 * tree (surface + subsurfaces) with a buffer attached */
+	// 与内容 pass 相同的过滤: 只处理带 buffer 的 toplevel 自己的 surface 树
+	// (surface + subsurface)
 	struct wlr_scene_surface *scene_surface =
 		wlr_scene_surface_try_from_buffer(buffer);
 	if (scene_surface == NULL ||
@@ -1183,9 +1121,8 @@ static void rounded_collect_damage_cb(struct wlr_scene_buffer *buffer,
 		buffer->dst_width, buffer->dst_height);
 }
 
-/* walk the content tree once to gather the accumulated surface damage into
- * rc->fbo_damage (FBO physical coordinates).  Runs before the content pass,
- * which needs the complete region up front for its clip. */
+// 遍历内容树一次, 把累积的 surface damage 收集到 rc->fbo_damage (FBO 物理坐标).
+// 在内容 pass 之前运行, 因为内容 pass 需要先拿到完整区域来做 clip.
 static void rounded_collect_damage(struct rounded_cache *rc) {
 	struct wlr_xdg_surface *base = rc->tl->xdg_toplevel->base;
 	if (base == NULL || base->surface == NULL) {
@@ -1200,9 +1137,8 @@ static void rounded_collect_damage(struct rounded_cache *rc) {
 		rounded_collect_damage_cb, &ctx);
 }
 
-/* the per-surface damage caches are consumed once a render reflects their
- * content (full or partial).  A commit arriving mid-render adds fresh
- * damage and re-dirties, so the next frame picks it up. */
+// 每 surface 的 damage 缓存在一次渲染反映出其内容 (整幅或局部) 后被消费.
+// 渲染中途到达的提交会添加新 damage 并重新置脏, 下一帧会捡起它.
 static void rounded_clear_damage_caches(struct rounded_cache *rc) {
 	pixman_region32_clear(&rc->content_damage);
 	struct toplevel_subsurface *ts;
@@ -1211,13 +1147,12 @@ static void rounded_clear_damage_caches(struct rounded_cache *rc) {
 	}
 }
 
-/* expand each damage rect by the border ring width (plus one AA pixel) so
- * border pixels that blend the changed content beneath them are re-masked
- * and republished too; the shadow ring never samples content, so it needs
- * no expansion.  The result is clipped to the FBO. */
+// 把每个 damage 矩形按边框环宽度 (加一个 AA 像素) 扩大, 让混合了下方变化内容的
+// 边框像素也重新掩码并重新发布; 阴影环从不采样内容, 无需扩大.
+// 结果裁剪到 FBO 内.
 static void rounded_expand_ring(struct rounded_cache *rc) {
 	if (pixman_region32_empty(&rc->fbo_damage)) {
-		return; /* empty means "full" upstream */
+		return; // 空表示"整幅"
 	}
 	int expand = (int)ceilf(border_width(rc->tl) * rc->scale) + 1;
 	int n = 0;
@@ -1237,16 +1172,13 @@ static void rounded_expand_ring(struct rounded_cache *rc) {
 	pixman_region32_fini(&expanded);
 }
 
-/* publish the freshly rendered rounded buffer to the scene node and keep
- * its position/dest size in sync with the window + shadow padding.
- * damage == NULL means the whole buffer changed.
- *
- * While the toplevel is running a maximize/restore zoom (tl->morph_active,
- * animate.c) the FBO is shown in the current morph box instead of its
- * natural geometry, so mid-animation re-renders never pop to the natural
- * size.  The FBO node is a child of the scene tree, so its position is
- * relative to the tree origin: offset it by the morph box origin minus the
- * tree origin. */
+// 把刚渲染好的圆角 buffer 发布到场景节点, 并让它的位置/dest 尺寸与窗口 + 阴影边距同步.
+// damage == NULL 表示整个 buffer 变了.
+//
+// toplevel 正在运行最大化/还原缩放 (tl->morph_active, animate.c) 时,
+// FBO 显示在当前形态框里而不是其自然几何, 这样动画中途的重绘绝不会跳到自然尺寸.
+// FBO 节点是场景树的子节点, 所以它的位置相对树原点:
+// 用形态框原点减去树原点来偏移.
 static void rounded_publish(struct rounded_cache *rc,
 		const struct wlr_box *box, const pixman_region32_t *damage) {
 	wlr_scene_buffer_set_buffer_with_damage(rc->node, rc->rounded_buf,
@@ -1271,19 +1203,17 @@ static void rounded_publish(struct rounded_cache *rc,
 		width + 2 * shadow_i, height + 2 * shadow_i);
 }
 
-/* true while the window is running a maximize/restore zoom (animate.c): the
- * scene tree is anchored at the morph box origin and every publish lands in
- * the morph box */
+// 窗口是否正在运行最大化/还原缩放 (animate.c): 场景树锚定在形态框原点,
+// 每次发布都落在形态框里
 bool rounded_morph_supported(struct toplevel *tl) {
 	struct rounded_cache *rc = tl->rounded;
 	return rc != NULL && !rc->failed && rc->node != NULL &&
 		rc->node->buffer != NULL;
 }
 
-/* the rounded FBO currently holds content rendered at exactly width x
- * height (layout pixels): the maximize/restore zoom uses this to detect
- * that the client has committed the target size and the cache has been
- * re-rendered at it, so the zoom can start/continue without popping */
+// 圆角 FBO 当前是否恰好持有按 width x height (布局像素) 渲染的内容:
+// 最大化/还原缩放用它检测客户端已提交目标尺寸且缓存已按该尺寸重绘,
+// 从而可以在不跳变的情况下开始/继续缩放
 bool rounded_cache_size_ready(struct toplevel *tl, int width, int height) {
 	struct rounded_cache *rc = tl->rounded;
 	return rc != NULL && !rc->failed && rc->node != NULL &&
@@ -1291,9 +1221,8 @@ bool rounded_cache_size_ready(struct toplevel *tl, int width, int height) {
 		rc->logical_width == width && rc->logical_height == height;
 }
 
-/* re-apply the current morph box to the scene node (position + dest size);
- * called every animation tick after tl->morph_* changed.  No-op unless a
- * morph is running. */
+// 把当前形态框重新应用到场景节点 (位置 + dest 尺寸);
+// 每个动画 tick 在 tl->morph_* 变化后调用. 没有形态运行时是空操作.
 void rounded_cache_morph_apply(struct toplevel *tl) {
 	struct rounded_cache *rc = tl->rounded;
 	if (rc == NULL || rc->failed || rc->node == NULL ||
@@ -1310,13 +1239,12 @@ void rounded_cache_morph_apply(struct toplevel *tl) {
 		tl->morph_w + 2 * shadow_i, tl->morph_h + 2 * shadow_i);
 }
 
-/* snapshot the main surface's direct subsurface stacking order so a later
- * commit can detect place_above/place_below restacks (which carry no buffer
- * damage).  The order is captured at publish time - the state the cached FBO
- * actually reflects - and compared at commit time. */
+// 快照主 surface 的直接 subsurface 堆叠顺序, 供之后的提交检测
+// place_above/place_below 重排 (它们不带 buffer damage).
+// 顺序在发布时捕获 - 即缓存 FBO 实际反映的状态 - 并在提交时比较.
 static void rounded_capture_subsurface_order(struct rounded_cache *rc) {
 	struct wlr_xdg_surface *base = rc->tl->xdg_toplevel->base;
-	/* keep the backing allocation; only reset the used length */
+	// 保留底层分配; 只重置已用长度
 	rc->subsurface_order.size = 0;
 	if (base == NULL || base->surface == NULL) {
 		return;
@@ -1343,8 +1271,8 @@ static void rounded_capture_subsurface_order(struct rounded_cache *rc) {
 	}
 }
 
-/* true if the main surface's direct subsurface stacking order differs from
- * the last published snapshot (below list first, then above) */
+// 主 surface 的直接 subsurface 堆叠顺序是否与上次发布的快照不同
+// (先 below 列表, 再 above)
 static bool rounded_subsurface_order_changed(struct rounded_cache *rc) {
 	struct wlr_xdg_surface *base = rc->tl->xdg_toplevel->base;
 	if (base == NULL || base->surface == NULL) {
@@ -1373,9 +1301,8 @@ static bool rounded_subsurface_order_changed(struct rounded_cache *rc) {
 	return index != snapshot_len;
 }
 
-/* remember the main-surface geometry the published FBO reflects; commits
- * that resize the surface or change its viewport source compare against
- * this to detect changes that carry no buffer damage */
+// 记住已发布 FBO 所反映的主 surface 几何; 调整 surface 尺寸或改变 viewport source
+// 而不带 buffer damage 的提交会与它比较来检测变化
 static void rounded_note_surface_state(struct rounded_cache *rc) {
 	struct wlr_xdg_surface *base = rc->tl->xdg_toplevel->base;
 	if (base == NULL || base->surface == NULL) {
@@ -1391,8 +1318,8 @@ static void rounded_note_surface_state(struct rounded_cache *rc) {
 	rounded_capture_subsurface_order(rc);
 }
 
-/* Render any dirty rounded caches.  Called from the output frame handler
- * before the scene is committed, so the scene always samples fresh FBOs. */
+// 渲染所有脏的圆角缓存. 由输出 frame 处理器在提交场景之前调用,
+// 所以场景采样的总是新鲜 FBO.
 void rounded_render_all(struct server *server) {
 	if (!wlr_renderer_is_gles2(server->renderer)) {
 		return;
@@ -1421,28 +1348,25 @@ void rounded_render_all(struct server *server) {
 		if (scale <= 0.0f) {
 			scale = 1.0f;
 		}
-		/* the FBO always reserves the maximum shadow padding (derived from
-		 * the gaussian sigma), so focus transitions never resize it and
-		 * stay mask-only re-renders */
+		// FBO 始终预留最大阴影边距 (由高斯 sigma 推导), 所以焦点切换
+		// 永远不改变其尺寸, 只做仅掩码重绘
 		float shadow_w = (float)shadow_padding();
 
 		if (!rc->content_dirty && !rc->mask_dirty &&
 				rc->logical_width == box.width &&
 				rc->logical_height == box.height && rc->scale == scale &&
 				rc->shadow_logical == shadow_w) {
-			/* cache is fresh: wlroots' scene_surface re-applies opacity
-			 * 1.0 on every surface commit (surface_reconfigure), so re-hide
-			 * the content right before the scene renders.  A valid FBO is
-			 * already published, so this never leaves the window
-			 * transparent. */
+			// 缓存新鲜: wlroots 的 scene_surface 在每次 surface 提交
+			// (surface_reconfigure) 时会把透明度重新应用为 1.0,
+			// 所以场景渲染前再隐藏一次内容. 已发布了有效 FBO,
+			// 所以这绝不会让窗口透明.
 			rounded_cache_hide_content(tl);
 			continue;
 		}
 
-		/* mask-only re-render: border/shadow parameters changed (focus),
-		 * content and buffers are untouched.  Requires a fully initialized
-		 * GL program and an FBO published at the current size, so the
-		 * cached content texture is complete. */
+		// 仅掩码重绘: 边框/阴影参数变化 (焦点), 内容与 buffer 未变.
+		// 需要 GL 程序已完全初始化, 且 FBO 已按当前尺寸发布,
+		// 这样缓存的内容纹理才是完整的.
 		if (rc->mask_dirty && !rc->content_dirty && rc->gl_ready &&
 				rc->content_buf != NULL &&
 				rc->node->buffer == rc->rounded_buf &&
@@ -1453,7 +1377,7 @@ void rounded_render_all(struct server *server) {
 				rc->mask_dirty = true;
 				continue;
 			}
-			/* the whole border ring and shadow changed color */
+			// 整个边框环和阴影颜色都变了
 			rounded_publish(rc, &box, NULL);
 			rounded_note_surface_state(rc);
 			rounded_cache_hide_content(tl);
@@ -1480,10 +1404,9 @@ void rounded_render_all(struct server *server) {
 			}
 		}
 
-		/* Clear dirty *before* compositing.  If the client commits again
-		 * while we are rendering (between our scene sampling and the
-		 * publish below), the commit handler sets dirty=true again and the
-		 * next frame re-renders - the update is never silently dropped. */
+		// 在合成之前清除脏标记. 如果客户端在我们渲染期间 (在场景采样之后、
+		// 下面发布之前) 又提交了一次, 提交处理器会再次置 dirty=true,
+		// 下一帧重绘 - 更新绝不会被静默丢弃.
 		rc->content_dirty = false;
 		rc->mask_dirty = false;
 
@@ -1496,29 +1419,26 @@ void rounded_render_all(struct server *server) {
 			continue;
 		}
 
-		/* gather the accumulated surface damage into FBO coordinates, then
-		 * consume the caches: whatever the caches held is reflected in this
-		 * render (full or partial) */
+		// 把累积的 surface damage 收集到 FBO 坐标, 然后消费缓存:
+		// 缓存里的内容都反映在这次渲染中 (整幅或局部)
 		rounded_collect_damage(rc);
 		rounded_clear_damage_caches(rc);
 
-		/* partial re-render only over the damaged area.  Requires an FBO
-		 * published at the current size (a fresh pair after a resize has
-		 * uninitialized content and must be rendered in full) and a bounded
-		 * rect count. */
+		// 只对 damage 区域做局部重绘. 需要 FBO 已按当前尺寸发布
+		// (调整尺寸后的新 buffer 对内容是未初始化的, 必须整幅渲染),
+		// 且矩形数量有界.
 		bool partial = rc->node->buffer == rc->rounded_buf &&
 			!pixman_region32_empty(&rc->fbo_damage) &&
 			pixman_region32_n_rects(&rc->fbo_damage) <=
 				ROUNDED_MAX_DAMAGE_RECTS;
 		if (!partial) {
-			pixman_region32_clear(&rc->fbo_damage); /* empty = full */
+			pixman_region32_clear(&rc->fbo_damage); // 空 = 整幅
 		}
 
 		if (!rounded_render_content(rc,
 				partial ? &rc->fbo_damage : NULL)) {
-			/* the client content could not be composited into the FBO (for
-			 * example a DMA-BUF/texture that isn't ready yet); keep the
-			 * previous rounded FBO and retry on the next frame */
+			// 客户端内容无法合成进 FBO (例如尚未就绪的 DMA-BUF/纹理):
+			// 保留上一个圆角 FBO, 下一帧重试
 			wlr_log(WLR_DEBUG, "rounded: content render failed for app_id "
 				"\"%s\" (%dx%d), keeping previous FBO",
 				tl->app_id != NULL ? tl->app_id : "?",
@@ -1528,8 +1448,8 @@ void rounded_render_all(struct server *server) {
 			continue;
 		}
 
-		/* border-ring pixels blend the content beneath them: expand the
-		 * damage so they are re-masked (and republished) too */
+		// 边框环像素会混合其下方的内容: 扩大 damage, 让它们也重新掩码
+		// (并重新发布)
 		rounded_expand_ring(rc);
 
 		if (!rounded_render_mask(rc, partial ? &rc->fbo_damage : NULL)) {
@@ -1539,14 +1459,12 @@ void rounded_render_all(struct server *server) {
 			continue;
 		}
 
-		/* publish the fresh result; NULL damage = whole buffer */
+		// 发布新结果; damage 为 NULL = 整个 buffer
 		rounded_publish(rc, &box, partial ? &rc->fbo_damage : NULL);
 		rounded_note_surface_state(rc);
-		/* NOTE: do not clear dirty here - it was cleared before the render,
-		 * and any commit that arrived mid-render has already set it true
-		 * again, so the next frame re-renders the newer content. */
-		/* the FBO is now valid: hide the raw client content and show the
-		 * rounded copy in its place */
+		// 注意: 不要在这里清除 dirty - 它在渲染前已清除,
+		// 而渲染中途到达的提交已经把它重新置 true, 所以下一帧会重绘更新的内容.
+		// FBO 现在有效: 隐藏原始客户端内容, 显示圆角副本
 		rounded_cache_hide_content(tl);
 		wlr_log(WLR_DEBUG, "rounded: published FBO for app_id \"%s\" "
 			"(%dx%d logical, %dx%d physical, scale %.2f)",

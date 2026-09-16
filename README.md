@@ -98,8 +98,10 @@ A minimal floating Wayland compositor written in C on top of **wlroots 0.20**.
 | `wp_fractional_scale_v1` | surfaces are told the output's exact fractional scale |
 | `ext_data_control_manager_v1` | privileged selection/clipboard control used by `wl-clipboard` (`wl-copy`/`wl-paste`) and clipboard managers, which is how terminal editors such as `vim` reach the Wayland clipboard |
 | `zwlr_data_control_manager_v1` | legacy wlroots clipboard-control protocol; still the only one bound by CopyQ and older clipboard tools, advertised alongside the `ext-` variant |
+| `zwp_primary_selection_device_manager_v1` | the standard PRIMARY selection (middle-click paste); the seat request listener drives `wlr_seat_set_primary_selection()` |
 | `zwp_pointer_constraints_v1` | clients lock/confine the pointer to a surface — QEMU's captured mouse (Ctrl+Alt+G grab), games' mouselook; confined motion is clamped to the region, a locked pointer stays put |
 | `zwp_relative_pointer_v1` | raw pointer deltas delivered while the pointer is locked (`QEMU`'s relative mouse mode), so the client's own cursor still tracks the hardware |
+| `zwp_keyboard_shortcuts_inhibit_manager_v1` | a focused client (GTK4 app, remote desktop, a VM UI) asks the compositor to pass its keys through instead of running bindings; while an inhibitor is active the compositor forwards every key |
 | `wp_linux_drm_syncobj_manager_v1` | explicit buffer synchronization via DRM syncobj timelines |
 | `zwp_input_method_v2` | input method (fcitx5/ibus) — activation, keyboard grab, preedit/commit |
 | `zwp_text_input_v3` | per-window text input — enter/leave, surrounding text, commit string |

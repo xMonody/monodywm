@@ -1,17 +1,12 @@
-/*
- * border.c - window border policy (width + colors)
- *
- * The border itself is drawn by the rounded-corner shader in rounded.c as a
- * ring just inside the window edge.  This module owns the border *policy*:
- * how wide the ring is and which colors it gets.
- *
- * The top band of the ring is split into three thirds (matching the
- * title-strip gesture zones: minimize / maximize / close), each with its own
- * color; the rest of the ring (sides and bottom) uses the focus-dependent
- * color.  Because that base color depends on focus, focus transitions call
- * border_focus_changed(), which marks the affected toplevels' rounded FBO
- * caches dirty; the next frame re-renders them with the new color.
- */
+// border.c - 窗口边框策略 (宽度 + 颜色)
+//
+// 边框本身由 rounded.c 的圆角着色器绘制, 是窗口边缘内侧的一圈环.
+// 本文件只管策略: 环的宽度和颜色.
+//
+// 环的顶部被分成三段 (对应标题栏手势区: 最小化/最大化/关闭), 各有一种颜色;
+// 其余部分 (左右和底部) 使用依赖焦点的颜色. 因为基础色依赖焦点, 焦点切换时
+// 调用 border_focus_changed(), 把受影响窗口的圆角 FBO 缓存标记为脏;
+// 下一帧会用新颜色重绘.
 
 #include "server.h"
 
@@ -27,13 +22,12 @@ static struct wlr_render_color border_hex_to_color(uint32_t hex) {
 }
 
 float border_width(struct toplevel *tl) {
-	/* fullscreen windows only get a border when explicitly enabled */
+	// 全屏窗口只有在显式开启时才画边框
 	if (tl->fullscreen && !CONFIG_FULLSCREEN_BORDER) {
 		return 0.0f;
 	}
-	/* optionally drop the border ring on unfocused windows (flat look for
-	 * inactive windows).  The invisible title strip / resize gesture zones
-	 * are separate from the visible ring, so interaction is unaffected. */
+	// 可选: 未聚焦窗口不画边框环 (更扁平的外观).
+	// 隐形的标题栏/resize 手势区与可见边框环无关, 交互不受影响.
 	if (!CONFIG_BORDER_UNFOCUSED_DRAW && tl->server->focused != tl) {
 		return 0.0f;
 	}
@@ -47,7 +41,7 @@ float border_gradient_width(struct toplevel *tl) {
 
 struct wlr_render_color border_color(struct server *server,
 		struct toplevel *tl) {
-	/* fullscreen uses its own single border color (ignores focus) */
+	// 全屏使用独立的单一边框色 (忽略焦点)
 	if (tl->fullscreen) {
 		return border_hex_to_color(CONFIG_FULLSCREEN_BORDER_COLOR);
 	}
@@ -58,16 +52,15 @@ struct wlr_render_color border_color(struct server *server,
 void border_top_colors(struct toplevel *tl,
 		struct wlr_render_color *left, struct wlr_render_color *mid,
 		struct wlr_render_color *right) {
-	/* fullscreen border is a single color: no three-segment top band */
+	// 全屏边框是单色: 顶部不做三段
 	if (tl->fullscreen) {
 		struct wlr_render_color c =
 			border_hex_to_color(CONFIG_FULLSCREEN_BORDER_COLOR);
 		*left = *mid = *right = c;
 		return;
 	}
-	/* dialogs and fixed-size windows have a single close-button strip, not
-	 * three gesture zones: use one uniform (focus-dependent) color so the
-	 * top band is not split into three segments */
+	// 对话框和固定尺寸窗口只有一个关闭条, 没有三个手势区:
+	// 使用统一的 (依赖焦点的) 颜色, 顶部不分三段
 	if (toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
 		struct wlr_render_color c = border_color(tl->server, tl);
 		*left = *mid = *right = c;
@@ -79,11 +72,9 @@ void border_top_colors(struct toplevel *tl,
 }
 
 void border_focus_changed(struct toplevel *tl, struct toplevel *prev) {
-	/* the border color depends on focus: re-render both the newly focused
-	 * window and the previously focused one so their rounded FBOs pick up
-	 * the new focused/unfocused border color.  The content did not change,
-	 * so this is a mask-only re-render: the cached content pass is reused
-	 * and only the SDF shader is re-run (see rounded.c). */
+	// 边框颜色依赖焦点: 重绘新聚焦窗口和先前聚焦窗口的圆角 FBO,
+	// 让它们取到新的聚焦/未聚焦颜色. 内容没变, 所以是只重绘 mask:
+	// 复用已缓存的内容 pass, 只重跑 SDF 着色器 (见 rounded.c).
 	rounded_cache_dirty_mask(tl);
 	if (prev != NULL) {
 		rounded_cache_dirty_mask(prev);

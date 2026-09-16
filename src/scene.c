@@ -1,10 +1,8 @@
-/*
- * scene.c - scene-graph helpers shared by the window / layer modules
- *
- * Every interesting scene node carries a struct scene_tag in node.data so
- * the compositor can find the owning object (toplevel, layer surface) from
- * an arbitrary hit-tested node by walking up the parent chain.
- */
+// scene.c - 窗口/图层模块共用的场景图辅助
+//
+// 每个有意义的场景节点都在 node.data 里放一个 struct scene_tag,
+// 这样从任意命中测试到的节点向上遍历父节点, 就能找到所属对象
+// (toplevel / layer surface).
 
 #include "server.h"
 
@@ -29,7 +27,7 @@ void xdg_surface_tag(struct wlr_scene_tree *tree,
 	tree->node.data = tag;
 }
 
-/* find the tagged object under the given layout coordinates */
+// 找到给定布局坐标下带标签的对象
 void *scene_tag_at(struct server *server, enum scene_tag_type type,
 		double lx, double ly) {
 	double sx, sy;
@@ -46,10 +44,10 @@ void *scene_tag_at(struct server *server, enum scene_tag_type type,
 				return tag->ptr;
 			}
 			if (tag->type != TAG_POPUP) {
-				return NULL; /* a closer tagged object won the hit test */
+				return NULL; // 更近的带标签对象赢得命中测试
 			}
-			/* a popup belongs to a toplevel: keep walking up so the
-			 * owning window is still found under an open menu */
+			// popup 属于某个 toplevel: 继续向上找, 这样菜单打开时
+			// 仍能找到所属窗口
 		}
 		n = n->parent != NULL ? &n->parent->node : NULL;
 	}
@@ -60,8 +58,8 @@ struct toplevel *toplevel_at(struct server *server) {
 	return toplevel_morph_at(server, server->cursor->x, server->cursor->y);
 }
 
-/* is toplevel a's scene tree stacked above toplevel b's in the toplevel
- * layer (the layer's children are listed bottom to top)? */
+// toplevel a 的场景树是否叠在 b 之上
+// (图层的子节点自下而上排列)
 static bool toplevel_tree_above(struct server *server, struct toplevel *a,
 		struct toplevel *b) {
 	struct wlr_scene_tree *layer = server->layers[LAYER_TOPLEVELS];
@@ -76,31 +74,27 @@ static bool toplevel_tree_above(struct server *server, struct toplevel *a,
 	struct wlr_scene_node *child;
 	wl_list_for_each_reverse(child, &layer->children, link) {
 		if (child == na) {
-			return true;  /* a is above b */
+			return true;  // a 在 b 之上
 		}
 		if (child == nb) {
-			return false; /* b is above a */
+			return false; // b 在 a 之上
 		}
 	}
 	return false;
 }
 
-/* The toplevel *drawn* under (lx, ly), i.e. the window whose visible
- * content claims the pointer.  While a window morphs (animate.c:
- * maximize/restore zoom, or the scale part of an open/close fade) the only
- * thing on screen at its position is its rounded FBO scaled into
- * tl->morph_*; the scene's raw hit test only knows the client surface at
- * its natural geometry.  A cursor inside the morph box therefore belongs
- * to the morphing window even when the raw scene hit landed on a window
- * stacked below it (restore / shrink zoom draws the window larger than its
- * committed content), and a morphing window loses only to a window stacked
- * above it whose own content covers the point (that window really is drawn
- * on top).  Layer-shell surfaces and popups are not consulted here: they
- * sit above the toplevel layer and callers (pointer.c) already prefer
- * them over any window. */
+// 给定坐标下"实际绘制"的 toplevel, 即其可见内容占据指针的窗口.
+// 当窗口正在形变 (animate.c: 最大化/还原缩放, 或打开/关闭淡入淡出的缩放部分) 时,
+// 它位置上唯一可见的是按 tl->morph_* 缩放后的圆角 FBO;
+// 场景的原始命中测试只认识自然尺寸下的客户端 surface.
+// 因此光标落在形变框内时就属于该形变窗口, 即使原始场景命中落在
+// 其下方堆叠的窗口上 (还原/缩小缩放会把窗口画得比已提交内容更大);
+// 形变窗口只输给堆叠在其上、且自身内容覆盖该点的窗口 (那个窗口确实画在上面).
+// 这里不查 layer-shell 和 popup: 它们位于 toplevel 图层之上, 调用方
+// (pointer.c) 已经让它们优先于任何窗口.
 struct toplevel *toplevel_morph_at(struct server *server, double lx,
 		double ly) {
-	/* fast path: no window morphs - the raw scene hit stands */
+	// 快速路径: 没有窗口形变, 直接用原始场景命中
 	bool any_morph = false;
 	struct toplevel *tl;
 	wl_list_for_each(tl, &server->toplevels, link) {
@@ -112,9 +106,8 @@ struct toplevel *toplevel_morph_at(struct server *server, double lx,
 	if (!any_morph) {
 		return scene_tag_at(server, TAG_TOPLEVEL, lx, ly);
 	}
-	/* a layer-shell surface (bar / menu overlay) or a popup covers the
-	 * point: it floats above the windows and is never displaced by a
-	 * morphing window */
+	// layer-shell surface (状态栏/菜单覆盖层) 或 popup 覆盖该点:
+	// 它们浮在窗口之上, 不会被形变窗口挤走
 	{
 		double sx, sy;
 		struct wlr_scene_node *node = wlr_scene_node_at(
@@ -142,10 +135,10 @@ struct toplevel *toplevel_morph_at(struct server *server, double lx,
 		}
 		if (lx < tl->morph_x || lx >= tl->morph_x + tl->morph_w ||
 				ly < tl->morph_y || ly >= tl->morph_y + tl->morph_h) {
-			continue; /* only the visible (morph) box claims the pointer */
+			continue; // 只有可见的 (形变) 框才占据指针
 		}
-		/* a window stacked above the morphing one covers the point with
-		 * its own (raw) content: it is drawn above it and keeps the hit */
+		// 叠在形变窗口之上的窗口用自身 (原始) 内容盖住该点:
+		// 它确实画在上面, 保留命中
 		if (raw != NULL && raw != tl && toplevel_tree_above(server, raw,
 				tl)) {
 			continue;
@@ -157,13 +150,11 @@ struct toplevel *toplevel_morph_at(struct server *server, double lx,
 	return best;
 }
 
-/* is the cursor over a popup (menu / dropdown / tooltip) surface?  A popup
- * floats above its parent toplevel, so a popup covering the window's border
- * wins the pointer: the compositor's frame grabs (resize edges, title
- * strip) are disabled there and the click reaches the popup instead of
- * starting a resize.  scene_tag_at() deliberately walks up past TAG_POPUP
- * to find the owning window, so the popup itself is detected with an
- * explicit hit test instead. */
+// 光标是否位于 popup (菜单/下拉框/工具提示) surface 上?
+// popup 浮在其父 toplevel 之上, 盖住窗口边框的 popup 赢得指针:
+// 此时合成器的边框抓取 (resize 边缘、标题栏) 被禁用, 点击到达 popup
+// 而不是触发缩放. scene_tag_at() 会特意越过 TAG_POPUP 去找所属窗口,
+// 所以这里用显式的命中测试来检测 popup 本身.
 bool pointer_over_popup(struct server *server) {
 	double sx, sy;
 	struct wlr_scene_node *node = wlr_scene_node_at(
@@ -183,10 +174,9 @@ bool pointer_over_popup(struct server *server) {
 	return false;
 }
 
-/* is the cursor over a layer-shell surface (bar, menu overlay, ...)?  These
- * sit above the windows, so while the cursor is on one the compositor must
- * not start a move/resize grab on the window below - the click has to reach
- * the layer surface (taskbar buttons, menu items) instead. */
+// 光标是否位于 layer-shell surface (状态栏、菜单覆盖层等) 上?
+// 它们叠在窗口之上, 所以光标在其上时合成器不能在下方窗口上开始
+// 移动/缩放抓取 - 点击必须到达 layer surface (任务栏按钮、菜单项).
 bool pointer_over_layer_surface(struct server *server) {
 	double sx, sy;
 	struct wlr_scene_node *node = wlr_scene_node_at(

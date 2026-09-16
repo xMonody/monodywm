@@ -1,9 +1,7 @@
-/*
- * output.c - monitors, output layout and wlr-output-management
- *
- * Each output gets a scene output, a preferred mode and an xcursor scale;
- * layout changes and wlr-randr apply/test requests are handled here.
- */
+// output.c - 显示器、输出布局与 wlr-output-management
+//
+// 每个输出创建一个 scene output、首选模式和 xcursor 缩放;
+// 布局变化以及 wlr-randr 的 apply/test 请求在这里处理.
 
 #include "server.h"
 
@@ -31,15 +29,13 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	struct monitor *mon = wl_container_of(listener, mon, frame);
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	/* advance every running window animation to this frame's own instant
-	 * before the scene samples it: each rendered frame shows exactly the
-	 * eased state for its vblank (see animate.c - no update-timer/vblank
-	 * beat, high-refresh outputs interpolate more states) */
+	// 在场景采样之前, 把所有运行中的窗口动画推进到本帧自己的时刻,
+	// 这样每个渲染帧显示的都是它自己 vblank 对应的缓动状态
+	// (见 animate.c: 不存在更新定时器与 vblank 的节拍错位, 高刷输出会插值出更多状态)
 	anim_frame_tick(mon->server,
 		(uint32_t)now.tv_sec * 1000u +
 		(uint32_t)(now.tv_nsec / 1000000u));
-	/* render any dirty offscreen rounded-corner FBOs before the scene
-	 * samples them */
+	// 场景采样前, 先渲染所有脏的离屏圆角 FBO
 	rounded_render_all(mon->server);
 	if (!wlr_scene_output_commit(mon->scene_output, NULL)) {
 		return;
