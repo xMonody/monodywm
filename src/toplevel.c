@@ -87,11 +87,21 @@ void toplevel_box(struct toplevel *tl, struct wlr_box *box) {
 	box->height = base != NULL ? base->geometry.height : 0;
 }
 
-// 对话框/瞬态窗口: 通过 xdg_toplevel.set_parent 声明了父 toplevel 的窗口
-// (GTK/Qt 对话框会这样). wlroots 会保持 toplevel->parent 更新
-// (父窗口 unmaps 时也会清除), 所以实时检查总是最新的.
+// 对话框/瞬态窗口:
+//  - 通过 xdg_toplevel.set_parent 声明了父 toplevel (GTK/Qt 对话框会这样);
+//  - 或通过 xdg-dialog-v1 显式标记为对话框 (不依赖 parent).
+// 两者都不用的客户端 (如 QQ 弹窗) 会被当作普通窗口.
+// wlroots 会保持 toplevel->parent 更新 (父窗口 unmaps 时也会清除),
+// xdg_dialog addon 也随 surface 生命周期, 所以实时检查总是最新的.
 bool toplevel_is_dialog(struct toplevel *tl) {
-	return tl->xdg_toplevel != NULL && tl->xdg_toplevel->parent != NULL;
+	if (tl->xdg_toplevel == NULL) {
+		return false;
+	}
+	if (tl->xdg_toplevel->parent != NULL) {
+		return true;
+	}
+	return wlr_xdg_dialog_v1_try_from_wlr_xdg_toplevel(
+		tl->xdg_toplevel) != NULL;
 }
 
 // 通过 min == max 约束钉死尺寸的窗口 (如 QQ 登录窗口、启动画面):
@@ -109,41 +119,25 @@ bool toplevel_is_fixed_size(struct toplevel *tl) {
 			tl->xdg_toplevel->current.max_height;
 }
 
-// 状态栏可见的"归属"窗口: 弹窗没有独立的 IPC id,
-// 先沿 xdg parent 链向上找到真正占据任务栏条目 (ipc_added) 的主窗口;
-// 没有 parent 的 Electron 弹窗 (如 QQ "资料卡", 见 toplevel_hidden_from_taskbar)
-// 退回同进程已有任务栏条目的窗口. 都没有时返回 NULL,
+// 状态栏可见的"归属"窗口: 弹窗没有独立 IPC id, 沿 xdg parent 链向上找到
+// 真正占据任务栏条目 (ipc_added) 的主窗口. 找不到时返回 NULL,
 // 让状态栏清空高亮而不是收到未知 id.
-struct toplevel *toplevel_ipc_owner(struct server *server, struct toplevel *tl) {
-	if (tl == NULL) {
-		return NULL;
-	}
-	pid_t pid = tl->pid;
+struct toplevel *toplevel_ipc_owner(struct toplevel *tl) {
 	while (tl != NULL && !tl->ipc_added) {
 		struct wlr_xdg_toplevel *parent =
 			tl->xdg_toplevel != NULL ? tl->xdg_toplevel->parent : NULL;
 		if (parent == NULL || parent->base == NULL) {
-			tl = NULL;
-			break;
+			return NULL;
 		}
 		tl = parent->base->data;
 	}
-	if (tl != NULL) {
-		return tl;
-	}
-	struct toplevel *other;
-	wl_list_for_each(other, &server->toplevels, link) {
-		if (other->ipc_added && other->pid != 0 && other->pid == pid) {
-			return other;
-		}
-	}
-	return NULL;
+	return tl;
 }
 
 // 向状态栏报告焦点: 弹窗归到其主窗口 (ipc_added 的窗口), 找不到则 id 0
 static void ipc_send_focus(struct server *server, struct toplevel *tl) {
 	ipc_send_window_event(server, "window_focus",
-		tl != NULL ? toplevel_ipc_owner(server, tl) : NULL);
+		tl != NULL ? toplevel_ipc_owner(tl) : NULL);
 }
 
 // toplevel 所在的输出 (按其中心), 或中心输出
@@ -960,27 +954,23 @@ static void toplevel_destroy_subsurfaces(struct toplevel *tl) {
 	}
 }
 
-// 不占独立任务栏条目的"弹窗":
-//  - 通过 xdg_toplevel.set_parent 声明父窗口的对话框 (GTK/Qt 对话框);
-//  - 没有 xdg parent 的固定尺寸小窗, 且同进程已有其它任务栏条目
-//    (Electron 弹窗, 如 QQ "资料卡" 322x472, min == max). 若它是该进程
-//    唯一的窗口则不隐藏, 这样 QQ 登录窗仍有任务栏条目.
-static bool toplevel_hidden_from_taskbar(struct server *server,
-		struct toplevel *tl) {
+// 让任务栏条目与当前对话框判定保持一致 (map 或 set_parent / xdg-dialog 变化后
+// 调用). 对话框通过 set_parent 声明父窗口或经 xdg-dialog-v1 标记识别;
+// 两者都不用的客户端 (如 QQ 弹窗) 仍按普通窗口进入任务栏.
+// 状态无变化时不做任何事, 避免重复广播.
+static void toplevel_sync_taskbar(struct server *server, struct toplevel *tl) {
 	if (toplevel_is_dialog(tl)) {
-		return true;
+		// 记住它当过对话框: 之后父窗口 unmaps 时 wlroots 会清空 parent,
+		// 不能让这个窗口突然冒回任务栏
+		tl->transient_seen = true;
 	}
-	if (!toplevel_is_fixed_size(tl)) {
-		return false;
+	bool visible = !tl->transient_seen;
+	if (visible == tl->ipc_added) {
+		return;
 	}
-	struct toplevel *other;
-	wl_list_for_each(other, &server->toplevels, link) {
-		if (other != tl && other->ipc_added && other->pid != 0 &&
-				other->pid == tl->pid) {
-			return true;
-		}
-	}
-	return false;
+	tl->ipc_added = visible;
+	ipc_send_window_event(server,
+		visible ? "window_added" : "window_removed", tl);
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
@@ -1003,12 +993,8 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 		place_toplevel(server, tl);
 	}
 	// 先通知状态栏, 再发状态/焦点事件.
-	// 对话框/弹窗不占独立任务栏条目 (归到其主窗口), 因此不分配 IPC id:
-	// 不发 window_added, 之后的 window_focus 会用 toplevel_ipc_owner 归到主窗口.
-	if (!toplevel_hidden_from_taskbar(server, tl)) {
-		tl->ipc_added = true;
-		ipc_send_window_event(server, "window_added", tl);
-	}
+	// 对话框/弹窗不占独立任务栏条目 (归到其主窗口), 因此不分配 IPC id.
+	toplevel_sync_taskbar(server, tl);
 	// 处理首个提交前到达的全屏/最大化请求 (此时 surface 已初始化并映射)
 	if (tl->xdg_toplevel->requested.fullscreen) {
 		// 初始状态, 不是用户全屏动作: 瞬时应用
@@ -1085,6 +1071,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&tl->request_resize.link);
 	wl_list_remove(&tl->set_title.link);
 	wl_list_remove(&tl->set_app_id.link);
+	wl_list_remove(&tl->set_parent.link);
 	wl_list_remove(&tl->new_popup.link);
 }
 
@@ -1270,6 +1257,27 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener,
 	// 用客户端选择的边缘进入合成器缩放抓取; 指针 motion 驱动 update_resize(),
 	// 按钮释放结束抓取, 与合成器自己的边缘手柄完全一样.
 	begin_resize(server, tl, event->edges);
+}
+
+// 客户端在 map 之后才声明/清除父窗口 (transient): 任务栏归属需要跟着变.
+// 注意 wlroots 只保留 mapped 父窗口; 完全不用 set_parent / xdg-dialog 的
+// 客户端 (如 QQ 弹窗) 在这里没有任何信号可用.
+static void xdg_toplevel_set_parent(struct wl_listener *listener, void *data) {
+	struct toplevel *tl = wl_container_of(listener, tl, set_parent);
+	// 先记日志: 多数客户端在 map 前就设好父窗口, 不能因未映射而漏掉
+	wlr_log(WLR_DEBUG, "xdg_toplevel: set_parent app_id \"%s\" -> %s",
+		tl->app_id != NULL ? tl->app_id : "?",
+		toplevel_is_dialog(tl) ? "dialog" : "none");
+	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
+	if (base == NULL || !base->surface->mapped) {
+		return; // 还没映射: map 处理器会用最新父窗口关系决定
+	}
+	bool was_added = tl->ipc_added;
+	toplevel_sync_taskbar(tl->server, tl);
+	// 归属变了且它正聚焦: 让状态栏重新高亮正确的条目 (或清空)
+	if (was_added != tl->ipc_added && tl->server->focused == tl) {
+		ipc_send_focus(tl->server, tl);
+	}
 }
 
 static void xdg_toplevel_set_title(struct wl_listener *listener, void *data) {
@@ -1481,6 +1489,26 @@ static void foreign_toplevel_destroy(struct wl_listener *listener, void *data) {
 	tl->fthandle = NULL;
 }
 
+// xdg-dialog-v1: 客户端把某个 toplevel 标记为对话框 (可附带 modal).
+// 若它在 map 之后才标记, 任务栏归属需要跟着变.
+void server_new_xdg_dialog(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server, new_xdg_dialog);
+	struct wlr_xdg_dialog_v1 *dialog = data;
+	struct wlr_xdg_toplevel *xdg_toplevel = dialog->xdg_toplevel;
+	if (xdg_toplevel == NULL || xdg_toplevel->base == NULL) {
+		return;
+	}
+	struct toplevel *tl = xdg_toplevel->base->data;
+	if (tl == NULL) {
+		return;
+	}
+	wlr_log(WLR_DEBUG, "xdg_dialog: app_id \"%s\" modal=%d",
+		tl->app_id != NULL ? tl->app_id : "?", dialog->modal);
+	if (xdg_toplevel->base->surface->mapped) {
+		toplevel_sync_taskbar(server, tl);
+	}
+}
+
 void server_new_toplevel(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server, new_xdg_toplevel);
 	struct wlr_xdg_toplevel *xdg_toplevel = data;
@@ -1569,6 +1597,8 @@ void server_new_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_toplevel->events.set_title, &tl->set_title);
 	tl->set_app_id.notify = xdg_toplevel_set_app_id;
 	wl_signal_add(&xdg_toplevel->events.set_app_id, &tl->set_app_id);
+	tl->set_parent.notify = xdg_toplevel_set_parent;
+	wl_signal_add(&xdg_toplevel->events.set_parent, &tl->set_parent);
 	tl->new_popup.notify = xdg_toplevel_new_popup;
 	wl_signal_add(&base->events.new_popup, &tl->new_popup);
 	tl->new_subsurface.notify = xdg_toplevel_new_subsurface;

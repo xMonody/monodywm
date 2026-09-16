@@ -32,8 +32,8 @@
 
 // 窗口阴影 (scenefx 风格高斯柔影, 颜色独立于边框色):
 #define CONFIG_SHADOW_BLUR_SIGMA 20.0f
-#define CONFIG_SHADOW_COLOR      0x24283b
-#define CONFIG_SHADOW_ALPHA      0.8f
+#define CONFIG_SHADOW_COLOR      0x000000
+#define CONFIG_SHADOW_ALPHA      0.4f
 
 #define CONFIG_TITLEBAR_HEIGHT  6           // 移动窗口标题栏范围
 #define CONFIG_EDGE_THICKNESS   6           // 调整窗口大小边框范围

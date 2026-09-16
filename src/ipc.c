@@ -330,7 +330,7 @@ static void ipc_send_window_list(struct server *server,
 	struct toplevel *focused = server->focused;
 	if (focused != NULL) {
 		// 对话框不占任务栏条目: 高亮其主窗口, 与 window_focus 保持一致
-		focused = toplevel_ipc_owner(server, focused);
+		focused = toplevel_ipc_owner(focused);
 	}
 	if (focused != NULL && focused->xdg_toplevel->base != NULL &&
 			focused->xdg_toplevel->base->surface->mapped) {

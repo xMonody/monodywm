@@ -38,6 +38,7 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_activation_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
+#include <wlr/types/wlr_xdg_dialog_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 
 // 场景树顺序 (自下而上)
@@ -222,6 +223,7 @@ struct toplevel {
 	// 通过 IPC 套接字暴露给状态栏的 id
 	int id;
 	bool ipc_added; // 已发出 window_added
+	bool transient_seen; // 曾是对话框/瞬态窗口 (父窗口消失后仍不占任务栏)
 	char *app_id;   // 缓存的 app_id (跨拆除保留, 供 window_removed 使用)
 	pid_t pid;      // 客户端进程 id (便于状态栏匹配托盘项)
 	int after_id;   // 本窗口由哪个 id 的窗口启动 (0 = 无); 关闭时焦点回到那里; 优先同进程的兄弟窗口而非终端
@@ -240,6 +242,7 @@ struct toplevel {
 	struct wl_listener request_resize;
 	struct wl_listener set_title;
 	struct wl_listener set_app_id;
+	struct wl_listener set_parent;
 	struct wl_listener new_popup;
 	struct wl_listener new_subsurface;
 
@@ -314,6 +317,8 @@ struct server {
 	struct wlr_output_layout *output_layout;
 	struct wlr_output_manager_v1 *output_manager;
 	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_manager;
+	// xdg-dialog-v1: 客户端可显式把 toplevel 标记为对话框 (比 set_parent 可靠)
+	struct wlr_xdg_wm_dialog_v1 *xdg_dialog_manager;
 
 	struct wlr_seat *seat;
 	struct wlr_cursor *cursor;
@@ -476,6 +481,7 @@ struct server {
 	struct wl_listener output_manager_apply;
 	struct wl_listener output_manager_test;
 	struct wl_listener new_xdg_toplevel;
+	struct wl_listener new_xdg_dialog;
 	struct wl_listener new_layer_surface;
 	struct wl_listener new_decoration;
 	struct wl_listener new_ime;
@@ -517,9 +523,8 @@ bool pointer_over_layer_surface(struct server *server);
 bool toplevel_is_dialog(struct toplevel *tl);
 // 固定尺寸窗口 (min == max): 不能缩放/最大化/最小化
 bool toplevel_is_fixed_size(struct toplevel *tl);
-// 状态栏可见的"归属"窗口: 对话框沿 parent 链归到主窗口, 没有 parent 的
-// 弹窗 (如 QQ "资料卡") 退回同进程已有任务栏条目的窗口; 无归属时返回 NULL
-struct toplevel *toplevel_ipc_owner(struct server *server, struct toplevel *tl);
+// 状态栏可见的"归属"窗口: 对话框沿 parent 链归到主窗口; 无归属时返回 NULL
+struct toplevel *toplevel_ipc_owner(struct toplevel *tl);
 
 // ---- toplevel.c: xdg-shell 窗口、窗口状态、装饰 ----
 void toplevel_box(struct toplevel *tl, struct wlr_box *box);
@@ -546,6 +551,7 @@ void arrange_toplevels_work_area(struct server *server,
 void maximized_box(struct server *server, struct wlr_output *output,
 	struct wlr_box *box);
 void server_new_toplevel(struct wl_listener *listener, void *data);
+void server_new_xdg_dialog(struct wl_listener *listener, void *data);
 void server_new_decoration(struct wl_listener *listener, void *data);
 
 // ---- rounded.c: 离屏圆角 FBO 缓存 ----

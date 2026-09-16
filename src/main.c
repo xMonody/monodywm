@@ -267,6 +267,9 @@ int main(int argc, char *argv[]) {
 	wlr_xdg_output_manager_v1_create(server.display, server.output_layout);
 	server.foreign_toplevel_manager =
 		wlr_foreign_toplevel_manager_v1_create(server.display);
+	// xdg-dialog-v1: 客户端把无 parent 的弹窗 (如 QQ "资料卡") 显式标记为对话框
+	server.xdg_dialog_manager =
+		wlr_xdg_wm_dialog_v1_create(server.display, 1);
 
 	server.seat = wlr_seat_create(server.display, "seat0");
 	server.cursor = wlr_cursor_create();
@@ -425,6 +428,11 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.output_manager->events.test, &server.output_manager_test);
 	server.new_xdg_toplevel.notify = server_new_toplevel;
 	wl_signal_add(&xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
+	if (server.xdg_dialog_manager != NULL) {
+		server.new_xdg_dialog.notify = server_new_xdg_dialog;
+		wl_signal_add(&server.xdg_dialog_manager->events.new_dialog,
+			&server.new_xdg_dialog);
+	}
 	server.new_layer_surface.notify = server_new_layer_surface;
 	wl_signal_add(&layer_shell->events.new_surface, &server.new_layer_surface);
 	server.new_decoration.notify = server_new_decoration;
@@ -550,6 +558,9 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.output_manager_apply.link);
 	wl_list_remove(&server.output_manager_test.link);
 	wl_list_remove(&server.new_xdg_toplevel.link);
+	if (server.xdg_dialog_manager != NULL) {
+		wl_list_remove(&server.new_xdg_dialog.link);
+	}
 	wl_list_remove(&server.new_layer_surface.link);
 	wl_list_remove(&server.new_decoration.link);
 	wl_list_remove(&server.new_ime.link);
