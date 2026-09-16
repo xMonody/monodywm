@@ -21,6 +21,10 @@ struct monitor {
 	struct wlr_output *output;
 	struct wlr_scene_output *scene_output;
 
+	// 渲染帧率统计: 每秒把实际提交的帧数记一条 INFO 日志
+	uint32_t fps_frames;
+	uint32_t fps_start_ms;
+
 	struct wl_listener frame;
 	struct wl_listener destroy;
 };
@@ -29,18 +33,33 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	struct monitor *mon = wl_container_of(listener, mon, frame);
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	uint32_t now_ms = (uint32_t)now.tv_sec * 1000u +
+		(uint32_t)(now.tv_nsec / 1000000u);
 	// 在场景采样之前, 把所有运行中的窗口动画推进到本帧自己的时刻,
 	// 这样每个渲染帧显示的都是它自己 vblank 对应的缓动状态
 	// (见 animate.c: 不存在更新定时器与 vblank 的节拍错位, 高刷输出会插值出更多状态)
-	anim_frame_tick(mon->server,
-		(uint32_t)now.tv_sec * 1000u +
-		(uint32_t)(now.tv_nsec / 1000000u));
+	anim_frame_tick(mon->server, now_ms);
 	// 场景采样前, 先渲染所有脏的离屏圆角 FBO
 	rounded_render_all(mon->server);
 	if (!wlr_scene_output_commit(mon->scene_output, NULL)) {
 		return;
 	}
 	wlr_scene_output_send_frame_done(mon->scene_output, &now);
+
+	// 渲染帧率: 每秒把实际提交的帧数记一条 INFO 日志 (空闲不出帧时不计)
+	if (mon->fps_start_ms == 0) {
+		mon->fps_start_ms = now_ms;
+	}
+	mon->fps_frames++;
+	uint32_t elapsed = now_ms - mon->fps_start_ms;
+	if (elapsed >= 1000u) {
+		wlr_log(WLR_INFO, "output %s: %.1f fps (%u frames in %u ms)",
+			mon->output->name,
+			(double)mon->fps_frames * 1000.0 / (double)elapsed,
+			mon->fps_frames, elapsed);
+		mon->fps_frames = 0;
+		mon->fps_start_ms = now_ms;
+	}
 }
 
 static void monitor_destroy(struct wl_listener *listener, void *data) {

@@ -6,9 +6,10 @@
 //                   这样不理会关闭请求的客户端也不会留下不可见却阻塞输入的窗口.
 //                   关闭一个仍在落下 (最小化) 的窗口会保留掉落的同时淡出;
 //                   刚 map 就关闭则从当前透明度开始淡出, 不会闪回.
-//   最小化       -> 窗口从当前位置垂直下落, 直到完全低于其输出下边缘,
-//                   然后隐藏场景节点 (隐藏时弹回静止原点, 几何记账保持不变)
-//   还原         -> 隐藏的窗口从自身顶边上方落回, 精确落回原位
+//   最小化       -> Windows 11 式: 窗口朝状态栏上的图标缩小 (图标位置由
+//                   config.h 的 TASKBAR 常量推算, 状态栏未运行也照常推算),
+//                   完成后隐藏场景节点并弹回静止原点
+//   还原         -> 从状态栏图标放大回静止框
 //
 // 运动作用在 toplevel 的场景树节点 (位置) 上, 淡变作用在可见窗口 buffer 上
 // (经 rounded_window_set_opacity()) - 所以圆角副本、边框和阴影一起移动/淡变.
@@ -49,9 +50,9 @@ enum anim_kind {
 	ANIM_NONE = 0,
 	ANIM_FADE_IN,   // map: 透明度 0 -> 1, 不移动
 	ANIM_FADE_OUT,  // close: 透明度 1 -> 0, 然后发送 close
-	ANIM_FALL_OUT,  // minimize: 落到屏幕下边缘之外
-	ANIM_FALL_IN,   // restore: 从窗口上方落回
 	ANIM_GEOM,      // maximize/restore: 在两个框之间缩放
+	ANIM_ICON_OUT,  // minimize: 朝状态栏图标缩小并淡出 (Windows 11)
+	ANIM_ICON_IN,   // restore: 从状态栏图标放大回原位并淡入 (Windows 11)
 };
 
 struct toplevel_anim {
@@ -62,8 +63,8 @@ struct toplevel_anim {
 
 	enum anim_kind kind;
 
-	// 静止原点: 窗口在屏幕上该待的地方. 最小化开始时 (落下前) 捕获,
-	// 这样打断落下过程的还原仍能把窗口落回真正的位置.
+	// 静止原点: 窗口在屏幕上该待的地方. 最小化开始时捕获,
+	// 还原据此把窗口放大回原位.
 	bool has_rest;
 	int rest_x, rest_y;
 
@@ -74,12 +75,6 @@ struct toplevel_anim {
 	float op_cur;         // 当前应用的透明度 (淡变): 让打断的运行从上一次
 	                       // 实际停留的位置开始 (map 淡入途中关闭)
 	int win_w, win_h;   // 窗口尺寸 (扫描区域 damage)
-
-	// 最小化落下/还原落回的缩放 (掉落): 窗口落下时围绕自己的 (移动中的) 中心
-	// 缩小到 CONFIG_ANIM_FALL_SCALE, 落回时从该值放大回 1.0.
-	// 仅当存在可缩放的圆角 FBO 时按运行启用.
-	bool scale_fall;
-	float scale_from;   // p = 0 时的缩放: 1.0 (落下), CONFIG (落回)
 
 	// ANIM_GEOM (Windows 式最大化/还原缩放): 在 geom_from 与 geom_to 之间插值的窗口框.
 	// 缩放从等待阶段开始 - 只有客户端提交了目标尺寸且圆角缓存按该尺寸重绘后,
@@ -101,12 +96,9 @@ static uint32_t mono_ms(void) {
 // 最大化/还原缩放使用类似 Windows 的平滑 ease-in-out
 static float anim_ease(enum anim_kind kind, float t) {
 	switch (kind) {
-	case ANIM_FALL_OUT:
-		return t * t; // 加速下落
-	case ANIM_FALL_IN:
-		t = 1.0f - t; // 减速落地
-		return 1.0f - t * t * t;
 	case ANIM_GEOM:
+	case ANIM_ICON_OUT:
+	case ANIM_ICON_IN:
 		return t * t * (3.0f - 2.0f * t); // smoothstep
 	case ANIM_FADE_IN:
 	case ANIM_FADE_OUT:
@@ -115,8 +107,8 @@ static float anim_ease(enum anim_kind kind, float t) {
 	}
 }
 
-// 最大化/还原缩放的时长. CONFIG_ANIM_MAXIMIZE_MS 是基准 - 它自己的独立旋钮,
-// 特意不绑定最小化掉落时间 (CONFIG_ANIM_FALL_MS). 跨度很大的缩放
+// 每个动画自己的时长. 最大化/还原的基准是 CONFIG_ANIM_MAXIMIZE_MS - 它自己的独立旋钮.
+// 跨度很大的缩放
 // (小窗口铺满全屏) 会获得有界的额外时间 (跨度/12, 最多翻倍),
 // 使每帧步进在 60Hz 下仍平滑; 增量足够小, 旋钮仍直接、可预测地控制缩放手感.
 static uint32_t anim_geom_duration(const struct wlr_box *from,
@@ -207,37 +199,9 @@ static void morph_box_at(struct toplevel_anim *a, float p) {
 static void anim_apply(struct toplevel_anim *a, float p) {
 	struct toplevel *tl = a->tl;
 	switch (a->kind) {
-	case ANIM_FALL_OUT:
-	case ANIM_FALL_IN: {
-		int nx = a->from_x + (int)lroundf(
-			(float)(a->to_x - a->from_x) * p);
-		int ny = a->from_y + (int)lroundf(
-			(float)(a->to_y - a->from_y) * p);
-		wlr_scene_node_set_position(&tl->scene_tree->node, nx, ny);
-		// 掉落时会围绕窗口自己的 (移动中的) 中心缩小/放大圆角 FBO:
-		// 落下 1.0 -> CONFIG_ANIM_FALL_SCALE, 落回 CONFIG_ANIM_FALL_SCALE -> 1.0
-		if (a->scale_fall) {
-			float to = a->kind == ANIM_FALL_OUT ?
-				CONFIG_ANIM_FALL_SCALE : 1.0f;
-			float s = a->scale_from + (to - a->scale_from) * p;
-			int mw = (int)lroundf(a->win_w * s);
-			int mh = (int)lroundf(a->win_h * s);
-			if (mw < 1) {
-				mw = 1;
-			}
-			if (mh < 1) {
-				mh = 1;
-			}
-			tl->morph_active = true;
-			tl->morph_x = nx + (a->win_w - mw) / 2;
-			tl->morph_y = ny + (a->win_h - mh) / 2;
-			tl->morph_w = mw;
-			tl->morph_h = mh;
-			rounded_cache_morph_apply(tl);
-		}
-		break;
-	}
 	case ANIM_GEOM:
+	case ANIM_ICON_OUT:
+	case ANIM_ICON_IN: {
 		// 窗口 (其圆角 FBO 持有目标尺寸的内容) 按缩放显示在插值出的框里:
 		// 把场景树移到框原点, 让 rounded.c 把 FBO 缩放进去
 		morph_box_at(a, p);
@@ -245,6 +209,7 @@ static void anim_apply(struct toplevel_anim *a, float p) {
 			tl->morph_x, tl->morph_y);
 		rounded_cache_morph_apply(tl);
 		break;
+	}
 	case ANIM_FADE_IN:
 	case ANIM_FADE_OUT: {
 		float op = a->op_from + (a->op_to - a->op_from) * p;
@@ -270,27 +235,35 @@ static const char *anim_kind_name(enum anim_kind kind) {
 	switch (kind) {
 	case ANIM_FADE_IN:  return "fade-in";
 	case ANIM_FADE_OUT: return "fade-out";
-	case ANIM_FALL_OUT: return "minimize-drop";
-	case ANIM_FALL_IN:  return "restore-drop";
 	case ANIM_GEOM:     return "maximize-zoom";
+	case ANIM_ICON_OUT: return "taskbar-shrink";
+	case ANIM_ICON_IN:  return "taskbar-grow";
 	default:            return "none";
 	}
 }
 
-// 拆除正在运行的形态 (最大化/还原缩放, 或最小化掉落/还原落回的收缩):
+// 拆除正在运行的形态 (最大化/还原缩放, 或最小化/还原的图标缩放):
 // 清除形态状态, 把 FBO 节点摆回良定义的布局.
-//  - 缩放: 把场景树弹回目标框 (几何), 并按自然 (目标) 尺寸摆放 FBO;
+//  - 最大化缩放: 把场景树弹回目标框, 并按自然 (目标) 尺寸摆放 FBO;
 //    若圆角缓存还没持有目标尺寸的内容, 就标记为脏, 客户端提交后立即按自然布局重绘.
-//  - 掉落/落回形态: 把 FBO 节点摆回窗口当前框的自然布局,
-//    这样接下来运行的任何东西 (保留运动的淡出、取消) 都能正确地从那里绘制窗口.
+//  - 图标缩放: 把 FBO 节点摆回窗口当前框的自然布局.
 static void anim_stop(struct toplevel_anim *a); // 定义在下文
 static void morph_teardown(struct toplevel_anim *a) {
 	struct toplevel *tl = a->tl;
 	if (!tl->morph_active) {
 		return;
 	}
-	struct wlr_box sweep;
-	if (a->kind == ANIM_GEOM) {
+	struct wlr_box sweep = {0};
+	if (a->kind == ANIM_ICON_OUT || a->kind == ANIM_ICON_IN) {
+		// 图标缩放: 把 FBO 摆回窗口静止框的自然尺寸
+		tl->morph_x = a->rest_x;
+		tl->morph_y = a->rest_y;
+		tl->morph_w = a->win_w;
+		tl->morph_h = a->win_h;
+		rounded_cache_morph_apply(tl);
+		tl->morph_active = false;
+		geom_sweep_box(a, &sweep);
+	} else if (a->kind == ANIM_GEOM) {
 		// 在清除 morph_active 之前弹到目标框, 并按自然 (目标) 尺寸重新摆放 FBO:
 		// 最后一个缩放 tick 把节点 dest-size 设成了缩放中途的形态框,
 		// 而就绪的缓存不会重新发布, 所以没有这一步窗口会停在中间缩放
@@ -308,17 +281,6 @@ static void morph_teardown(struct toplevel_anim *a) {
 			rounded_cache_dirty(tl);
 		}
 		geom_sweep_box(a, &sweep);
-	} else {
-		// 掉落/落回收缩: 把 FBO 摆回窗口当前位置的自然框, 然后停止缩放
-		struct wlr_box box;
-		toplevel_box(tl, &box);
-		tl->morph_x = box.x;
-		tl->morph_y = box.y;
-		tl->morph_w = box.width;
-		tl->morph_h = box.height;
-		rounded_cache_morph_apply(tl);
-		tl->morph_active = false;
-		anim_sweep_box(a, &sweep);
 	}
 	anim_schedule_frames(tl->server, &sweep);
 	wlr_log(WLR_DEBUG, "animate: %s cancelled for app_id \"%s\"",
@@ -361,24 +323,21 @@ static void anim_finish(struct toplevel_anim *a) {
 			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
 		}
 		return;
-	case ANIM_FALL_OUT:
-		// 窗口已离开屏幕: 隐藏它并弹回静止原点, 让所有几何记账看到
-		// (现在不可见的) 窗口的原始位置. 收缩形态已完成;
-		// FBO 节点停在上个 tick 的位置, 随整棵树一起隐藏, 直到窗口被还原.
+	case ANIM_GEOM:
+		// 已缩放到目标框: 把几何交还圆角缓存 (自然位置/尺寸等于刚显示的内容)
+		tl->morph_active = false;
+		break;
+	case ANIM_ICON_OUT:
+		// 已缩到图标: 隐藏并弹回静止原点
 		wlr_scene_node_set_position(&tl->scene_tree->node,
 			a->rest_x, a->rest_y);
 		wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
 		tl->morph_active = false;
 		break;
-	case ANIM_FALL_IN:
-		// 落地: 保持静止原点. 最后一个 tick (p = 1) 已把 FBO 缩放回自然框,
-		// 所以只需清除形态状态本身
+	case ANIM_ICON_IN:
+		// 已放大回静止框: 保持静止原点
 		wlr_scene_node_set_position(&tl->scene_tree->node,
 			a->rest_x, a->rest_y);
-		tl->morph_active = false;
-		break;
-	case ANIM_GEOM:
-		// 已缩放到目标框: 把几何交还圆角缓存 (自然位置/尺寸等于刚显示的内容)
 		tl->morph_active = false;
 		break;
 	default:
@@ -386,7 +345,8 @@ static void anim_finish(struct toplevel_anim *a) {
 	}
 	a->kind = ANIM_NONE;
 	struct wlr_box sweep;
-	if (kind == ANIM_GEOM) {
+	if (kind == ANIM_GEOM || kind == ANIM_ICON_OUT ||
+			kind == ANIM_ICON_IN) {
 		geom_sweep_box(a, &sweep);
 	} else {
 		anim_sweep_box(a, &sweep);
@@ -566,6 +526,57 @@ static void anim_begin(struct toplevel_anim *a, enum anim_kind kind,
 	anim_watchdog_arm(a->tl->server);
 }
 
+// 用状态栏布局常量 (config.h) 推算窗口在任务栏上的图标框 (布局坐标).
+// 位置完全来自配置, 不查询/不判断状态栏是否运行:
+//   状态栏贴在输出上边或下边 (CONFIG_TASKBAR_AT_TOP), 高度 CONFIG_TASKBAR_HEIGHT,
+//   图标间距 CONFIG_TASKBAR_ICON_PITCH, 第一个图标偏移 CONFIG_TASKBAR_ICON_OFFSET.
+static bool taskbar_icon_box(struct server *server, struct toplevel *tl,
+		struct wlr_box *out) {
+	if (!tl->ipc_added) {
+		return false; // 对话框/弹窗没有独立图标
+	}
+	struct wlr_output *output = toplevel_output(server, tl);
+	if (output == NULL) {
+		return false;
+	}
+	struct wlr_box obox;
+	wlr_output_layout_get_box(server->output_layout, output, &obox);
+
+	// 状态栏顶边: 贴顶就是输出顶边, 贴底则从输出底边往上量一个栏高
+	int bar_top = CONFIG_TASKBAR_AT_TOP ? obox.y :
+		obox.y + obox.height - CONFIG_TASKBAR_HEIGHT;
+
+	// 图标序号 = 创建顺序中, 该窗口前面有多少个任务栏可见的窗口.
+	// 状态栏按 window_added 顺序排列图标, 所以两者一致.
+	int index = 0;
+	struct toplevel *it;
+	wl_list_for_each(it, &server->toplevels, link) {
+		if (it == tl) {
+			break;
+		}
+		if (it->ipc_added) {
+			index++;
+		}
+	}
+
+	int icon = CONFIG_TASKBAR_HEIGHT - 8; // 图标尺寸, 见 config.h
+	if (icon < 1) {
+		icon = 1;
+	}
+	int x = obox.x + CONFIG_TASKBAR_ICON_OFFSET +
+		index * CONFIG_TASKBAR_ICON_PITCH;
+	int y = bar_top + (CONFIG_TASKBAR_HEIGHT - icon) / 2;
+	// 夹在屏幕内, 避免图标很多时飞出
+	if (x + icon > obox.x + obox.width) {
+		x = obox.x + obox.width - icon;
+	}
+	if (x < obox.x) {
+		x = obox.x;
+	}
+	*out = (struct wlr_box){ x, y, icon, icon };
+	return true;
+}
+
 bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 	if (!CONFIG_ANIM_ENABLE) {
 		return false;
@@ -584,70 +595,44 @@ bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 	if (box.width <= 0 || box.height <= 0) {
 		return false; // 没有可用几何: 调用方瞬时隐藏
 	}
-	struct wlr_output *output = toplevel_output(server, tl);
-	if (output == NULL) {
-		return false;
-	}
-	struct wlr_box obox;
-	wlr_output_layout_get_box(server->output_layout, output, &obox);
+	// Windows 11 式最小化: 朝状态栏图标缩小. 图标位置由常量推算,
+	// 状态栏没运行/没圆角 FBO 也照常动画 (后者只移动, 不缩放).
+	struct wlr_box icon_box = box;
+	taskbar_icon_box(server, tl, &icon_box);
 
-	// 落到窗口完全离开输出下边缘为止: 其 FBO 顶边在内容顶边上方
-	// shadow_padding() 处, 所以内容顶边到 bottom + shadow (再加 1 像素安全量)
-	// 时不会露出任何边框/阴影细条. 掉落恰好在窗口离开屏幕时结束 -
-	// 不再有不可见的尾部行程.
-	int fall_to = obox.y + obox.height + shadow_padding() + 1;
-	if (fall_to <= box.y) {
-		// 已经在底部之下: 立即隐藏
-		wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
-		wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
-		return true;
-	}
-
-	// 记住静止原点. 落回过程中最小化必须保留那次运行的目标:
-	// 还原已消费 has_rest, 而 box 是下落窗口的半空位置, 不是它该待的地方
-	if (a->kind == ANIM_FALL_IN) {
+	// 记住静止原点 (被打断的还原用其目标, 而不是半空中的位置)
+	if (a->kind == ANIM_ICON_IN) {
 		a->has_rest = true;
-		a->rest_x = a->to_x;
-		a->rest_y = a->to_y;
+		a->rest_x = a->geom_to.x;
+		a->rest_y = a->geom_to.y;
 	} else {
 		a->has_rest = true;
 		a->rest_x = box.x;
 		a->rest_y = box.y;
 	}
-
-	anim_begin(a, ANIM_FALL_OUT, CONFIG_ANIM_FALL_MS);
-	a->from_x = box.x;
-	a->from_y = box.y;
-	a->to_x = box.x;
-	a->to_y = fall_to;
+	anim_begin(a, ANIM_ICON_OUT, CONFIG_ANIM_TASKBAR_MS);
+	a->geom_from = box;
+	a->geom_to = icon_box;
 	a->win_w = box.width;
 	a->win_h = box.height;
-
-	// 落下时围绕自己的 (移动中的) 中心缩小窗口 - 到窗口离开屏幕时,
-	// 圆角 FBO 从 1.0 缩放到 CONFIG_ANIM_FALL_SCALE.
-	// 没有可缩放 FBO 时就是纯掉落.
-	a->scale_fall = CONFIG_ANIM_FALL_SCALE < 1.0f &&
-		rounded_morph_supported(tl);
-	if (a->scale_fall) {
-		a->scale_from = 1.0f;
-		tl->morph_active = true;
-		tl->morph_x = box.x;
-		tl->morph_y = box.y;
-		tl->morph_w = box.width;
-		tl->morph_h = box.height;
-	} else {
-		tl->morph_active = false;
-	}
-
-	// 完全不透明、节点启用, 然后让它落下. 焦点已移到下一个窗口并被提升到它上面
-	// (见 set_minimized), 所以把下落的窗口放回 toplevel 图层顶部:
-	// 它必须在下落时留在自己的位置, 而不是滑到接替焦点的窗口后面.
+	a->op_from = 1.0f;
+	a->op_to = 1.0f;
+	a->op_cur = 1.0f;
+	// 场景树锚定在窗口框原点, 圆角 FBO (含边框/阴影) 缩放进去
+	tl->morph_active = rounded_morph_supported(tl);
+	tl->morph_x = box.x;
+	tl->morph_y = box.y;
+	tl->morph_w = box.width;
+	tl->morph_h = box.height;
+	// 完全不透明、节点启用, 然后缩小; 焦点已移到下一个窗口, 所以把动画窗口
+	// 放回 toplevel 图层顶部, 避免它滑到接替焦点的窗口后面
 	rounded_window_set_opacity(tl, 1.0f);
 	wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
 	wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
+	rounded_cache_morph_apply(tl);
 	struct wlr_box sweep;
-	anim_sweep_box(a, &sweep);
+	geom_sweep_box(a, &sweep);
 	anim_schedule_frames(server, &sweep);
 	return true;
 }
@@ -673,64 +658,34 @@ bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
 	int rest_x = a->has_rest ? a->rest_x : box.x;
 	int rest_y = a->has_rest ? a->rest_y : box.y;
 	a->has_rest = false;
+	a->rest_x = rest_x;
+	a->rest_y = rest_y;
 
-	// 落回: 从窗口自身顶边上方约自身高度 (+间隙) 处开始, 垂直落回自己的位置.
-	// 还原若打断仍在进行的最小化掉落 (窗口正可见地下落), 则从窗口当前位置
-	// 平滑反向 - 从任务栏中途还原绝不能把窗口瞬移回位置上方.
-	int from_y;
-	if (a->kind == ANIM_FALL_OUT) {
-		from_y = tl->scene_tree != NULL ?
-			tl->scene_tree->node.y : rest_y;
-	} else {
-		int drop = box.height + CONFIG_ANIM_FALL_GAP;
-		from_y = rest_y - drop;
-		if (from_y >= rest_y) {
-			from_y = rest_y - 1;
-		}
-	}
-
-	anim_begin(a, ANIM_FALL_IN, CONFIG_ANIM_FALL_MS);
-	a->from_x = rest_x;
-	a->from_y = from_y;
-	a->to_x = rest_x;
-	a->to_y = rest_y;
+	// Windows 11 式还原: 从任务栏图标放大回静止框. 图标位置由常量推算.
+	struct wlr_box icon_box = box;
+	taskbar_icon_box(server, tl, &icon_box);
+	struct wlr_box rest_box = { rest_x, rest_y, box.width, box.height };
+	anim_begin(a, ANIM_ICON_IN, CONFIG_ANIM_TASKBAR_MS);
+	a->geom_from = icon_box;
+	a->geom_to = rest_box;
 	a->win_w = box.width;
 	a->win_h = box.height;
-
-	// 落回时围绕自己的 (移动中的) 中心把窗口放大回全尺寸:
-	// CONFIG_ANIM_FALL_SCALE -> 1.0 (仅圆角 FBO).
-	// 没有可缩放 FBO 时就是纯落回.
-	a->scale_fall = CONFIG_ANIM_FALL_SCALE < 1.0f &&
-		rounded_morph_supported(tl);
-	if (a->scale_fall) {
-		a->scale_from = CONFIG_ANIM_FALL_SCALE;
-		int mw = (int)lroundf(box.width * CONFIG_ANIM_FALL_SCALE);
-		int mh = (int)lroundf(box.height * CONFIG_ANIM_FALL_SCALE);
-		if (mw < 1) {
-			mw = 1;
-		}
-		if (mh < 1) {
-			mh = 1;
-		}
-		tl->morph_active = true;
-		tl->morph_x = rest_x + (box.width - mw) / 2;
-		tl->morph_y = from_y + (box.height - mh) / 2;
-		tl->morph_w = mw;
-		tl->morph_h = mh;
-		rounded_cache_morph_apply(tl);
-	} else {
-		tl->morph_active = false;
-	}
-
-	// 第一帧就可见, 且已在下落的顶部. 把它提升到其他窗口之上,
-	// 这样落回能出现在自己的位置上 (被还原的窗口通常也会被重新聚焦, 从而提升);
-	// 没有这一步它会从当前聚焦窗口后面重新出现.
+	a->op_from = 1.0f;
+	a->op_to = 1.0f;
+	a->op_cur = 1.0f;
+	tl->morph_active = rounded_morph_supported(tl);
+	tl->morph_x = icon_box.x;
+	tl->morph_y = icon_box.y;
+	tl->morph_w = icon_box.width;
+	tl->morph_h = icon_box.height;
+	// 第一帧就从图标处可见, 并提升到其他窗口之上
 	rounded_window_set_opacity(tl, 1.0f);
 	wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
-	wlr_scene_node_set_position(&tl->scene_tree->node, rest_x, from_y);
+	wlr_scene_node_set_position(&tl->scene_tree->node, icon_box.x, icon_box.y);
+	rounded_cache_morph_apply(tl);
 	struct wlr_box sweep;
-	anim_sweep_box(a, &sweep);
+	geom_sweep_box(a, &sweep);
 	anim_schedule_frames(server, &sweep);
 	return true;
 }
@@ -845,6 +800,11 @@ bool animate_toplevel_close(struct toplevel *tl) {
 	if (a == NULL) {
 		return false;
 	}
+	if (a->kind == ANIM_ICON_OUT || a->kind == ANIM_ICON_IN) {
+		// 图标缩放还在运行: 先落定它 (最小化已淡出 -> 节点隐藏, 还原回到原位),
+		// 再按普通关闭处理, 避免淡出与运行中的缩放共用场景节点
+		anim_finish(a);
+	}
 	if (tl->scene_tree == NULL ||
 			!tl->scene_tree->node.enabled) {
 		return false; // 隐藏 (最小化) 的窗口: 没有淡出可看
@@ -853,19 +813,13 @@ bool animate_toplevel_close(struct toplevel *tl) {
 		return true; // 淡出关闭已在运行
 	}
 
-	bool interrupting_fall = a->kind == ANIM_FALL_OUT;
 	bool interrupting_fade_in = a->kind == ANIM_FADE_IN;
-	// 这次关闭打断的最小化掉落继续下落: 捕获它的屏外目标,
-	// 让淡出继续该运动 (anim_apply) 而不是把窗口冻在半空
-	int fall_target_y = interrupting_fall ? a->to_y : 0;
-
 	struct wlr_box box;
 	toplevel_box(tl, &box);
 
 	anim_begin(a, ANIM_FADE_OUT, CONFIG_ANIM_FADE_MS);
 	a->from_x = a->to_x = box.x;
-	a->from_y = box.y;
-	a->to_y = interrupting_fall ? fall_target_y : box.y;
+	a->from_y = a->to_y = box.y;
 	a->win_w = box.width;
 	a->win_h = box.height;
 	// 从上一次运行留下的透明度继续: 刚 map 就关闭绝不能先把窗口闪回 100%
@@ -889,13 +843,13 @@ void animate_toplevel_cancel(struct toplevel *tl) {
 	}
 	struct toplevel_anim *a = tl->anim;
 	switch (a->kind) {
-	case ANIM_FALL_OUT:
+	case ANIM_ICON_OUT:
 		// 完成最小化: 在静止原点隐藏
 		wlr_scene_node_set_position(&tl->scene_tree->node,
 			a->rest_x, a->rest_y);
 		wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
 		break;
-	case ANIM_FALL_IN:
+	case ANIM_ICON_IN:
 		// 完成还原: 落在静止原点
 		wlr_scene_node_set_position(&tl->scene_tree->node,
 			a->rest_x, a->rest_y);

@@ -21,10 +21,12 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -211,10 +213,75 @@ static void run_startup_file(void) {
 	fclose(f);
 }
 
-int main(int argc, char *argv[]) {
-	// WLR_DEBUG=1 切换为调试日志 (自带测试通过 "cursor: ..." 的 WLR_DEBUG 行验证光标决策)
+// --- 日志 ---
+//
+// 默认: INFO 及以上写 stderr. WLR_DEBUG=1 时额外打开一个日志文件并把所有行
+// (含 DEBUG) 也写进去 - 自带测试会 grep `WLR_DEBUG=1 monodywm` 的标准输出,
+// 所以 stderr 流必须保留; 文件只是方便你自己离线看.
+// 若显式指定 MONODYWWM_LOG=<路径>, 则只写该文件, stderr 保持干净.
+// 未指定时 WLR_DEBUG=1 的日志文件为 $XDG_RUNTIME_DIR/monodywm.log (否则 /tmp).
+static FILE *log_file = NULL;
+static bool log_to_stderr = true;
+
+static void log_write(FILE *out, enum wlr_log_importance importance,
+		const char *msg) {
+	static const char *const names[] = {
+		[WLR_SILENT] = "SILENT",
+		[WLR_ERROR] = "ERROR",
+		[WLR_INFO] = "INFO",
+		[WLR_DEBUG] = "DEBUG",
+	};
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	unsigned long sec = (unsigned long)ts.tv_sec;
+	fprintf(out, "%02lu:%02lu:%02lu.%03u [%s] %s\n",
+		(sec / 3600) % 100, (sec / 60) % 60, sec % 60,
+		(unsigned)(ts.tv_nsec / 1000000),
+		names[importance] != NULL ? names[importance] : "?", msg);
+	fflush(out);
+}
+
+static void log_callback(enum wlr_log_importance importance,
+		const char *fmt, va_list args) {
+	if (importance > wlr_log_get_verbosity()) {
+		return;
+	}
+	static char buf[8192];
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	if (log_to_stderr) {
+		log_write(stderr, importance, buf);
+	}
+	if (log_file != NULL) {
+		log_write(log_file, importance, buf);
+	}
+}
+
+static void init_logging(void) {
 	const char *dbg = getenv("WLR_DEBUG");
-	wlr_log_init(dbg != NULL && dbg[0] != '\0' ? WLR_DEBUG : WLR_INFO, NULL);
+	bool debug = dbg != NULL && dbg[0] != '\0';
+	const char *path = getenv("MONODYWWM_LOG");
+	if (path != NULL && path[0] != '\0') {
+		log_file = fopen(path, "w");
+		if (log_file == NULL) {
+			fprintf(stderr, "monodywm: cannot open log %s: %s\n",
+				path, strerror(errno));
+		} else {
+			log_to_stderr = false; // 显式指定文件: 只写文件
+		}
+	} else if (debug) {
+		char fallback[512];
+		const char *rt = getenv("XDG_RUNTIME_DIR");
+		snprintf(fallback, sizeof(fallback), "%s/monodywm.log",
+			rt != NULL && rt[0] != '\0' ? rt : "/tmp");
+		log_file = fopen(fallback, "w");
+	}
+	wlr_log_init(debug ? WLR_DEBUG : WLR_INFO, log_callback);
+}
+
+int main(int argc, char *argv[]) {
+	// 正常输出只到 stderr; WLR_DEBUG=1 时额外写 $XDG_RUNTIME_DIR/monodywm.log,
+	// 显式 MONODYWWM_LOG=<path> 则只写该文件
+	init_logging();
 	// 不要让生成的后台进程变成僵尸
 	init_reaper();
 

@@ -57,16 +57,9 @@
 #define CONFIG_ANIM_ENABLE   1
 
 // 各动画时长互相独立, 可单独调整, 互不影响:
-#define CONFIG_ANIM_FALL_MS  90      // 最小化落下 / 从最小化还原(掉回原位) 时长 (ms)
 #define CONFIG_ANIM_FADE_MS  50      // 创建淡入 / 关闭淡出 时长 (ms)
-#define CONFIG_ANIM_FALL_GAP 10      // 落出屏幕底边/从窗口上方起跳时保留的间隙 (px)
-// 最小化落下 / 还原掉回时伴随的缩放 (围绕窗口自身中心):
-//   落下时窗口从 1.0 逐渐缩小到 CONFIG_ANIM_FALL_SCALE;
-//   还原掉回时从 CONFIG_ANIM_FALL_SCALE 逐渐放大回 1.0.
-// 设为 1.0 则关闭缩放, 只保留纯落下/掉回.
-#define CONFIG_ANIM_FALL_SCALE 1.0f // 落下/掉回缩放到的比例 (1.0 = 不缩放, 直接掉落)
 // 最大化 / 取消最大化(还原) 的 Windows 式缩放动画:
-//   CONFIG_ANIM_MAXIMIZE_MS = 缩放时长基准 (与上面的 FALL_MS 无关, 是另一个独立时长项).
+//   CONFIG_ANIM_MAXIMIZE_MS = 缩放时长基准 (独立时长项).
 //     大跨度缩放 (小窗口铺满全屏) 会在此基准上自动增加少许时长
 //     (跨度/12, 上限 2 倍基准) 以保持每帧位移平滑, 增加量有界.
 //   CONFIG_ANIM_MAXIMIZE_WAIT_MS = 等待客户端把内容重排成目标尺寸的时间上限:
@@ -75,8 +68,27 @@
 #define CONFIG_ANIM_MAXIMIZE_MS 70  // 最大化/还原 缩放时长基准 (ms)
 #define CONFIG_ANIM_MAXIMIZE_WAIT_MS 120 // 等待目标尺寸内容重排的上限 (ms)
 
-// 创建/关闭动画是纯淡入/淡出 (窗口保持自然大小), 缩放效果已移除.
-// 只有最大化/还原保留 Windows 式缩放 (见上方的 MAXIMIZE 注释).
+// Windows 11 式最小化/还原 (animate.c): 最小化时窗口朝状态栏上的图标缩小,
+// 还原时从图标放大回原位. 合成器无法直接查询图标位置, 因此用状态栏布局的
+// 3 个常量推算 (必须与状态栏自身配置一致, 这里是 ~/monodybar/config.h):
+//   目标图标框 x = 栏左边缘 + ICON_OFFSET + 图标序号 * ICON_PITCH
+//   目标图标框 y = 栏顶边 + (HEIGHT - 图标尺寸) / 2, 其中图标尺寸 = HEIGHT - 8
+// 以 monodybar 为例:
+//   ICON_OFFSET = 第一个任务按钮左边 + (按钮宽 - 图标)/2
+//               第一个任务按钮左边 = WIN_PADDING + TASK_BUTTON_W + WIN_TASKBAR_GAP
+//                                    = 8 + 44 + 50 = 102
+//               图标左边 = 102 + (TASK_BUTTON_W - TASK_ICON_SIZE)/2 = 108
+//   ICON_PITCH  = TASK_BUTTON_W + TASK_SPACING = 44 + 24 = 68
+// 图标位置完全由下面的常量推算 (不查询/不判断状态栏是否运行):
+// 状态栏贴在输出上边还是下边由 AT_TOP 决定.
+#define CONFIG_TASKBAR_AT_TOP 0        // 1 = 栏在顶部, 0 = 栏在底部 (monodybar BAR_TOP)
+#define CONFIG_TASKBAR_HEIGHT 40       // 状态栏高度 (monodybar BAR_HEIGHT)
+#define CONFIG_TASKBAR_ICON_OFFSET 108 // 第一个图标左边缘相对栏左边缘的偏移 (px)
+#define CONFIG_TASKBAR_ICON_PITCH 68   // 相邻图标左边缘的间距 (px)
+#define CONFIG_ANIM_TASKBAR_MS 180     // 最小化/还原 缩放+淡变 时长 (ms)
+
+// 创建/关闭动画是纯淡入/淡出 (窗口保持自然大小).
+// 最小化/还原 (Windows 11 式, 见下方 TASKBAR 常量) 与最大化/还原保留缩放:
 // 组合键修饰符, 按需组合使用
 #define MODKEY0 (WLR_MODIFIER_ALT)                        // alt (单独按 Alt)
 #define MODKEY1 (WLR_MODIFIER_LOGO)                        // win

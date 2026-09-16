@@ -1172,6 +1172,16 @@ static void rounded_expand_ring(struct rounded_cache *rc) {
 	pixman_region32_fini(&expanded);
 }
 
+// 形态缩放时阴影边距必须和内容按同一比例缩放: FBO 纹理是整块
+// (内容 + 两侧阴影) 一起做 dest_size 缩放的. 若阴影保持原始像素,
+// 缩到很小的目标 (任务栏图标) 时内容会被撑大、且溢出目标之外.
+static int rounded_scaled_shadow(int shadow, int natural, int target) {
+	if (natural <= 0 || target <= 0) {
+		return shadow;
+	}
+	return (int)lroundf((float)shadow * (float)target / (float)natural);
+}
+
 // 把刚渲染好的圆角 buffer 发布到场景节点, 并让它的位置/dest 尺寸与窗口 + 阴影边距同步.
 // damage == NULL 表示整个 buffer 变了.
 //
@@ -1189,18 +1199,24 @@ static void rounded_publish(struct rounded_cache *rc,
 	int oy = box->y;
 	int width = box->width;
 	int height = box->height;
+	int sh_x = shadow_i;
+	int sh_y = shadow_i;
 	if (tl->morph_active) {
 		ox = tl->morph_x;
 		oy = tl->morph_y;
 		width = tl->morph_w;
 		height = tl->morph_h;
+		sh_x = rounded_scaled_shadow(shadow_i,
+			rc->logical_width, width);
+		sh_y = rounded_scaled_shadow(shadow_i,
+			rc->logical_height, height);
 	}
 	int tree_x = tl->scene_tree != NULL ? tl->scene_tree->node.x : 0;
 	int tree_y = tl->scene_tree != NULL ? tl->scene_tree->node.y : 0;
 	wlr_scene_node_set_position(&rc->node->node,
-		ox - tree_x - shadow_i, oy - tree_y - shadow_i);
+		ox - tree_x - sh_x, oy - tree_y - sh_y);
 	wlr_scene_buffer_set_dest_size(rc->node,
-		width + 2 * shadow_i, height + 2 * shadow_i);
+		width + 2 * sh_x, height + 2 * sh_y);
 }
 
 // 窗口是否正在运行最大化/还原缩放 (animate.c): 场景树锚定在形态框原点,
@@ -1232,11 +1248,15 @@ void rounded_cache_morph_apply(struct toplevel *tl) {
 	int shadow_i = (int)lroundf(rc->shadow_logical);
 	int tree_x = tl->scene_tree != NULL ? tl->scene_tree->node.x : 0;
 	int tree_y = tl->scene_tree != NULL ? tl->scene_tree->node.y : 0;
+	int sh_x = rounded_scaled_shadow(shadow_i, rc->logical_width,
+		tl->morph_w);
+	int sh_y = rounded_scaled_shadow(shadow_i, rc->logical_height,
+		tl->morph_h);
 	wlr_scene_node_set_position(&rc->node->node,
-		tl->morph_x - tree_x - shadow_i,
-		tl->morph_y - tree_y - shadow_i);
+		tl->morph_x - tree_x - sh_x,
+		tl->morph_y - tree_y - sh_y);
 	wlr_scene_buffer_set_dest_size(rc->node,
-		tl->morph_w + 2 * shadow_i, tl->morph_h + 2 * shadow_i);
+		tl->morph_w + 2 * sh_x, tl->morph_h + 2 * sh_y);
 }
 
 // 快照主 surface 的直接 subsurface 堆叠顺序, 供之后的提交检测
