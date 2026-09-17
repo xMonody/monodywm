@@ -150,6 +150,7 @@ struct rounded_cache {
 	int fbo_width, fbo_height;       // 当前 FBO 尺寸 (物理像素)
 	int window_pw, window_ph;        // 窗口尺寸 (物理像素)
 	int shadow_px;                   // 阴影边距 (物理像素)
+	int shadow_i;                    // 阴影边距 (布局像素, 已对齐到物理像素)
 	int logical_width, logical_height; // 窗口尺寸 (布局像素)
 	float shadow_logical;            // 阴影宽度 (布局像素)
 	float scale;                     // FBO 渲染时使用的输出缩放
@@ -360,12 +361,35 @@ static void rounded_release_buffers(struct rounded_cache *rc) {
 	rc->logical_width = rc->logical_height = 0;
 }
 
+// 选取 >= shadow_logical 的最小整数布局边距, 使它与输出缩放的乘积落在物理像素上.
+//
+// 这样 rounded_alloc_buffers() 推出的物理边距 shadow_px 与 rounded_publish()
+// 设的逻辑 dest 尺寸 (width + 2*shadow_i) 一致:
+//   dest_logical * scale == window_pw + 2*shadow_px == fbo 尺寸
+// 于是场景按 1:1 采样 FBO, 分数缩放下不会重采样 (前提是窗口逻辑尺寸 * scale
+// 也是整数 - 这正是 wp_fractional_scale 客户端侧的约定, Wayfire 的
+// scaling-test 也正是挑选 6x6 逻辑 / 10x10 物理这样的尺寸).
+static int rounded_shadow_logical_aligned(float shadow_logical, float scale) {
+	int base = (int)ceilf(shadow_logical);
+	if (scale <= 0.0f) {
+		return base;
+	}
+	for (int i = base; i < base + 64; i++) {
+		float v = (float)i * scale;
+		if (fabsf(v - roundf(v)) < 1e-3f) {
+			return i;
+		}
+	}
+	return base;
+}
+
 static bool rounded_alloc_buffers(struct rounded_cache *rc,
 		int logical_width, int logical_height, float scale,
 		float shadow_logical) {
-	int window_pw = (int)ceilf((float)logical_width * scale);
-	int window_ph = (int)ceilf((float)logical_height * scale);
-	int shadow_px = (int)ceilf(shadow_logical * scale);
+	int shadow_i = rounded_shadow_logical_aligned(shadow_logical, scale);
+	int shadow_px = (int)lroundf((float)shadow_i * scale);
+	int window_pw = (int)lroundf((float)logical_width * scale);
+	int window_ph = (int)lroundf((float)logical_height * scale);
 	int fw = window_pw + 2 * shadow_px;
 	int fh = window_ph + 2 * shadow_px;
 	if (fw <= 0 || fh <= 0) {
@@ -382,6 +406,7 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 		rc->window_pw = window_pw;
 		rc->window_ph = window_ph;
 		rc->shadow_px = shadow_px;
+		rc->shadow_i = shadow_i;
 		return true;
 	}
 
@@ -411,6 +436,7 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 	rc->window_pw = window_pw;
 	rc->window_ph = window_ph;
 	rc->shadow_px = shadow_px;
+	rc->shadow_i = shadow_i;
 	return true;
 }
 
@@ -1194,7 +1220,7 @@ static void rounded_publish(struct rounded_cache *rc,
 	wlr_scene_buffer_set_buffer_with_damage(rc->node, rc->rounded_buf,
 		damage);
 	struct toplevel *tl = rc->tl;
-	int shadow_i = (int)lroundf(rc->shadow_logical);
+	int shadow_i = rc->shadow_i;
 	int ox = box->x;
 	int oy = box->y;
 	int width = box->width;
@@ -1245,7 +1271,7 @@ void rounded_cache_morph_apply(struct toplevel *tl) {
 			!tl->morph_active) {
 		return;
 	}
-	int shadow_i = (int)lroundf(rc->shadow_logical);
+	int shadow_i = rc->shadow_i;
 	int tree_x = tl->scene_tree != NULL ? tl->scene_tree->node.x : 0;
 	int tree_y = tl->scene_tree != NULL ? tl->scene_tree->node.y : 0;
 	int sh_x = rounded_scaled_shadow(shadow_i, rc->logical_width,

@@ -251,6 +251,9 @@ if(TEST)
 		${text-input-unstable-v3_CODE}
 		${cursor-shape-v1_CODE}
 		${tablet-unstable-v2_CODE}
+		${viewporter_CODE}
+		${wp_fractional_scale_v1_CODE}
+		${wlr-screencopy-unstable-v1_CODE}
 	)
 	target_include_directories(protocol_stubs PUBLIC ${PROTOCOL_GEN_DIR})
 	target_link_libraries(protocol_stubs PUBLIC PkgConfig::WAYLAND_CLIENT)
@@ -258,6 +261,13 @@ if(TEST)
 	add_executable(test-client test-client.c)
 	target_include_directories(test-client PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-client PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
+
+	# fractional-scale test client: wp_fractional_scale_v1 + wp_viewporter,
+	# attaches a physical-size checkerboard for a logical size so a capture can
+	# tell 1:1 sampling apart from resampling at fractional output scale
+	add_executable(test-fractional-scale test-fractional-scale.c)
+	target_include_directories(test-fractional-scale PRIVATE ${PROTOCOL_GEN_DIR})
+	target_link_libraries(test-fractional-scale PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	add_executable(test-interaction test-interaction.c)
 	target_include_directories(test-interaction PRIVATE ${PROTOCOL_GEN_DIR})
