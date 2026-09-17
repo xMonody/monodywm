@@ -1211,79 +1211,39 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 	// 常规路径: 把指针 motion 转发给光标下的 surface
 	double sx, sy;
 	struct wlr_surface *surface = NULL;
-	// 窗口形变时 (animate.c: 最大化/还原缩放, 或打开/关闭淡变的缩放部分)
-	// 其可见内容是缩放进形态框的圆角 FBO, 但场景只在自然几何上命中测试原始客户端 surface.
-	// 光标位于形变窗口可见区域内、而场景把它归给下方窗口 (还原/缩小缩放) 时,
-	// 它必须改为到达形变窗口, 坐标经形态缩放映射.
-	// popup 和 layer-shell surface 浮在窗口之上, 总是优先.
-	// 只有确实有窗口在形变时才做额外命中测试.
-	struct toplevel *morph_tl = NULL;
-	bool any_morph = false;
-	{
-		struct toplevel *t;
-		wl_list_for_each(t, &server->toplevels, link) {
-			if (t->morph_active) {
-				any_morph = true;
-				break;
-			}
-		}
-	}
-	if (any_morph && !pointer_over_popup(server) &&
-			!pointer_over_layer_surface(server)) {
-		morph_tl = toplevel_morph_at(server, server->cursor->x,
-			server->cursor->y);
-	}
-	if (morph_tl != NULL && morph_tl->xdg_toplevel != NULL &&
-			morph_tl->xdg_toplevel->base != NULL) {
-		struct wlr_box box;
-		toplevel_box(morph_tl, &box);
-		surface = morph_tl->xdg_toplevel->base->surface;
-		if (morph_tl->morph_w > 0 && morph_tl->morph_h > 0 &&
-				box.width > 0 && box.height > 0) {
-			// 把光标 (位于形态框内) 经形态缩放映射到内容的自然几何上
-			sx = (server->cursor->x - morph_tl->morph_x) *
-				(double)box.width / (double)morph_tl->morph_w;
-			sy = (server->cursor->y - morph_tl->morph_y) *
-				(double)box.height / (double)morph_tl->morph_h;
-		} else {
-			sx = 0.0;
-			sy = 0.0;
-		}
-	} else {
-		struct wlr_scene_node *node = wlr_scene_node_at(
+	struct wlr_scene_node *node = wlr_scene_node_at(
 			&server->scene->tree.node, server->cursor->x, server->cursor->y,
 			&sx, &sy);
-		if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
-			struct wlr_scene_buffer *buffer =
-				wlr_scene_buffer_from_node(node);
-			struct wlr_scene_surface *scene_surface =
-				wlr_scene_surface_try_from_buffer(buffer);
-			if (scene_surface != NULL) {
-				surface = scene_surface->surface;
-			} else {
-				// 命中的 buffer 是合成器圆角掩码内容的重绘:
-				// 通过其树上的场景标签解析 xdg surface
-				struct wlr_scene_node *n = node;
-				while (n != NULL) {
-					if (n->data != NULL) {
-						struct scene_tag *tag = n->data;
-						if (tag->type == TAG_POPUP) {
-							// 圆角 popup (Qt 菜单): 命中的 buffer 是它的
-							// 掩码重绘; 解析出 popup surface
-							struct wlr_xdg_popup *popup = tag->ptr;
-							if (popup != NULL && popup->base != NULL) {
-								surface = popup->base->surface;
-							}
-						} else if (tag->type == TAG_TOPLEVEL) {
-							struct toplevel *tl = tag->ptr;
-							if (tl->xdg_toplevel->base != NULL) {
-								surface = tl->xdg_toplevel->base->surface;
-							}
+	if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
+		struct wlr_scene_buffer *buffer =
+			wlr_scene_buffer_from_node(node);
+		struct wlr_scene_surface *scene_surface =
+			wlr_scene_surface_try_from_buffer(buffer);
+		if (scene_surface != NULL) {
+			surface = scene_surface->surface;
+		} else {
+			// 命中的 buffer 是合成器圆角掩码内容的重绘:
+			// 通过其树上的场景标签解析 xdg surface
+			struct wlr_scene_node *n = node;
+			while (n != NULL) {
+				if (n->data != NULL) {
+					struct scene_tag *tag = n->data;
+					if (tag->type == TAG_POPUP) {
+						// 圆角 popup (Qt 菜单): 命中的 buffer 是它的
+						// 掩码重绘; 解析出 popup surface
+						struct wlr_xdg_popup *popup = tag->ptr;
+						if (popup != NULL && popup->base != NULL) {
+							surface = popup->base->surface;
 						}
-						break; // 更近的带标签对象赢得命中测试
+					} else if (tag->type == TAG_TOPLEVEL) {
+						struct toplevel *tl = tag->ptr;
+						if (tl->xdg_toplevel->base != NULL) {
+							surface = tl->xdg_toplevel->base->surface;
+						}
 					}
-					n = n->parent != NULL ? &n->parent->node : NULL;
+					break; // 更近的带标签对象赢得命中测试
 				}
+				n = n->parent != NULL ? &n->parent->node : NULL;
 			}
 		}
 	}

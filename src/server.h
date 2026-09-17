@@ -190,12 +190,6 @@ struct toplevel {
 	// 窗口场景树销毁时释放该状态.
 	struct toplevel_anim *anim;
 
-	// Windows 式最大化/还原缩放 (animate.c). morph_active 置位期间,
-	// 圆角 FBO 按缩放后的形态框发布, 而不是其自然几何 (rounded.c);
-	// toplevel.c 把场景树锚定在形态框原点. 缩放结束或取消时清除.
-	bool morph_active;
-	int morph_x, morph_y, morph_w, morph_h;
-
 	// map 处理器应用客户端初始状态 (应用启动即最大化) 期间置位:
 	// animate_toplevel_geometry 读取并清除它, 使首次最大化瞬时完成,
 	// 只有之后用户触发的最大化/还原才播放缩放
@@ -506,11 +500,6 @@ void xdg_surface_tag(struct wlr_scene_tree *tree, enum scene_tag_type type,
 	void *ptr);
 void *scene_tag_at(struct server *server, enum scene_tag_type type,
 	double lx, double ly);
-// (lx, ly) 下"实际绘制"的 toplevel: 窗口形变 (animate.c) 时其可见内容是
-// 按形态框缩放后的圆角 FBO, 场景原始命中测试看不到它, 所以形态框内的光标
-// 会解析到形变窗口, 即使其原始客户端 surface 还没长到那里 (还原/缩小缩放).
-struct toplevel *toplevel_morph_at(struct server *server, double lx,
-	double ly);
 struct toplevel *toplevel_at(struct server *server);
 // 光标位于 popup surface (菜单/下拉框/工具提示) 上: popup 在合成器边框
 // (resize 边缘、标题栏) 之前赢得指针
@@ -569,10 +558,26 @@ void rounded_cache_hide_content(struct toplevel *tl);
 // (原始客户端内容以透明度 0 隐藏), 所以动画作用于该节点;
 // 在首次 FBO 发布之前 / 关闭圆角时, 改为淡出窗口树下的每个场景 buffer
 void rounded_window_set_opacity(struct toplevel *tl, float opacity);
-// 最大化/还原缩放支持 (animate.c):
-bool rounded_morph_supported(struct toplevel *tl); // FBO 可见且可缩放
+// 最大化/还原等待阶段的支持 (animate.c): 目标尺寸内容是否已就绪
 bool rounded_cache_size_ready(struct toplevel *tl, int width, int height);
-void rounded_cache_morph_apply(struct toplevel *tl);
+// macOS genie 网格形变支持 (animate.c): 把窗口当前圆角 FBO 的内容快照为纹理,
+// 按调用方给的三角形网格重绘到一张离屏 buffer, 再作为单个场景节点显示 -
+// 左右边缘是真正的斜线, 没有横条切片法在宽高变化处的阶梯与接缝.
+struct rounded_warp;
+// bounds 是布局坐标里覆盖整段动画的包围盒 (所有网格顶点都必须落在其中).
+// 失败 (无 GL/FBO) 返回 NULL, 调用方退回整体缩放.
+struct rounded_warp *rounded_warp_begin(struct toplevel *tl,
+	const struct wlr_box *bounds);
+// verts 为交错数组 [x, y, u, v]: x,y 为布局坐标; u,v 为窗口内容纹理的
+// 归一化坐标 [0,1] (u 沿宽, v 沿高). indices 为三角形索引.
+// bbox 为网格在布局坐标里的紧包围盒 (用来摆放节点并触发场景 damage).
+void rounded_warp_update(struct rounded_warp *w, const float *verts,
+	int vert_count, const uint16_t *indices, int index_count,
+	const struct wlr_box *bbox);
+// 重新快照窗口 FBO 的内容 (源尺寸/内容框可能已变). 用于最大化等待阶段:
+// 网格先以旧内容显示, 客户端提交目标尺寸后再换成新内容并开始缩放.
+void rounded_warp_resnapshot(struct rounded_warp *w);
+void rounded_warp_end(struct rounded_warp *w);
 void rounded_render_all(struct server *server);
 
 // ---- border.c: 窗口边框宽度与依赖焦点的颜色 ----
@@ -622,6 +627,8 @@ bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
 // (toplevel.c 在有新的最大化/还原请求替换正在运行的缩放时使用,
 // 如快速切换或客户端在首个 configure ack 前重复声明状态)
 void animate_toplevel_abort_geometry(struct toplevel *tl);
+// 是否有拥有场景节点的几何动画在运行 (最大化/还原缩放、最小化/还原)
+bool animate_toplevel_owns_geometry(struct toplevel *tl);
 void animate_toplevel_cancel(struct toplevel *tl);
 // 把所有运行中的窗口动画推进到给定的 CLOCK_MONOTONIC 时刻;
 // 由每个输出的 frame 处理器在场景渲染前调用 (output.c),

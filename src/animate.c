@@ -6,14 +6,15 @@
 //                   这样不理会关闭请求的客户端也不会留下不可见却阻塞输入的窗口.
 //                   关闭一个仍在落下 (最小化) 的窗口会保留掉落的同时淡出;
 //                   刚 map 就关闭则从当前透明度开始淡出, 不会闪回.
-//   最小化       -> Windows 11 式: 窗口朝状态栏上的图标位置缩小 (图标位置由
-//                   config.h 的 TASKBAR 常量推算, 状态栏未运行也照常推算),
-//                   但不进入状态栏 (目标框贴着栏的外侧), 完成后隐藏场景节点
-//                   并弹回静止原点
-//   还原         -> 从状态栏外侧的目标框放大回静止框
+//   最小化       -> macOS genie 形变: 窗口内容贴到网格上, 朝状态栏图标位置
+//                   扭成梯形/漏斗 (图标位置由 config.h 的 TASKBAR 常量推算,
+//                   状态栏未运行也照常推算), 完成后隐藏场景节点并弹回静止原点
+//   还原         -> 从任务栏外侧的目标框反向形变放大回静止框
+//   最大化/全屏  -> 同样用 genie 形变在旧框与目标框之间过渡
 //
-// 运动作用在 toplevel 的场景树节点 (位置) 上, 淡变作用在可见窗口 buffer 上
-// (经 rounded_window_set_opacity()) - 所以圆角副本、边框和阴影一起移动/淡变.
+// 形变渲染在 rounded.c 的一张离屏网格 buffer 上 (animate.c 只负责网格顶点);
+// 淡变作用在可见窗口 buffer 上 (经 rounded_window_set_opacity()),
+// 所以圆角副本、边框和阴影一起淡变.
 //
 // 时间模型: 动画状态不由相位会相对显示刷新漂移的每窗口定时器推进.
 // 而是由每个输出的 frame 处理器 (output.c) 在场景渲染前把所有运行中的动画
@@ -46,14 +47,31 @@
 // 和墙钟超时继续推进; 16ms 足够短, 任何输出上的动画都不会明显迟结束或迟进入.
 #define ANIM_WATCHDOG_MS 16
 
+// macOS genie 形变网格分段数 (CONFIG_ANIM_GENIE_ROWS/COLS 夹到有意义的范围:
+// 顶点索引用 uint16, 且过密的网格只是白白浪费顶点)
+#if CONFIG_ANIM_GENIE_ROWS < 2
+#define ANIM_WARP_ROWS 2
+#elif CONFIG_ANIM_GENIE_ROWS > 512
+#define ANIM_WARP_ROWS 512
+#else
+#define ANIM_WARP_ROWS CONFIG_ANIM_GENIE_ROWS
+#endif
+#if CONFIG_ANIM_GENIE_COLS < 1
+#define ANIM_WARP_COLS 1
+#elif CONFIG_ANIM_GENIE_COLS > 64
+#define ANIM_WARP_COLS 64
+#else
+#define ANIM_WARP_COLS CONFIG_ANIM_GENIE_COLS
+#endif
+
 // 一个窗口同一时刻只能运行一种动画
 enum anim_kind {
 	ANIM_NONE = 0,
 	ANIM_FADE_IN,   // map: 透明度 0 -> 1, 不移动
 	ANIM_FADE_OUT,  // close: 透明度 1 -> 0, 然后发送 close
-	ANIM_GEOM,      // maximize/restore: 在两个框之间缩放
-	ANIM_ICON_OUT,  // minimize: 朝状态栏图标缩小并淡出 (Windows 11)
-	ANIM_ICON_IN,   // restore: 从状态栏外侧放大回原位并淡入 (Windows 11)
+	ANIM_GEOM,      // maximize/restore/fullscreen: 在两个框之间 genie 形变
+	ANIM_ICON_OUT,  // minimize: 朝状态栏图标扭成漏斗 (genie)
+	ANIM_ICON_IN,   // restore: 从任务栏外侧反向形变回原位
 };
 
 struct toplevel_anim {
@@ -77,11 +95,16 @@ struct toplevel_anim {
 	                       // 实际停留的位置开始 (map 淡入途中关闭)
 	int win_w, win_h;   // 窗口尺寸 (扫描区域 damage)
 
-	// ANIM_GEOM (Windows 式最大化/还原缩放): 在 geom_from 与 geom_to 之间插值的窗口框.
+	// ANIM_GEOM (最大化/还原/全屏 genie 形变): 形变起止的两个窗口框.
 	// 缩放从等待阶段开始 - 只有客户端提交了目标尺寸且圆角缓存按该尺寸重绘后,
-	// 目标尺寸的 FBO 才存在 - 所以绝不会在两种内容布局之间跳变.
+	// 目标尺寸的内容快照才存在 - 所以绝不会在两种内容布局之间跳变.
 	struct wlr_box geom_from, geom_to;
 	bool geom_zooming;  // false = 等待目标尺寸的 FBO
+
+	// macOS genie 形变 (CONFIG_ANIM_GENIE). 激活时窗口自己的场景树被禁用,
+	// 画面由 rounded.c 的一张网格形变 buffer 节点显示 - 窗口内容被贴到一张细分
+	// 网格上, 顶点按梯形/漏斗形变 (底部两角先到目标位, 顶部随后跟上).
+	struct rounded_warp *warp;
 
 	uint32_t start_ms;  // 运行开始时的 CLOCK_MONOTONIC
 	uint32_t duration_ms;
@@ -93,8 +116,7 @@ static uint32_t mono_ms(void) {
 	return (uint32_t)ts.tv_sec * 1000u + (uint32_t)(ts.tv_nsec / 1000000u);
 }
 
-// 每种动画一条单调缓动曲线: 掉落加速 (重力), 落回减速, 淡变线性,
-// 最大化/还原缩放使用类似 Windows 的平滑 ease-in-out
+// 每种动画一条单调缓动曲线: 淡变线性, 形变使用平滑的 ease-in-out (smoothstep)
 static float anim_ease(enum anim_kind kind, float t) {
 	switch (kind) {
 	case ANIM_GEOM:
@@ -174,26 +196,168 @@ static void geom_sweep_box(struct toplevel_anim *a, struct wlr_box *sweep) {
 	};
 }
 
-// 在 geom_from (p=0) 与 geom_to (p=1) 之间插值窗口形态框到 tl->morph_*;
-// 调用方 (最大化/还原缩放) 随后把场景树锚定在该框原点, 并把圆角 FBO 缩放进去
-// (rounded_cache_morph_apply)
-static void morph_box_at(struct toplevel_anim *a, float p) {
-	struct toplevel *tl = a->tl;
-	if (p >= 1.0f) {
-		tl->morph_x = a->geom_to.x;
-		tl->morph_y = a->geom_to.y;
-		tl->morph_w = a->geom_to.width;
-		tl->morph_h = a->geom_to.height;
-	} else {
-		tl->morph_x = a->geom_from.x + (int)lroundf(
-			(float)(a->geom_to.x - a->geom_from.x) * p);
-		tl->morph_y = a->geom_from.y + (int)lroundf(
-			(float)(a->geom_to.y - a->geom_from.y) * p);
-		tl->morph_w = a->geom_from.width + (int)lroundf(
-			(float)(a->geom_to.width - a->geom_from.width) * p);
-		tl->morph_h = a->geom_from.height + (int)lroundf(
-			(float)(a->geom_to.height - a->geom_from.height) * p);
+// --- macOS genie 形变 (CONFIG_ANIM_GENIE) ---
+//
+// 把窗口内容贴到一张细分网格上, 顶点按梯形/漏斗形变 (底部两角先被拉到目标位,
+// 顶部随后跟上), 由 rounded.c 用一次 draw call 渲染成一张离屏 buffer 显示.
+// 网格的左右边缘是连续斜线, 所以没有横条切片法在宽高变化处的阶梯与接缝.
+// 激活时窗口自己的场景树被禁用; 动画结束销毁网格 buffer 并恢复窗口树.
+
+// 某一行 (归一化 s: 0=窗口顶边, 1=底边) 在全局进度 p 下的局部进度.
+// lead_top 决定哪条边先动: false 时底部 (s=1) 先动, true 时顶部 (s=0) 先动 -
+// 先动的边没有延迟, 另一条边延迟 lag. 最小化时底部先动 (目标在下方),
+// 还原时顶部先动 (目标在上方), 于是还原正好是最小化的反向.
+static double anim_warp_q(float p, double s, double lag, bool lead_top) {
+	if (lag <= 0.0) {
+		return p;
 	}
+	if (lag >= 1.0) {
+		lag = 0.999;
+	}
+	// d = 距"先动边"的归一化距离: 0 = 先动, 1 = 最后动
+	double d = lead_top ? s : (1.0 - s);
+	double q = ((double)p - d * lag) / (1.0 - lag);
+	if (q < 0.0) {
+		q = 0.0;
+	} else if (q > 1.0) {
+		q = 1.0;
+	}
+	return q;
+}
+
+// 按进度 p 生成一帧的三角形网格并交给 rounded.c 重绘:
+// 顶点 (x,y) 是布局坐标, (u,v) 是窗口内容纹理的归一化坐标.
+static void anim_warp_apply(struct toplevel_anim *a, float p) {
+	if (a->warp == NULL) {
+		return;
+	}
+	const struct wlr_box *from = &a->geom_from;
+	const struct wlr_box *to = &a->geom_to;
+	if (from->width <= 0 || from->height <= 0 ||
+			to->width <= 0 || to->height <= 0) {
+		return;
+	}
+	if (p < 0.0f) {
+		p = 0.0f;
+	} else if (p > 1.0f) {
+		p = 1.0f;
+	}
+	double lag = CONFIG_ANIM_GENIE_LAG;
+	// 先动边 = 离目标更近的边: 最小化 (目标在下方) 底边先被拉走,
+	// 还原 (目标在上方) 顶边先展开 - 两个方向观感对称, 不会出现
+	// 还原只是一坨从小放大的感觉.
+	bool lead_top = (to->y + to->height * 0.5) <
+		(from->y + from->height * 0.5);
+	double fcx = from->x + from->width * 0.5;
+	double tcx = to->x + to->width * 0.5;
+
+	static float verts[(ANIM_WARP_ROWS + 1) * (ANIM_WARP_COLS + 1) * 4];
+	static uint16_t indices[ANIM_WARP_ROWS * ANIM_WARP_COLS * 6];
+	int nv = 0;
+	double minx = 0.0, miny = 0.0, maxx = 0.0, maxy = 0.0;
+	for (int i = 0; i <= ANIM_WARP_ROWS; i++) {
+		double s = (double)i / (double)ANIM_WARP_ROWS;
+		double q = anim_warp_q(p, s, lag, lead_top);
+		// 水平: 底部先收窄并滑到目标中心, 顶部最后才收
+		double cx = fcx + (tcx - fcx) * q;
+		double w = from->width + (to->width - from->width) * q;
+		// 垂直: 每一行各自向目标行插值, 底部行先到
+		double fy = from->y + s * from->height;
+		double ty = to->y + s * to->height;
+		double y = fy + (ty - fy) * q;
+		for (int j = 0; j <= ANIM_WARP_COLS; j++) {
+			double u = (double)j / (double)ANIM_WARP_COLS;
+			double x = cx + (u - 0.5) * w;
+			verts[nv * 4 + 0] = (float)x;
+			verts[nv * 4 + 1] = (float)y;
+			verts[nv * 4 + 2] = (float)u;
+			verts[nv * 4 + 3] = (float)s;
+			if (nv == 0) {
+				minx = maxx = x;
+				miny = maxy = y;
+			} else {
+				if (x < minx) { minx = x; }
+				if (x > maxx) { maxx = x; }
+				if (y < miny) { miny = y; }
+				if (y > maxy) { maxy = y; }
+			}
+			nv++;
+		}
+	}
+	int ni = 0;
+	for (int i = 0; i < ANIM_WARP_ROWS; i++) {
+		for (int j = 0; j < ANIM_WARP_COLS; j++) {
+			uint16_t v00 = (uint16_t)(i * (ANIM_WARP_COLS + 1) + j);
+			uint16_t v10 = (uint16_t)((i + 1) * (ANIM_WARP_COLS + 1) + j);
+			uint16_t v01 = (uint16_t)(i * (ANIM_WARP_COLS + 1) + j + 1);
+			uint16_t v11 = (uint16_t)((i + 1) * (ANIM_WARP_COLS + 1) + j + 1);
+			indices[ni++] = v00;
+			indices[ni++] = v10;
+			indices[ni++] = v01;
+			indices[ni++] = v01;
+			indices[ni++] = v10;
+			indices[ni++] = v11;
+		}
+	}
+	struct wlr_box bbox = {
+		.x = (int)floor(minx),
+		.y = (int)floor(miny),
+		.width = (int)ceil(maxx) - (int)floor(minx),
+		.height = (int)ceil(maxy) - (int)floor(miny),
+	};
+	rounded_warp_update(a->warp, verts, nv, indices, ni, &bbox);
+}
+
+// 结束形变: 销毁网格 buffer 节点, 解锁快照. restore_tree 为真时把窗口树重新启用
+// (还原/最大化结束要重新显示窗口; 窗口正在销毁时传 false, 不碰它).
+static void anim_warp_end(struct toplevel_anim *a, bool restore_tree) {
+	if (a->warp == NULL) {
+		return;
+	}
+	rounded_warp_end(a->warp);
+	a->warp = NULL;
+	struct toplevel *tl = a->tl;
+	if (!restore_tree || tl->scene_tree == NULL) {
+		return;
+	}
+	if (a->kind == ANIM_GEOM) {
+		// 最大化/还原形变期间场景树一直停在 from 框 (网格负责视觉);
+		// 结束时要落到 to 框. 圆角节点一直是相对树的自然摆放 (rounded_publish),
+		// 所以不需额外复位.
+		wlr_scene_node_set_position(&tl->scene_tree->node,
+			a->geom_to.x, a->geom_to.y);
+	}
+	if (a->kind == ANIM_ICON_IN || a->kind == ANIM_GEOM) {
+		// 恢复自然透明度后重新显示窗口 (最大化的等待阶段曾用它隐藏窗口)
+		rounded_window_set_opacity(tl, 1.0f);
+		wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+	}
+}
+
+// 开始形变: 快照窗口当前 FBO 并建立网格 buffer. 返回 false 时调用方退回瞬时行为.
+// 网格顶点永远落在 geom_from/geom_to 的并集里, 所以用它作为离屏 buffer 的包围盒.
+static bool anim_warp_begin(struct toplevel_anim *a) {
+	if (!CONFIG_ANIM_GENIE) {
+		return false;
+	}
+	if (a->warp != NULL) {
+		return true;
+	}
+	struct toplevel *tl = a->tl;
+	if (tl->scene_tree == NULL) {
+		return false;
+	}
+	const struct wlr_box *from = &a->geom_from;
+	const struct wlr_box *to = &a->geom_to;
+	int x0 = from->x < to->x ? from->x : to->x;
+	int y0 = from->y < to->y ? from->y : to->y;
+	int x1 = (from->x + from->width) > (to->x + to->width) ?
+		(from->x + from->width) : (to->x + to->width);
+	int y1 = (from->y + from->height) > (to->y + to->height) ?
+		(from->y + from->height) : (to->y + to->height);
+	struct wlr_box bounds = { x0, y0, x1 - x0, y1 - y0 };
+	a->warp = rounded_warp_begin(tl, &bounds);
+	return a->warp != NULL;
 }
 
 // 应用进度 p ∈ [0,1] 对应的状态
@@ -202,15 +366,10 @@ static void anim_apply(struct toplevel_anim *a, float p) {
 	switch (a->kind) {
 	case ANIM_GEOM:
 	case ANIM_ICON_OUT:
-	case ANIM_ICON_IN: {
-		// 窗口 (其圆角 FBO 持有目标尺寸的内容) 按缩放显示在插值出的框里:
-		// 把场景树移到框原点, 让 rounded.c 把 FBO 缩放进去
-		morph_box_at(a, p);
-		wlr_scene_node_set_position(&tl->scene_tree->node,
-			tl->morph_x, tl->morph_y);
-		rounded_cache_morph_apply(tl);
+	case ANIM_ICON_IN:
+		// genie 形变: 网格按梯形/漏斗形变, 不做整体矩形缩放
+		anim_warp_apply(a, p);
 		break;
-	}
 	case ANIM_FADE_IN:
 	case ANIM_FADE_OUT: {
 		float op = a->op_from + (a->op_to - a->op_from) * p;
@@ -243,52 +402,6 @@ static const char *anim_kind_name(enum anim_kind kind) {
 	}
 }
 
-// 拆除正在运行的形态 (最大化/还原缩放, 或最小化/还原的图标缩放):
-// 清除形态状态, 把 FBO 节点摆回良定义的布局.
-//  - 最大化缩放: 把场景树弹回目标框, 并按自然 (目标) 尺寸摆放 FBO;
-//    若圆角缓存还没持有目标尺寸的内容, 就标记为脏, 客户端提交后立即按自然布局重绘.
-//  - 图标缩放: 把 FBO 节点摆回窗口当前框的自然布局.
-static void anim_stop(struct toplevel_anim *a); // 定义在下文
-static void morph_teardown(struct toplevel_anim *a) {
-	struct toplevel *tl = a->tl;
-	if (!tl->morph_active) {
-		return;
-	}
-	struct wlr_box sweep = {0};
-	if (a->kind == ANIM_ICON_OUT || a->kind == ANIM_ICON_IN) {
-		// 图标缩放: 把 FBO 摆回窗口静止框的自然尺寸
-		tl->morph_x = a->rest_x;
-		tl->morph_y = a->rest_y;
-		tl->morph_w = a->win_w;
-		tl->morph_h = a->win_h;
-		rounded_cache_morph_apply(tl);
-		tl->morph_active = false;
-		geom_sweep_box(a, &sweep);
-	} else if (a->kind == ANIM_GEOM) {
-		// 在清除 morph_active 之前弹到目标框, 并按自然 (目标) 尺寸重新摆放 FBO:
-		// 最后一个缩放 tick 把节点 dest-size 设成了缩放中途的形态框,
-		// 而就绪的缓存不会重新发布, 所以没有这一步窗口会停在中间缩放
-		// (例如缩放中途开始的最小化或关闭淡出)
-		wlr_scene_node_set_position(&tl->scene_tree->node,
-			a->geom_to.x, a->geom_to.y);
-		tl->morph_x = a->geom_to.x;
-		tl->morph_y = a->geom_to.y;
-		tl->morph_w = a->geom_to.width;
-		tl->morph_h = a->geom_to.height;
-		rounded_cache_morph_apply(tl); // morph_active 仍置位
-		tl->morph_active = false;
-		if (!rounded_cache_size_ready(tl, a->geom_to.width,
-				a->geom_to.height)) {
-			rounded_cache_dirty(tl);
-		}
-		geom_sweep_box(a, &sweep);
-	}
-	anim_schedule_frames(tl->server, &sweep);
-	wlr_log(WLR_DEBUG, "animate: %s cancelled for app_id \"%s\"",
-		anim_kind_name(a->kind),
-		tl->app_id != NULL ? tl->app_id : "?");
-}
-
 // 结束当前动画: 精确落定最终状态 (没有运行中的动画后, 节拍看门狗自行解除)
 static void anim_finish(struct toplevel_anim *a) {
 	struct toplevel *tl = a->tl;
@@ -304,6 +417,8 @@ static void anim_finish(struct toplevel_anim *a) {
 		anim_kind_name(kind),
 		tl->app_id != NULL ? tl->app_id : "?");
 	anim_apply(a, 1.0f); // 精确端点 (也覆盖 p = 1 的取整)
+	// 结束 genie 形变: 探销网格 buffer 并恢复窗口树 (还原/最大化结束时窗口重新可见)
+	anim_warp_end(a, true);
 	switch (kind) {
 	case ANIM_FADE_IN:
 		rounded_window_set_opacity(tl, 1.0f);
@@ -325,21 +440,18 @@ static void anim_finish(struct toplevel_anim *a) {
 		}
 		return;
 	case ANIM_GEOM:
-		// 已缩放到目标框: 把几何交还圆角缓存 (自然位置/尺寸等于刚显示的内容)
-		tl->morph_active = false;
+		// 已缩放到目标框: 窗口树已由 anim_warp_end 重新启用并落在目标几何
 		break;
 	case ANIM_ICON_OUT:
 		// 已缩到图标: 隐藏并弹回静止原点
 		wlr_scene_node_set_position(&tl->scene_tree->node,
 			a->rest_x, a->rest_y);
 		wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
-		tl->morph_active = false;
 		break;
 	case ANIM_ICON_IN:
 		// 已放大回静止框: 保持静止原点
 		wlr_scene_node_set_position(&tl->scene_tree->node,
 			a->rest_x, a->rest_y);
-		tl->morph_active = false;
 		break;
 	default:
 		break;
@@ -355,6 +467,8 @@ static void anim_finish(struct toplevel_anim *a) {
 	anim_schedule_frames(tl->server, &sweep);
 }
 
+static void anim_stop(struct toplevel_anim *a); // 定义在下文
+
 // 把一个运行中的动画推进到 now_ms: 插值并应用缓动状态, 运行结束时落定最终状态.
 // 每个渲染帧调用一次 (anim_frame_tick), 用它自己的时刻,
 // 所以输出实际显示的状态总是属于它自己的 vblank.
@@ -362,10 +476,9 @@ static void anim_advance(struct toplevel_anim *a, uint32_t now_ms) {
 	struct toplevel *tl = a->tl;
 	uint32_t elapsed = now_ms - a->start_ms;
 
-	// ANIM_GEOM 等待阶段: 直到圆角缓存持有目标尺寸的窗口内容
-	// (客户端已提交且缓存已重绘) 才做任何事. 只有到那时才开始真正的缩放 -
-	// 这样窗口绝不会在浮动布局和目标布局之间跳变.
-	// 等待期间画面静止, 所以这里不应用任何东西.
+	// ANIM_GEOM 等待阶段: 网格已接管并以 p=0 显示旧内容 (与窗口一致).
+	// 直到圆角缓存持有目标尺寸的内容 (客户端已提交且缓存已重绘) 才重拍快照
+	// 并开始缩放 - 这样窗口绝不会在浮动布局和目标布局之间跳变.
 	if (a->kind == ANIM_GEOM && !a->geom_zooming) {
 		if (rounded_cache_size_ready(tl, a->geom_to.width,
 				a->geom_to.height)) {
@@ -377,17 +490,18 @@ static void anim_advance(struct toplevel_anim *a, uint32_t now_ms) {
 				"zooming for app_id \"%s\" (%u ms)",
 				tl->app_id != NULL ? tl->app_id : "?",
 				a->duration_ms);
+			// 目标尺寸内容已就绪: 换掉网格的源快照, 从 from 框开始缩放.
+			// 窗口树保持启用但透明 (等待阶段已设), 命中测试继续走原始内容.
+			rounded_warp_resnapshot(a->warp);
+			rounded_window_set_opacity(tl, 0.0f);
 			anim_apply(a, 0.0f);
-			// p = 0 的缩放状态与窗口已显示的内容相同 (其 FBO 缩放进 from 框),
-			// 不损坏任何东西: 显式请求第一帧缩放
 			struct wlr_box sweep;
 			geom_sweep_box(a, &sweep);
 			anim_schedule_frames(tl->server, &sweep);
 		} else if (elapsed >= a->duration_ms) {
 			// 客户端始终没提交目标尺寸: 放弃缩放并瞬时落在目标几何上
-			// (morph_teardown 会请求显示落定结果的那一帧)
-			morph_teardown(a);
 			anim_stop(a);
+			rounded_cache_dirty(tl);
 		}
 		return;
 	}
@@ -436,8 +550,8 @@ static int anim_watchdog(void *data) {
 			if (!rounded_cache_size_ready(tl, a->geom_to.width,
 					a->geom_to.height) &&
 					mono_ms() - a->start_ms >= a->duration_ms) {
-				morph_teardown(a);
 				anim_stop(a);
+				rounded_cache_dirty(tl);
 			}
 			continue;
 		}
@@ -481,6 +595,8 @@ static void anim_watchdog_arm(struct server *server) {
 static void anim_tree_destroy(struct wl_listener *listener, void *data) {
 	struct toplevel_anim *a = wl_container_of(listener, a, tree_destroy);
 	(void)data;
+	// 窗口场景树正在销毁: 探销形变网格, 但不要再碰窗口树
+	anim_warp_end(a, false);
 	a->tl->anim = NULL;
 	wl_list_remove(&a->tree_destroy.link);
 	free(a);
@@ -508,6 +624,8 @@ static struct toplevel_anim *anim_get(struct toplevel *tl) {
 
 // 停止运行中的动画但不碰场景状态 (节拍看门狗发现没有运行中的动画后自行解除)
 static void anim_stop(struct toplevel_anim *a) {
+	// 离开任何 genie 形变: 探销网格 buffer, 还原/最大化时把窗口树重新启用
+	anim_warp_end(a, true);
 	a->kind = ANIM_NONE;
 }
 
@@ -515,8 +633,7 @@ static void anim_stop(struct toplevel_anim *a) {
 // (起始位置/起始透明度)
 static void anim_begin(struct toplevel_anim *a, enum anim_kind kind,
 		uint32_t duration_ms) {
-	// 另一个动画占着窗口; 如果那是最大化/还原缩放, 先停止缩放并把窗口弹回目标
-	morph_teardown(a);
+	// 另一个动画占着窗口: 先结束它 (形变会拆掉网格并把窗口树落到目标几何)
 	anim_stop(a);
 	a->kind = kind;
 	a->duration_ms = duration_ms;
@@ -570,7 +687,7 @@ static bool taskbar_icon_box(struct server *server, struct toplevel *tl,
 		index * CONFIG_TASKBAR_ICON_PITCH;
 	// 目标框贴着状态栏外侧: 贴底栏时底边 = 栏顶边 (y = bar_top - icon),
 	// 贴顶栏时顶边 = 栏底边. 起点的最大化框底边也正好是栏顶边,
-	// 所以 morph 插值出的底边全程恒定在栏顶边, 绝不会沉到状态栏下面.
+	// 所以形变插值出的底边全程恒定在栏顶边, 绝不会沉到状态栏下面.
 	int y = CONFIG_TASKBAR_AT_TOP
 		? bar_top + CONFIG_TASKBAR_HEIGHT
 		: bar_top - icon;
@@ -603,7 +720,7 @@ bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 	if (box.width <= 0 || box.height <= 0) {
 		return false; // 没有可用几何: 调用方瞬时隐藏
 	}
-	// Windows 11 式最小化: 朝状态栏图标缩小 (停在状态栏外侧, 不进入状态栏).
+	// genie 最小化: 朝状态栏图标缩小 (停在状态栏外侧, 不进入状态栏).
 	// 图标位置由常量推算,
 	// 状态栏没运行/没圆角 FBO 也照常动画 (后者只移动, 不缩放).
 	struct wlr_box icon_box = box;
@@ -627,19 +744,17 @@ bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 	a->op_from = 1.0f;
 	a->op_to = 1.0f;
 	a->op_cur = 1.0f;
-	// 场景树锚定在窗口框原点, 圆角 FBO (含边框/阴影) 缩放进去
-	tl->morph_active = rounded_morph_supported(tl);
-	tl->morph_x = box.x;
-	tl->morph_y = box.y;
-	tl->morph_w = box.width;
-	tl->morph_h = box.height;
-	// 完全不透明、节点启用, 然后缩小; 焦点已移到下一个窗口, 所以把动画窗口
-	// 放回 toplevel 图层顶部, 避免它滑到接替焦点的窗口后面
-	rounded_window_set_opacity(tl, 1.0f);
-	wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+	// 网格 buffer 接管画面 (底部两角先被拉向目标);
+	// 没有可用的 GL/FBO 时退回瞬时隐藏.
+	if (!anim_warp_begin(a)) {
+		anim_stop(a);
+		return false;
+	}
+	// 画面完全由网格节点显示: 窗口自身内容变透明, 但场景树保持启用 -
+	// 禁用树会让动画期间窗口无法被指针命中 (命中测试走原始客户端内容).
+	// 提升到顶层, 使命中测试与置顶显示的网格一致.
+	rounded_window_set_opacity(tl, 0.0f);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
-	wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
-	rounded_cache_morph_apply(tl);
 	struct wlr_box sweep;
 	geom_sweep_box(a, &sweep);
 	anim_schedule_frames(server, &sweep);
@@ -670,7 +785,7 @@ bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
 	a->rest_x = rest_x;
 	a->rest_y = rest_y;
 
-	// Windows 11 式还原: 从任务栏图标外侧放大回静止框. 图标位置由常量推算.
+	// genie 还原: 从任务栏图标外侧放大回静止框. 图标位置由常量推算.
 	struct wlr_box icon_box = box;
 	taskbar_icon_box(server, tl, &icon_box);
 	struct wlr_box rest_box = { rest_x, rest_y, box.width, box.height };
@@ -682,17 +797,16 @@ bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
 	a->op_from = 1.0f;
 	a->op_to = 1.0f;
 	a->op_cur = 1.0f;
-	tl->morph_active = rounded_morph_supported(tl);
-	tl->morph_x = icon_box.x;
-	tl->morph_y = icon_box.y;
-	tl->morph_w = icon_box.width;
-	tl->morph_h = icon_box.height;
-	// 第一帧就从图标处可见, 并提升到其他窗口之上
-	rounded_window_set_opacity(tl, 1.0f);
+	// 网格从目标位展开回窗口 (顶部最后到位); 没有可用的 GL/FBO 时退回瞬时显示.
+	if (!anim_warp_begin(a)) {
+		anim_stop(a);
+		return false;
+	}
+	// 画面完全由网格节点显示: 窗口自身内容透明, 但场景树保持启用,
+	// 这样动画期间窗口仍可被指针命中; 并提升到顶层使命中与网格一致.
+	rounded_window_set_opacity(tl, 0.0f);
 	wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
-	wlr_scene_node_set_position(&tl->scene_tree->node, icon_box.x, icon_box.y);
-	rounded_cache_morph_apply(tl);
 	struct wlr_box sweep;
 	geom_sweep_box(a, &sweep);
 	anim_schedule_frames(server, &sweep);
@@ -731,10 +845,11 @@ bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl) {
 	return true;
 }
 
-// Windows 式最大化/还原缩放. 调用方已向客户端发送目标尺寸, 且不得自行移动场景节点.
-// 窗口先在当前 (浮动/最大化) 框里继续显示当前内容, 直到圆角缓存持有目标尺寸的内容,
-// 然后在两个框之间平滑缩放 - 最大化从浮动矩形放大, 还原缩回浮动矩形.
-// 节点最终停在 `to` 的原点.
+// 最大化/还原/全屏的 genie 形变. 调用方已向客户端发送目标尺寸,
+// 且不得自行移动场景节点 (形变期间场景树停在 from 框).
+// 网格先以 from 框显示当前内容, 直到圆角缓存持有目标尺寸的内容,
+// 再重拍快照并在两个框之间形变 - 最大化从浮动矩形放大, 还原缩回浮动矩形.
+// 结束时场景树落到 `to` 的原点.
 bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
 		const struct wlr_box *from, const struct wlr_box *to) {
 	if (!CONFIG_ANIM_ENABLE || CONFIG_ANIM_MAXIMIZE_MS <= 0) {
@@ -764,24 +879,25 @@ bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
 	if (a->kind != ANIM_NONE) {
 		return false; // 另一个动画 (掉落/淡变) 正在运行
 	}
-	if (!rounded_morph_supported(tl)) {
-		return false; // 没有可缩放的圆角 FBO 可缩放
-	}
 
 	anim_begin(a, ANIM_GEOM, CONFIG_ANIM_MAXIMIZE_WAIT_MS);
 	a->geom_from = *from;
 	a->geom_to = *to;
 	a->geom_zooming = false;
 
-	// 在目标尺寸内容就绪之前保持视觉上不动:
-	// FBO 按缩放发布在当前 (from) 框里, 正是窗口已经所在的位置
-	tl->morph_active = true;
-	tl->morph_x = from->x;
-	tl->morph_y = from->y;
-	tl->morph_w = from->width;
-	tl->morph_h = from->height;
+	// 场景树锚定在 from 框 (形变期间不动, 由网格负责视觉)
 	wlr_scene_node_set_position(&tl->scene_tree->node, from->x, from->y);
-	rounded_cache_morph_apply(tl);
+	// 网格立即接管: 以 p=0 显示旧内容 (与窗口一致), 等目标尺寸内容就绪
+	// (anim_advance) 再重拍快照并开始缩放. 没有可用的 GL/FBO 时退回瞬时跳变.
+	if (!anim_warp_begin(a)) {
+		anim_stop(a);
+		return false;
+	}
+	// 场景树全程保持启用: 圆角 FBO 的合成依赖它 (wlroots 跳过被禁用的节点),
+	// 目标尺寸的内容才能在客户端提交后重绘; 命中测试也依赖它找到窗口.
+	// 用 0 透明度隐藏窗口, 画面由网格节点显示. 不会闪目标几何.
+	rounded_window_set_opacity(tl, 0.0f);
+	anim_warp_apply(a, 0.0f);
 	struct wlr_box sweep;
 	geom_sweep_box(a, &sweep);
 	anim_schedule_frames(server, &sweep);
@@ -794,8 +910,22 @@ void animate_toplevel_abort_geometry(struct toplevel *tl) {
 	if (tl->anim == NULL) {
 		return;
 	}
-	morph_teardown(tl->anim);
 	anim_stop(tl->anim);
+}
+
+// 是否有拥有窗口场景节点的几何动画在运行 (最大化/还原缩放、最小化/还原).
+bool animate_toplevel_owns_geometry(struct toplevel *tl) {
+	if (tl->anim == NULL) {
+		return false;
+	}
+	switch (tl->anim->kind) {
+	case ANIM_GEOM:
+	case ANIM_ICON_OUT:
+	case ANIM_ICON_IN:
+		return true;
+	default:
+		return false;
+	}
 }
 
 bool animate_toplevel_close(struct toplevel *tl) {
@@ -869,8 +999,6 @@ void animate_toplevel_cancel(struct toplevel *tl) {
 	default:
 		break;
 	}
-	// 正在运行的最大化/还原缩放拆除到目标框
-	morph_teardown(a);
 	wlr_log(WLR_DEBUG, "animate: %s cancelled for app_id \"%s\"",
 		anim_kind_name(a->kind),
 		tl->app_id != NULL ? tl->app_id : "?");

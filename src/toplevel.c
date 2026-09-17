@@ -450,7 +450,7 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 			tl->xdg_toplevel->current.fullscreen == fullscreen) {
 		return;
 	}
-	if (tl->morph_active) {
+	if (animate_toplevel_owns_geometry(tl)) {
 		// 最大化/还原缩放正在运行: 让全屏干净地接管, 而不是与运行中的缩放相互干扰
 		animate_toplevel_abort_geometry(tl);
 	}
@@ -521,7 +521,7 @@ void set_maximized(struct server *server, struct toplevel *tl,
 	if (tl->closing || tl->xdg_toplevel->base == NULL) {
 		return;
 	}
-	if (tl->morph_active) {
+	if (animate_toplevel_owns_geometry(tl)) {
 		// 正在进行的最大化/还原缩放拥有场景节点: 让新的最大化/还原请求
 		// 干净地替换它, 而不是与运行中的缩放相互干扰
 		// (快速切换, 或客户端在首个 configure ack 前重复声明 set_maximized)
@@ -633,7 +633,7 @@ void restore_maximized_toplevel(struct toplevel *tl, bool animate) {
 			!tl->xdg_toplevel->current.maximized || tl->fullscreen) {
 		return;
 	}
-	if (tl->morph_active) {
+	if (animate_toplevel_owns_geometry(tl)) {
 		// 正在进行的最大化/还原缩放拥有场景节点
 		animate_toplevel_abort_geometry(tl);
 	}
@@ -682,7 +682,7 @@ void set_minimized(struct server *server, struct toplevel *tl,
 	if (tl->minimized == minimized) {
 		return;
 	}
-	if (tl->morph_active) {
+	if (animate_toplevel_owns_geometry(tl)) {
 		// 正在进行的最大化/还原缩放拥有场景节点 (快速切换, 或客户端在首个
 		// configure ack 前重复声明 set_maximized): 让新请求替换它
 		animate_toplevel_abort_geometry(tl);
@@ -1009,6 +1009,31 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	}
 	focus_toplevel(server, tl);
 	update_toplevel_output(server, tl);
+	// 推进客户端立即采纳 preferred_buffer_scale (如输出 1.75 → 2).
+	// wlroots 在 surface 进入输出时才发这个事件 (即 map 前后), 而很多客户端
+	// (wezterm 就是) 要等到下一个 configure 才按新缩放重绘. 不同步的后果:
+	// 客户端按旧缩放 (scale 1) 计算并上报 text-input 的 cursor_rectangle,
+	// 候选窗位置会偏一半, 直到某次最大化/缩放触发的 configure 才纠正.
+	// 用一个"尺寸不变"的 configure 推它一把 (不改变客户端自选的尺寸).
+	if (!tl->xdg_toplevel->requested.fullscreen &&
+			!tl->xdg_toplevel->requested.maximized &&
+			tl->xdg_toplevel->base != NULL &&
+			tl->xdg_toplevel->base->surface != NULL) {
+		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
+		// configure 的 width/height 是 window geometry 坐标 (xdg-shell 协议),
+		// 不是 surface 尺寸. 用 surface 尺寸会给带 CSD/阴影 (surface > geometry)
+		// 的窗口再撑大一圈, 也会把 Electron 的小占位 surface 当成最终几何钉住.
+		int ww = base->geometry.width;
+		int wh = base->geometry.height;
+		if (ww <= 0 || wh <= 0) {
+			// 客户端没设 window geometry: 退回 surface 尺寸
+			ww = base->surface->current.width;
+			wh = base->surface->current.height;
+		}
+		if (ww > 0 && wh > 0) {
+			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, ww, wh);
+		}
+	}
 	rounded_cache_hide_content(tl);
 	rounded_cache_dirty(tl);
 	// 刚映射的窗口淡入 (animate.c)

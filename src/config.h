@@ -89,9 +89,17 @@
 #define CONFIG_TASKBAR_HEIGHT 40       // 状态栏高度 (monodybar BAR_HEIGHT)
 #define CONFIG_TASKBAR_ICON_OFFSET 108 // 第一个图标左边缘相对栏左边缘的偏移 (px)
 #define CONFIG_TASKBAR_ICON_PITCH 68   // 相邻图标左边缘的间距 (px)
-#define CONFIG_ANIM_TASKBAR_MS 180     // 最小化/还原 缩放+淡变 时长 (ms)
 
-// 创建/关闭动画是纯淡入/淡出 (窗口保持自然大小).
+// macOS 式 genie 形变 (最小化/还原/最大化): 把窗口内容作为纹理贴到一张细分网格上,
+// 底部两角先被拉到目标位 (形成梯形/漏斗), 顶部随后跟上 - 不再是整体矩形缩放.
+// 网格在 GPU 上一次绘制, 左右边缘是真正的斜线, 没有横条切片法的阶梯/接缝.
+// 0 = 关闭, 退回原来的整体缩放.
+#define CONFIG_ANIM_GENIE 1
+#define CONFIG_ANIM_GENIE_LAG 0.5f      // 顶部相对底部的延迟 (0..1): 越大越"先拉底部"
+#define CONFIG_ANIM_GENIE_ROWS 200       // 网格竖向分段 (越多边缘越平滑, 顶点开销可忽略)
+#define CONFIG_ANIM_GENIE_COLS 16        // 网格横向分段
+#define CONFIG_ANIM_TASKBAR_MS 100     // 最小化/还原 缩放+淡变 时长 (ms)
+
 // 最小化/还原 (Windows 11 式, 见下方 TASKBAR 常量) 与最大化/还原保留缩放:
 // 组合键修饰符, 按需组合使用
 #define MODKEY0 (WLR_MODIFIER_ALT)                        // alt (单独按 Alt)
