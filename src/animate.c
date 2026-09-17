@@ -6,10 +6,11 @@
 //                   这样不理会关闭请求的客户端也不会留下不可见却阻塞输入的窗口.
 //                   关闭一个仍在落下 (最小化) 的窗口会保留掉落的同时淡出;
 //                   刚 map 就关闭则从当前透明度开始淡出, 不会闪回.
-//   最小化       -> Windows 11 式: 窗口朝状态栏上的图标缩小 (图标位置由
+//   最小化       -> Windows 11 式: 窗口朝状态栏上的图标位置缩小 (图标位置由
 //                   config.h 的 TASKBAR 常量推算, 状态栏未运行也照常推算),
-//                   完成后隐藏场景节点并弹回静止原点
-//   还原         -> 从状态栏图标放大回静止框
+//                   但不进入状态栏 (目标框贴着栏的外侧), 完成后隐藏场景节点
+//                   并弹回静止原点
+//   还原         -> 从状态栏外侧的目标框放大回静止框
 //
 // 运动作用在 toplevel 的场景树节点 (位置) 上, 淡变作用在可见窗口 buffer 上
 // (经 rounded_window_set_opacity()) - 所以圆角副本、边框和阴影一起移动/淡变.
@@ -52,7 +53,7 @@ enum anim_kind {
 	ANIM_FADE_OUT,  // close: 透明度 1 -> 0, 然后发送 close
 	ANIM_GEOM,      // maximize/restore: 在两个框之间缩放
 	ANIM_ICON_OUT,  // minimize: 朝状态栏图标缩小并淡出 (Windows 11)
-	ANIM_ICON_IN,   // restore: 从状态栏图标放大回原位并淡入 (Windows 11)
+	ANIM_ICON_IN,   // restore: 从状态栏外侧放大回原位并淡入 (Windows 11)
 };
 
 struct toplevel_anim {
@@ -526,10 +527,12 @@ static void anim_begin(struct toplevel_anim *a, enum anim_kind kind,
 	anim_watchdog_arm(a->tl->server);
 }
 
-// 用状态栏布局常量 (config.h) 推算窗口在任务栏上的图标框 (布局坐标).
+// 用状态栏布局常量 (config.h) 推算最小化/还原动画的目标框 (布局坐标).
 // 位置完全来自配置, 不查询/不判断状态栏是否运行:
 //   状态栏贴在输出上边或下边 (CONFIG_TASKBAR_AT_TOP), 高度 CONFIG_TASKBAR_HEIGHT,
 //   图标间距 CONFIG_TASKBAR_ICON_PITCH, 第一个图标偏移 CONFIG_TASKBAR_ICON_OFFSET.
+// x 对齐任务栏图标; y 不进入状态栏 - 贴底栏时目标框底边压在栏顶边之上,
+// 贴顶栏时目标框顶边压在栏底边之下. 这样缩小/放大的窗口全程都不低于状态栏.
 static bool taskbar_icon_box(struct server *server, struct toplevel *tl,
 		struct wlr_box *out) {
 	if (!tl->ipc_added) {
@@ -565,7 +568,12 @@ static bool taskbar_icon_box(struct server *server, struct toplevel *tl,
 	}
 	int x = obox.x + CONFIG_TASKBAR_ICON_OFFSET +
 		index * CONFIG_TASKBAR_ICON_PITCH;
-	int y = bar_top + (CONFIG_TASKBAR_HEIGHT - icon) / 2;
+	// 目标框贴着状态栏外侧: 贴底栏时底边 = 栏顶边 (y = bar_top - icon),
+	// 贴顶栏时顶边 = 栏底边. 起点的最大化框底边也正好是栏顶边,
+	// 所以 morph 插值出的底边全程恒定在栏顶边, 绝不会沉到状态栏下面.
+	int y = CONFIG_TASKBAR_AT_TOP
+		? bar_top + CONFIG_TASKBAR_HEIGHT
+		: bar_top - icon;
 	// 夹在屏幕内, 避免图标很多时飞出
 	if (x + icon > obox.x + obox.width) {
 		x = obox.x + obox.width - icon;
@@ -595,7 +603,8 @@ bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 	if (box.width <= 0 || box.height <= 0) {
 		return false; // 没有可用几何: 调用方瞬时隐藏
 	}
-	// Windows 11 式最小化: 朝状态栏图标缩小. 图标位置由常量推算,
+	// Windows 11 式最小化: 朝状态栏图标缩小 (停在状态栏外侧, 不进入状态栏).
+	// 图标位置由常量推算,
 	// 状态栏没运行/没圆角 FBO 也照常动画 (后者只移动, 不缩放).
 	struct wlr_box icon_box = box;
 	taskbar_icon_box(server, tl, &icon_box);
@@ -661,7 +670,7 @@ bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
 	a->rest_x = rest_x;
 	a->rest_y = rest_y;
 
-	// Windows 11 式还原: 从任务栏图标放大回静止框. 图标位置由常量推算.
+	// Windows 11 式还原: 从任务栏图标外侧放大回静止框. 图标位置由常量推算.
 	struct wlr_box icon_box = box;
 	taskbar_icon_box(server, tl, &icon_box);
 	struct wlr_box rest_box = { rest_x, rest_y, box.width, box.height };

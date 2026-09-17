@@ -1,3 +1,4 @@
-swaybg -i ~/vimconfig/image/3.jpg -m fill
+~/notifier-watcher/build/notifier-watcher
 wlr-randr --output Virtual-1 --mode 2880x1800 --scale 1.75
+swaybg -i ~/vimconfig/image/3.jpg -m fill
 pgrep -x fcitx5 > /dev/null 2>&1 || fcitx5 -d
