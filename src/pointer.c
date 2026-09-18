@@ -240,7 +240,7 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 			// 窗口保持最大化, 什么都不动
 			return;
 		}
-		restore_maximized_toplevel(tl, false); // 拖动: 抓取接管几何
+		restore_maximized_toplevel(tl); // 拖动: 抓取接管几何
 		// 重新锚定抓取: 把按压点在最大化框内部的偏移按比例映射进还原框,
 		// 光标持续抓住按下时同一个窗口内部位置. 单纯的绝对偏移会让它停在同一个像素,
 		// 在更窄的还原窗口上会向右漂 (例如按在最大化 gvim 居中标题文字上,
@@ -272,6 +272,34 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 	wlr_scene_node_set_position(&tl->scene_tree->node, nx, ny);
 }
 
+// 拖动的最大化窗口先还原到保存的浮动几何, 并把抓取参考点钳进还原后的窗口
+// (抓取接管几何). 非最大化窗口原样返回.
+static void restore_for_drag(struct toplevel *tl, double *ref_x, double *ref_y) {
+	if (!tl->xdg_toplevel->current.maximized) {
+		return;
+	}
+	restore_maximized_toplevel(tl); // 拖动: 抓取接管几何
+	struct wlr_box rb = tl->restore_box;
+	// restore_maximized_toplevel 会把还原位置钳进作区,
+	// 所以按窗口实际框 (而不是过期保存的框) 抓住光标
+	rb.x = tl->scene_tree->node.x;
+	rb.y = tl->scene_tree->node.y;
+	if (tl->has_restore_box && rb.width > 0) {
+		if (*ref_x < rb.x) {
+			*ref_x = rb.x;
+		}
+		if (*ref_x > rb.x + rb.width - 1) {
+			*ref_x = rb.x + rb.width - 1;
+		}
+		if (*ref_y < rb.y) {
+			*ref_y = rb.y;
+		}
+		if (*ref_y > rb.y + rb.height - 1) {
+			*ref_y = rb.y + rb.height - 1;
+		}
+	}
+}
+
 // 把标题条上的按压变成移动抓取: 抓取锚定在原始按压位置;
 // 拖动最大化窗口会先还原它 (Windows 行为), 使拖动抓住其还原后的几何
 static void begin_zone_drag(struct server *server) {
@@ -283,30 +311,7 @@ static void begin_zone_drag(struct server *server) {
 	server->zone_action = ZONE_NONE; // 拖动取消任何已臂置的双击
 	double ref_x = server->press_x;
 	double ref_y = server->press_y;
-	if (tl->xdg_toplevel->current.maximized) {
-		// 拖动最大化窗口的标题栏: 先还原到之前的几何, 并把抓取点钳进还原后的窗口,
-		// 使光标抓住其标题栏, 窗口跟随 (Windows 行为)
-		restore_maximized_toplevel(tl, false); // 拖动: 抓取接管几何
-		struct wlr_box rb = tl->restore_box;
-		// restore_maximized_toplevel 会把还原位置钳进作区,
-		// 所以按窗口实际框 (而不是过期保存的框) 抓住光标
-		rb.x = tl->scene_tree->node.x;
-		rb.y = tl->scene_tree->node.y;
-		if (tl->has_restore_box && rb.width > 0) {
-			if (ref_x < rb.x) {
-				ref_x = rb.x;
-			}
-			if (ref_x > rb.x + rb.width - 1) {
-				ref_x = rb.x + rb.width - 1;
-			}
-			if (ref_y < rb.y) {
-				ref_y = rb.y;
-			}
-			if (ref_y > rb.y + rb.height - 1) {
-				ref_y = rb.y + rb.height - 1;
-			}
-		}
-	}
+	restore_for_drag(tl, &ref_x, &ref_y);
 	begin_move(server, tl, ref_x, ref_y);
 	move_toplevel_to(server, server->cursor->x, server->cursor->y);
 	server->last_was_click = false;
@@ -925,28 +930,7 @@ static void begin_chord_move(struct server *server) {
 	}
 	double ref_x = server->press_x;
 	double ref_y = server->press_y;
-	if (tl->xdg_toplevel->current.maximized) {
-		restore_maximized_toplevel(tl, false); // 拖动: 抓取接管几何
-		struct wlr_box rb = tl->restore_box;
-		// restore_maximized_toplevel 会把还原位置钳进作区,
-		// 所以按窗口实际框抓住光标
-		rb.x = tl->scene_tree->node.x;
-		rb.y = tl->scene_tree->node.y;
-		if (tl->has_restore_box && rb.width > 0) {
-			if (ref_x < rb.x) {
-				ref_x = rb.x;
-			}
-			if (ref_x > rb.x + rb.width - 1) {
-				ref_x = rb.x + rb.width - 1;
-			}
-			if (ref_y < rb.y) {
-				ref_y = rb.y;
-			}
-			if (ref_y > rb.y + rb.height - 1) {
-				ref_y = rb.y + rb.height - 1;
-			}
-		}
-	}
+	restore_for_drag(tl, &ref_x, &ref_y);
 	focus_toplevel(server, tl);
 	begin_move(server, tl, ref_x, ref_y);
 	move_toplevel_to(server, server->cursor->x, server->cursor->y);
@@ -1024,7 +1008,7 @@ static void chord_double_click(struct server *server, uint32_t chord_button) {
 		// 按住的是右键
 		focus_toplevel(server, tl);
 		if (tl->xdg_toplevel->current.maximized) {
-			restore_maximized_toplevel(tl, true);
+			restore_maximized_toplevel(tl);
 		} else {
 			set_maximized(server, tl, true);
 		}
@@ -1146,17 +1130,18 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 // 布局点相对于某 toplevel surface 的 surface 局部坐标,
 // 即使点位于 surface 之外 (用于隐式抓取期间继续向被抓 surface 转发 motion).
 // surface 不是 toplevel surface 时返回 false.
-static bool toplevel_surface_coords(struct server *server,
-		struct wlr_surface *surface, double lx, double ly,
-		double *sx, double *sy) {
+// toplevel surface 内容在布局坐标下的原点 (含 geometry 偏移),
+// 使 surface 局部坐标能映射回布局 (surface 局部点 + 原点 = 布局坐标)
+static bool toplevel_surface_origin(struct server *server,
+		struct wlr_surface *surface, double *ox, double *oy) {
 	struct toplevel *tl;
 	wl_list_for_each(tl, &server->toplevels, link) {
 		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 		if (base == NULL || base->surface != surface) {
 			continue;
 		}
-		*sx = lx - tl->scene_tree->node.x + base->geometry.x;
-		*sy = ly - tl->scene_tree->node.y + base->geometry.y;
+		*ox = tl->scene_tree->node.x - base->geometry.x;
+		*oy = tl->scene_tree->node.y - base->geometry.y;
 		return true;
 	}
 	return false;
@@ -1262,12 +1247,10 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 				wlr_seat_pointer_notify_motion(server->seat, time_msec,
 					sx, sy);
 			} else {
-				double gx, gy;
-				if (toplevel_surface_coords(server, focused,
-						server->cursor->x, server->cursor->y,
-						&gx, &gy)) {
+				double ox, oy;
+				if (toplevel_surface_origin(server, focused, &ox, &oy)) {
 					wlr_seat_pointer_notify_motion(server->seat, time_msec,
-						gx, gy);
+						server->cursor->x - ox, server->cursor->y - oy);
 				}
 			}
 		}
@@ -1432,7 +1415,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 					case ZONE_MAXIMIZE:
 						focus_toplevel(server, tl);
 						if (tl->xdg_toplevel->current.maximized) {
-							restore_maximized_toplevel(tl, true);
+							restore_maximized_toplevel(tl);
 						} else {
 							set_maximized(server, tl, true);
 						}
@@ -1603,7 +1586,7 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 		if (event->delta_discrete < 0) {
 			if (tl->xdg_toplevel->current.maximized) {
 				// 已最大化: 还原保存的几何
-				restore_maximized_toplevel(tl, true);
+				restore_maximized_toplevel(tl);
 			} else {
 				set_maximized(server, tl, true);
 			}
@@ -1657,23 +1640,6 @@ static void pointer_constraint_destroy(struct wl_listener *listener,
 	}
 	wl_list_remove(&pc->destroy.link);
 	free(pc);
-}
-
-// toplevel surface 内容在布局坐标下的原点 (含 geometry 偏移),
-// 使 surface 局部坐标能映射回布局
-static bool toplevel_surface_origin(struct server *server,
-		struct wlr_surface *surface, double *ox, double *oy) {
-	struct toplevel *tl;
-	wl_list_for_each(tl, &server->toplevels, link) {
-		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
-		if (base == NULL || base->surface != surface) {
-			continue;
-		}
-		*ox = tl->scene_tree->node.x - base->geometry.x;
-		*oy = tl->scene_tree->node.y - base->geometry.y;
-		return true;
-	}
-	return false;
 }
 
 // 把光标放到约束请求的提示位置 (锁定指针激活时可能要求 warp 到某个 surface 局部点)

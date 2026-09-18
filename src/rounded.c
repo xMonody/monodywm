@@ -233,7 +233,7 @@ static GLuint rounded_compile_shader(GLenum type, const char *src) {
 	return shader;
 }
 
-// 边框/圆角 uniform 位置: mask 程序与 warp 的 live 着色器用同一套 uniform 名字,
+// 边框/圆角 uniform 位置 (mask 程序用这一套 uniform 名字),
 // 这里集中一次, 上传也走同一个 helper.
 struct border_uniforms {
 	GLint radius, width, color;
@@ -372,11 +372,6 @@ static struct wlr_buffer *rounded_alloc_buffer_server(struct server *server,
 		&fmt);
 }
 
-static struct wlr_buffer *rounded_alloc_buffer(struct rounded_cache *rc,
-		int width, int height) {
-	return rounded_alloc_buffer_server(rc->server, width, height);
-}
-
 static void rounded_drop_buffers(struct rounded_cache *rc) {
 	if (rc->content_buf != NULL) {
 		wlr_buffer_drop(rc->content_buf);
@@ -444,8 +439,10 @@ static bool rounded_alloc_buffers(struct rounded_cache *rc,
 	}
 
 	// 尺寸变化: 分配新的一对, 之后再丢弃旧的
-	struct wlr_buffer *content_buf = rounded_alloc_buffer(rc, fw, fh);
-	struct wlr_buffer *rounded_buf = rounded_alloc_buffer(rc, fw, fh);
+	struct wlr_buffer *content_buf =
+		rounded_alloc_buffer_server(rc->server, fw, fh);
+	struct wlr_buffer *rounded_buf =
+		rounded_alloc_buffer_server(rc->server, fw, fh);
 	if (content_buf == NULL || rounded_buf == NULL) {
 		if (content_buf != NULL) {
 			wlr_buffer_drop(content_buf);
@@ -676,13 +673,11 @@ static bool rounded_render_content(struct rounded_cache *rc,
 
 // --- 圆角掩码 pass (原生 GLES2) ---
 
-// 把内容 FBO 拷进内容纹理 (供掩码着色器和 warp 采样), 并在 draw_mask 为真时把
-// SDF 掩码画到输出 FBO. region 为 NULL 时刷新整个 FBO, 否则只处理它的矩形 (glScissor
-// 限定, 拷贝和采样都不越界).
-// 几何动画期间窗口由 warp 网格显示, 输出 FBO 被隐藏 - 此时传 draw_mask=false,
-// 跳过整幅 SDF/阴影绘制, 只更新 content_tex, 减轻动画帧里客户端重绘的卡顿.
+// 把内容 FBO 拷进内容纹理 (供掩码着色器采样), 并把 SDF 掩码画到输出 FBO.
+// region 为 NULL 时刷新整个 FBO, 否则只处理它的矩形 (glScissor 限定,
+// 拷贝和采样都不越界).
 static bool rounded_render_mask(struct rounded_cache *rc,
-		const pixman_region32_t *region, bool draw_mask) {
+		const pixman_region32_t *region) {
 	struct wlr_renderer *renderer = rc->server->renderer;
 	if (!wlr_renderer_is_gles2(renderer)) {
 		return false;
@@ -690,9 +685,9 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 
 	GLuint content_fbo =
 		wlr_gles2_renderer_get_buffer_fbo(renderer, rc->content_buf);
-	GLuint out_fbo = draw_mask ? wlr_gles2_renderer_get_buffer_fbo(renderer,
-		rc->rounded_buf) : 0;
-	if (content_fbo == 0 || (draw_mask && out_fbo == 0)) {
+	GLuint out_fbo =
+		wlr_gles2_renderer_get_buffer_fbo(renderer, rc->rounded_buf);
+	if (content_fbo == 0 || out_fbo == 0) {
 		return false;
 	}
 
@@ -726,36 +721,34 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		boxes = pixman_region32_rectangles(region, &n_rects);
 	}
 
-	if (draw_mask) {
-		// 圆角矩形掩码 pass 写入输出 FBO
-		glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
-		glViewport(0, 0, rc->fbo_width, rc->fbo_height);
-		glDisable(GL_DEPTH_TEST);
-		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-		glDisable(GL_BLEND); // 掩码 pass 覆盖所绘区域
+	// 圆角矩形掩码 pass 写入输出 FBO
+	glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
+	glViewport(0, 0, rc->fbo_width, rc->fbo_height);
+	glDisable(GL_DEPTH_TEST);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	glDisable(GL_BLEND); // 掩码 pass 覆盖所绘区域
 
-		glUseProgram(mask_gl.program);
+	glUseProgram(mask_gl.program);
 
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, rc->content_tex);
-		glUniform1i(mask_gl.u_tex, 0);
-		glUniform2f(mask_gl.u_size, (float)rc->fbo_width, (float)rc->fbo_height);
-		glUniform2f(mask_gl.u_window_origin, (float)rc->shadow_px,
-			(float)rc->shadow_px);
-		glUniform2f(mask_gl.u_window_size, (float)rc->window_pw,
-			(float)rc->window_ph);
-		// 边距是常量 (始终是最大高斯阴影范围); 是否画阴影跟随焦点:
-		// 未聚焦窗口 sigma 为 0. 阴影颜色与边框无关.
-		glUniform1f(mask_gl.u_shadow_sigma, shadow_sigma(rc->tl) * rc->scale);
-		glUniform1f(mask_gl.u_shadow_alpha, shadow_alpha());
-		struct wlr_render_color shcol = shadow_color();
-		glUniform4f(mask_gl.u_shadow_color, shcol.r, shcol.g, shcol.b, shcol.a);
-		rounded_upload_border_uniforms(&mask_gl.border, rc->tl, rc->scale);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, rc->content_tex);
+	glUniform1i(mask_gl.u_tex, 0);
+	glUniform2f(mask_gl.u_size, (float)rc->fbo_width, (float)rc->fbo_height);
+	glUniform2f(mask_gl.u_window_origin, (float)rc->shadow_px,
+		(float)rc->shadow_px);
+	glUniform2f(mask_gl.u_window_size, (float)rc->window_pw,
+		(float)rc->window_ph);
+	// 边距是常量 (始终是最大高斯阴影范围); 是否画阴影跟随焦点:
+	// 未聚焦窗口 sigma 为 0. 阴影颜色与边框无关.
+	glUniform1f(mask_gl.u_shadow_sigma, shadow_sigma(rc->tl) * rc->scale);
+	glUniform1f(mask_gl.u_shadow_alpha, shadow_alpha());
+	struct wlr_render_color shcol = shadow_color();
+	glUniform4f(mask_gl.u_shadow_color, shcol.r, shcol.g, shcol.b, shcol.a);
+	rounded_upload_border_uniforms(&mask_gl.border, rc->tl, rc->scale);
 
-		glBindBuffer(GL_ARRAY_BUFFER, mask_gl.vbo);
-		glEnableVertexAttribArray(mask_gl.a_pos);
-		glVertexAttribPointer(mask_gl.a_pos, 2, GL_FLOAT, GL_FALSE, 0, NULL);
-	}
+	glBindBuffer(GL_ARRAY_BUFFER, mask_gl.vbo);
+	glEnableVertexAttribArray(mask_gl.a_pos);
+	glVertexAttribPointer(mask_gl.a_pos, 2, GL_FLOAT, GL_FALSE, 0, NULL);
 
 	if (partial) {
 		// 逐矩形: 把刚合成的内容拷进纹理 (纯 GPU 拷贝, 没有 glReadPixels),
@@ -770,10 +763,8 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 			glBindFramebuffer(GL_FRAMEBUFFER, content_fbo);
 			// 纹理偏移和 framebuffer 源都用该矩形的坐标: 纹理逐行镜像 FBO
 			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, y, x, y, w, h);
-			if (draw_mask) {
-				glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
-				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-			}
+			glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		}
 		glDisable(GL_SCISSOR_TEST);
 	} else {
@@ -781,16 +772,12 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		glBindFramebuffer(GL_FRAMEBUFFER, content_fbo);
 		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
 			rc->fbo_width, rc->fbo_height);
-		if (draw_mask) {
-			glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
-			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-		}
+		glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	}
 
-	if (draw_mask) {
-		glDisableVertexAttribArray(mask_gl.a_pos);
-		glBindBuffer(GL_ARRAY_BUFFER, 0);
-	}
+	glDisableVertexAttribArray(mask_gl.a_pos);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	// 掩码绘制命令在同一 GL 上下文中排在场景渲染之前,
@@ -943,6 +930,15 @@ void rounded_cache_destroy(struct rounded_cache *rc) {
 	free(rc);
 }
 
+// 在 toplevel 所在输出上调度一帧: 缓存失效本身不必然损坏场景,
+// 重绘后的发布才会损坏输出, 所以这里主动推一帧.
+static void rounded_schedule_frame(struct toplevel *tl) {
+	struct wlr_output *output = toplevel_output(tl->server, tl);
+	if (output != NULL) {
+		wlr_output_schedule_frame(output);
+	}
+}
+
 void rounded_cache_dirty(struct toplevel *tl) {
 	if (tl->rounded == NULL) {
 		return;
@@ -954,10 +950,7 @@ void rounded_cache_dirty(struct toplevel *tl) {
 	// configure ack 也不带 damage. 那样就不会有帧被调度, rounded_render_all 永远不会
 	// 重绘 FBO, 边框 (宽度/颜色依赖全屏状态) 会保持旧样.
 	// 像 rounded_cache_dirty_mask 一样调度一帧.
-	struct wlr_output *output = toplevel_output(tl->server, tl);
-	if (output != NULL) {
-		wlr_output_schedule_frame(output);
-	}
+	rounded_schedule_frame(tl);
 }
 
 // 仅内容失效: 附带了 damage 的 surface 提交
@@ -975,10 +968,7 @@ void rounded_cache_dirty_mask(struct toplevel *tl) {
 		return;
 	}
 	tl->rounded->mask_dirty = true;
-	struct wlr_output *output = toplevel_output(tl->server, tl);
-	if (output != NULL) {
-		wlr_output_schedule_frame(output);
-	}
+	rounded_schedule_frame(tl);
 }
 
 // 主 surface 提交: 收集本次提交的 damage 供局部重绘.
@@ -1255,506 +1245,6 @@ static void rounded_publish(struct rounded_cache *rc,
 	rounded_sync_node(rc, box);
 }
 
-// --- macOS genie 网格形变 (rounded_warp_*) ---
-//
-// 把窗口内容贴到一张网格上, 每帧按调用方给的三角形网格 (顶点做梯形/漏斗形变)
-// 重绘到一张离屏 buffer, 再作为单个 wlr_scene_buffer 显示. 内容来源有两种:
-// 最大化/全屏的等待阶段先快照旧内容 (掩码已烘焙), 客户端重排后切到实时内容纹理
-// content_tex (掩码在片元着色器里重做); 最小化/还原一开始就用实时纹理.
-// 与把窗口切成 N 条横条相比: 边缘是真正的斜线 (只有网格密度决定的多边形感,
-// 没有横条宽度突变造成的阶梯), 而且只有一次 draw call.
-//
-// 离屏 buffer 覆盖整段动画的包围盒, 尺寸在动画期间不变; 每帧只重绘其内容,
-// 通过改变场景节点的 src_box/dest_size (紧包围盒) 触发 damage -
-// 场景缓存的纹理直接引用同一块 buffer 显存, 所以重绘后的像素立即可见,
-// 无需重新导入 buffer (wlr_scene_buffer_set_buffer* 会丢弃缓存的纹理).
-
-static const char *rounded_warp_vert_src =
-	"attribute vec2 a_pos;\n"   // 布局坐标 (与 u_origin/u_scale 配合转物理像素)
-	"attribute vec2 a_uv;\n"    // 窗口内容归一化坐标 [0,1]
-	"uniform vec2 u_origin;\n"  // 包围盒左上角 (布局坐标)
-	"uniform float u_scale;\n"  // 输出缩放
-	"uniform vec2 u_buf_size;\n" // 输出 buffer 尺寸 (物理像素)
-	"uniform vec4 u_src;\n"    // 源纹理里的内容区域 (x,y,w,h 归一化)
-	"uniform highp vec2 u_window_size;\n" // 窗口内容尺寸 (物理像素)
-	"varying vec2 v_uv;\n"      // 源纹理里的内容区域坐标
-	"varying vec2 v_win;\n"     // 窗口局部像素坐标, 用于掩码 SDF
-	"void main() {\n"
-	"  v_uv = u_src.xy + a_uv * u_src.zw;\n"
-	"  v_win = a_uv * u_window_size;\n"
-	"  vec2 buf = (a_pos - u_origin) * u_scale;\n"
-	"  vec2 p = buf / u_buf_size;\n"
-	"  gl_Position = vec4(p.x * 2.0 - 1.0, p.y * 2.0 - 1.0, 0.0, 1.0);\n"
-	"}\n";
-
-// 内容已是预乘 alpha. u_live=0 时直接采样快照 (等待阶段的旧内容, 掩码已烘焙);
-// u_live=1 时采样窗口的实时内容纹理 (rounded_cache::content_tex, 由掩码 pass 每帧
-// 更新), 并在着色器里重做圆角/边框掩码 - 这样形变期间内容是活的, 不需要
-// glCopyTexSubImage2D 每帧把 FBO 拷成纹理.
-static const char *rounded_warp_frag_src =
-	"precision mediump float;\n"
-	"varying vec2 v_uv;\n"
-	"varying vec2 v_win;\n"
-	"uniform sampler2D u_tex;\n"
-	"uniform float u_live;\n"
-	"uniform highp vec2 u_window_size;\n"
-	"uniform float u_radius;\n"
-	"uniform float u_border_width;\n"
-	"uniform vec4 u_border_color;\n"
-	"uniform vec4 u_border_top_left;\n"
-	"uniform vec4 u_border_top_mid;\n"
-	"uniform vec4 u_border_top_right;\n"
-	"uniform float u_border_gradient;\n"
-	"void main() {\n"
-	"  vec4 c = texture2D(u_tex, v_uv);\n"
-	"  if (u_live < 0.5) {\n"
-	"    gl_FragColor = c;\n"
-	"    return;\n"
-	"  }\n"
-	"  vec2 p = v_win;\n"
-	"  vec2 b = u_window_size * 0.5;\n"
-	"  vec2 q = abs(p - b) - (b - vec2(u_radius));\n"
-	"  float sd = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - u_radius;\n"
-	"  float aa = 1.0;\n"
-	"  float inner = 1.0 - smoothstep(-aa, aa, sd + u_border_width);\n"
-	"  float border = (1.0 - smoothstep(-aa, aa, sd)) - inner;\n"
-	"  float third = u_window_size.x / 3.0;\n"
-	"  float t1 = smoothstep(third - u_border_gradient, third + u_border_gradient, p.x);\n"
-	"  float t2 = smoothstep(2.0 * third - u_border_gradient, 2.0 * third + u_border_gradient, p.x);\n"
-	"  vec4 top_color = mix(u_border_top_left, u_border_top_mid, t1);\n"
-	"  top_color = mix(top_color, u_border_top_right, t2);\n"
-	"  float vfade = 1.0 - smoothstep(u_border_width, u_border_width + u_border_gradient, p.y);\n"
-	"  vec4 bcolor = mix(u_border_color, top_color, vfade);\n"
-	"  vec3 rgb = c.rgb * inner + bcolor.rgb * bcolor.a * border;\n"
-	"  float a = c.a * inner + bcolor.a * border;\n"
-	"  gl_FragColor = vec4(rgb, a);\n"
-	"}\n";
-
-// 网格程序/VBO 全进程共享 (一个 renderer), 首次使用时编译
-static struct {
-	bool tried;
-	bool ready;
-	GLuint program;
-	GLuint vbo;
-	GLuint ibo;
-	GLint a_pos;
-	GLint a_uv;
-	GLint u_origin;
-	GLint u_scale;
-	GLint u_buf_size;
-	GLint u_src;
-	GLint u_tex;
-	GLint u_live;
-	GLint u_window_size;
-	struct border_uniforms border;
-} warp_gl;
-
-static bool rounded_warp_gl_init(void) {
-	if (warp_gl.tried) {
-		return warp_gl.ready;
-	}
-	warp_gl.tried = true;
-
-	GLuint vert = rounded_compile_shader(GL_VERTEX_SHADER,
-		rounded_warp_vert_src);
-	GLuint frag = rounded_compile_shader(GL_FRAGMENT_SHADER,
-		rounded_warp_frag_src);
-	if (vert == 0 || frag == 0) {
-		if (vert != 0) {
-			glDeleteShader(vert);
-		}
-		if (frag != 0) {
-			glDeleteShader(frag);
-		}
-		return false;
-	}
-	GLuint program = glCreateProgram();
-	glAttachShader(program, vert);
-	glAttachShader(program, frag);
-	glLinkProgram(program);
-	GLint ok = GL_FALSE;
-	glGetProgramiv(program, GL_LINK_STATUS, &ok);
-	glDeleteShader(vert);
-	glDeleteShader(frag);
-	if (!ok) {
-		char log[512];
-		glGetProgramInfoLog(program, sizeof(log), NULL, log);
-		wlr_log(WLR_ERROR, "rounded: warp program link failed: %s", log);
-		glDeleteProgram(program);
-		return false;
-	}
-	warp_gl.program = program;
-	warp_gl.a_pos = glGetAttribLocation(program, "a_pos");
-	warp_gl.a_uv = glGetAttribLocation(program, "a_uv");
-	warp_gl.u_origin = glGetUniformLocation(program, "u_origin");
-	warp_gl.u_scale = glGetUniformLocation(program, "u_scale");
-	warp_gl.u_buf_size = glGetUniformLocation(program, "u_buf_size");
-	warp_gl.u_src = glGetUniformLocation(program, "u_src");
-	warp_gl.u_tex = glGetUniformLocation(program, "u_tex");
-	warp_gl.u_live = glGetUniformLocation(program, "u_live");
-	warp_gl.u_window_size = glGetUniformLocation(program, "u_window_size");
-	warp_gl.border.radius = glGetUniformLocation(program, "u_radius");
-	warp_gl.border.width = glGetUniformLocation(program, "u_border_width");
-	warp_gl.border.color = glGetUniformLocation(program, "u_border_color");
-	warp_gl.border.top_left = glGetUniformLocation(program,
-		"u_border_top_left");
-	warp_gl.border.top_mid = glGetUniformLocation(program,
-		"u_border_top_mid");
-	warp_gl.border.top_right = glGetUniformLocation(program,
-		"u_border_top_right");
-	warp_gl.border.gradient = glGetUniformLocation(program,
-		"u_border_gradient");
-	glGenBuffers(1, &warp_gl.vbo);
-	glGenBuffers(1, &warp_gl.ibo);
-	warp_gl.ready = true;
-	return true;
-}
-
-struct rounded_warp {
-	struct server *server;
-	struct toplevel *tl;
-	struct wlr_scene_buffer *node;
-	struct wlr_buffer *out;  // 我们持有的一帧引用
-	struct wlr_box bounds;   // 布局坐标
-	float scale;
-	int out_w, out_h;        // 物理像素
-	bool live;               // true: 采样实时 content_tex; false: 采样旧快照
-	GLuint src_tex;          // 等待阶段的旧内容快照 (live=false 时用)
-	int src_w, src_h;        // 源尺寸 (物理像素)
-	struct wlr_fbox src_box; // 内容区域 (源局部, 物理像素)
-};
-
-// 把网格的源内容区域指向当前圆角 FBO 的内容区 - 快照纹理与实时 content_tex
-// 的布局相同, 所以快照/实时两种模式共用同一组字段. 调用方需保证 FBO 尺寸与
-// 窗口内容尺寸有效.
-static void rounded_warp_set_source_box(struct rounded_warp *w) {
-	struct rounded_cache *rc = w->tl->rounded;
-	w->src_w = rc->fbo_width;
-	w->src_h = rc->fbo_height;
-	w->src_box = (struct wlr_fbox){
-		.x = rc->shadow_px,
-		.y = rc->shadow_px,
-		.width = rc->window_pw,
-		.height = rc->window_ph,
-	};
-}
-
-// 把窗口当前圆角 FBO 的内容拷进 w->src_tex (必要时按新尺寸重建), 并更新
-// src_w/h/src_box. 调用时 GL 上下文必须已 current. 没有可用源 FBO 时返回 false.
-static bool rounded_warp_copy_src(struct rounded_warp *w) {
-	struct rounded_cache *rc = w->tl->rounded;
-	if (rc == NULL || rc->failed || rc->rounded_buf == NULL ||
-			rc->fbo_width <= 0 || rc->fbo_height <= 0 ||
-			rc->window_pw <= 0 || rc->window_ph <= 0) {
-		return false;
-	}
-	GLuint src_fbo = wlr_gles2_renderer_get_buffer_fbo(w->server->renderer,
-		rc->rounded_buf);
-	if (src_fbo == 0) {
-		return false;
-	}
-	if (w->src_tex == 0) {
-		glGenTextures(1, &w->src_tex);
-		glBindTexture(GL_TEXTURE_2D, w->src_tex);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	} else {
-		glBindTexture(GL_TEXTURE_2D, w->src_tex);
-	}
-	if (rc->fbo_width != w->src_w || rc->fbo_height != w->src_h) {
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rc->fbo_width,
-			rc->fbo_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-	}
-	glBindFramebuffer(GL_FRAMEBUFFER, src_fbo);
-	glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-		rc->fbo_width, rc->fbo_height);
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glBindTexture(GL_TEXTURE_2D, 0);
-	rounded_warp_set_source_box(w);
-	return true;
-}
-
-struct rounded_warp *rounded_warp_begin(struct toplevel *tl,
-		const struct wlr_box *bounds, bool live) {
-	struct rounded_cache *rc = tl->rounded;
-	if (rc == NULL || rc->failed || rc->rounded_buf == NULL ||
-			rc->node == NULL || rc->node->buffer == NULL ||
-			(live && rc->content_tex == 0) ||
-			bounds == NULL || bounds->width <= 0 || bounds->height <= 0 ||
-			rc->window_pw <= 0 || rc->window_ph <= 0 ||
-			rc->fbo_width <= 0 || rc->fbo_height <= 0) {
-		return NULL;
-	}
-	struct server *server = rc->server;
-	if (!wlr_renderer_is_gles2(server->renderer) ||
-			server->layers[LAYER_TOPLEVELS] == NULL) {
-		return NULL;
-	}
-	struct wlr_output *output = toplevel_output(server, tl);
-	float scale = output != NULL ? output->scale : 1.0f;
-	if (scale <= 0.0f) {
-		scale = 1.0f;
-	}
-	int out_w = (int)lroundf((float)bounds->width * scale);
-	int out_h = (int)lroundf((float)bounds->height * scale);
-	if (out_w <= 0 || out_h <= 0) {
-		return NULL;
-	}
-	struct wlr_buffer *out = rounded_alloc_buffer_server(server, out_w, out_h);
-	if (out == NULL) {
-		return NULL;
-	}
-	struct rounded_warp *w = calloc(1, sizeof(*w));
-	if (w == NULL) {
-		wlr_buffer_drop(out);
-		return NULL;
-	}
-	w->server = server;
-	w->tl = tl;
-	w->out = out;
-	w->bounds = *bounds;
-	w->scale = scale;
-	w->out_w = out_w;
-	w->out_h = out_h;
-	w->live = live;
-	if (live) {
-		// 实时模式不用 src_tex; 内容区域直接取当前 FBO
-		rounded_warp_set_source_box(w);
-	}
-	// 非实时: src_w/h/src_box 由 rounded_warp_copy_src() 在分配好 src_tex 后填
-	// (这里不能预设, 否则 copy_src 会以为纹理已分配而跳过 glTexImage2D)
-	w->node = wlr_scene_buffer_create(server->layers[LAYER_TOPLEVELS], out);
-	if (w->node == NULL) {
-		wlr_buffer_drop(out);
-		free(w);
-		return NULL;
-	}
-	w->node->point_accepts_input = rounded_no_input;
-	wlr_scene_buffer_set_filter_mode(w->node, WLR_SCALE_FILTER_BILINEAR);
-	// 先隐藏: 第一次 update 之前 buffer 内容是未初始化的
-	wlr_scene_node_set_enabled(&w->node->node, false);
-
-	struct egl_context_state saved = {0};
-	if (!rounded_begin_gl(server->renderer, &saved)) {
-		wlr_scene_node_destroy(&w->node->node);
-		wlr_buffer_drop(out);
-		free(w);
-		return NULL;
-	}
-	bool ok = rounded_warp_gl_init();
-	if (ok) {
-		// 输出 buffer 必须能作为 GL 渲染目标 (dmabuf), 否则场景只会显示未初始化的内容
-		ok = wlr_gles2_renderer_get_buffer_fbo(server->renderer, out) != 0;
-	}
-	if (ok && !live) {
-		// 等待阶段先快照旧内容 (掩码已烘焙); 客户端重排后再切到实时纹理
-		ok = rounded_warp_copy_src(w);
-	}
-	rounded_end_gl(&saved);
-	if (!ok) {
-		if (w->src_tex != 0) {
-			struct egl_context_state saved2 = {0};
-			if (rounded_begin_gl(server->renderer, &saved2)) {
-				glDeleteTextures(1, &w->src_tex);
-				rounded_end_gl(&saved2);
-			}
-		}
-		wlr_scene_node_destroy(&w->node->node);
-		wlr_buffer_drop(out);
-		free(w);
-		return NULL;
-	}
-
-	wlr_scene_node_raise_to_top(&w->node->node);
-	// 注意: 不在这里禁用窗口树. 调用方把窗口内容设为 0 透明度但保持场景树启用:
-	// 圆角 FBO 的合成依赖它 (wlr_scene_node_for_each_buffer 会跳过被禁用的节点),
-	// 命中测试也依赖它找到窗口.
-	wlr_log(WLR_DEBUG, "rounded: genie warp started for app_id \"%s\" "
-		"(%dx%d layout, %dx%d physical, scale %.2f)",
-		tl->app_id != NULL ? tl->app_id : "?",
-		bounds->width, bounds->height, out_w, out_h, scale);
-	return w;
-}
-
-void rounded_warp_update(struct rounded_warp *w, const float *verts,
-		int vert_count, const uint16_t *indices, int index_count,
-		const struct wlr_box *bbox) {
-	if (w == NULL || verts == NULL || vert_count <= 0 ||
-			indices == NULL || index_count <= 0 || bbox == NULL) {
-		return;
-	}
-	struct rounded_cache *rc = w->tl->rounded;
-	if (rc == NULL) {
-		return;
-	}
-	bool rendered = false;
-	if (wlr_renderer_is_gles2(w->server->renderer) && warp_gl.ready) {
-		struct egl_context_state saved = {0};
-		if (rounded_begin_gl(w->server->renderer, &saved)) {
-			GLuint fbo = wlr_gles2_renderer_get_buffer_fbo(
-				w->server->renderer, w->out);
-			if (fbo != 0) {
-				rendered = true;
-				glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-				glViewport(0, 0, w->out_w, w->out_h);
-				glDisable(GL_DEPTH_TEST);
-				glDisable(GL_BLEND);
-				glDisable(GL_SCISSOR_TEST);
-				glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-				glClear(GL_COLOR_BUFFER_BIT);
-
-				glUseProgram(warp_gl.program);
-				glActiveTexture(GL_TEXTURE0);
-				// live: 采样掩码 pass 每帧更新的实时内容 (掩码在片元里重做);
-				// 否则采样等待阶段烘好了掩码的旧快照
-				glBindTexture(GL_TEXTURE_2D,
-					w->live ? rc->content_tex : w->src_tex);
-				glUniform1i(warp_gl.u_tex, 0);
-				glUniform1f(warp_gl.u_live, w->live ? 1.0f : 0.0f);
-				glUniform2f(warp_gl.u_origin, (float)w->bounds.x,
-					(float)w->bounds.y);
-				glUniform1f(warp_gl.u_scale, w->scale);
-				glUniform2f(warp_gl.u_buf_size, (float)w->out_w,
-					(float)w->out_h);
-				glUniform4f(warp_gl.u_src,
-					w->src_box.x / (float)w->src_w,
-					w->src_box.y / (float)w->src_h,
-					w->src_box.width / (float)w->src_w,
-					w->src_box.height / (float)w->src_h);
-				glUniform2f(warp_gl.u_window_size, (float)rc->window_pw,
-					(float)rc->window_ph);
-				rounded_upload_border_uniforms(&warp_gl.border, w->tl,
-					w->scale);
-
-				glBindBuffer(GL_ARRAY_BUFFER, warp_gl.vbo);
-				glBufferData(GL_ARRAY_BUFFER,
-					(GLsizeiptr)vert_count * 4 * sizeof(float),
-					verts, GL_STREAM_DRAW);
-				glEnableVertexAttribArray(warp_gl.a_pos);
-				glVertexAttribPointer(warp_gl.a_pos, 2, GL_FLOAT,
-					GL_FALSE, 4 * sizeof(float), (void *)0);
-				glEnableVertexAttribArray(warp_gl.a_uv);
-				glVertexAttribPointer(warp_gl.a_uv, 2, GL_FLOAT,
-					GL_FALSE, 4 * sizeof(float),
-					(void *)(2 * sizeof(float)));
-
-				glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, warp_gl.ibo);
-				glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-					(GLsizeiptr)index_count * sizeof(uint16_t),
-					indices, GL_STREAM_DRAW);
-				glDrawElements(GL_TRIANGLES, index_count,
-					GL_UNSIGNED_SHORT, NULL);
-
-				glDisableVertexAttribArray(warp_gl.a_pos);
-				glDisableVertexAttribArray(warp_gl.a_uv);
-				glBindBuffer(GL_ARRAY_BUFFER, 0);
-				glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-				glBindTexture(GL_TEXTURE_2D, 0);
-				glBindFramebuffer(GL_FRAMEBUFFER, 0);
-			}
-			rounded_end_gl(&saved);
-		}
-	}
-	if (!rendered) {
-		// 没有真的重绘就不要显示 (buffer 内容可能是旧的/未初始化的)
-		return;
-	}
-
-	// 用紧包围盒显示输出 buffer 的对应子区域. src_box/dest_size 每帧变化,
-	// 从而产生场景 damage; buffer 本身不变, 场景缓存的纹理直接反映重绘后的 FBO.
-	int bx = bbox->x - w->bounds.x;
-	int by = bbox->y - w->bounds.y;
-	int bw = bbox->width;
-	int bh = bbox->height;
-	if (bx < 0) {
-		bw += bx;
-		bx = 0;
-	}
-	if (by < 0) {
-		bh += by;
-		by = 0;
-	}
-	if (bx + bw > w->bounds.width) {
-		bw = w->bounds.width - bx;
-	}
-	if (by + bh > w->bounds.height) {
-		bh = w->bounds.height - by;
-	}
-	if (bw < 1 || bh < 1) {
-		return;
-	}
-	struct wlr_fbox src = {
-		.x = (float)bx * w->scale,
-		.y = (float)by * w->scale,
-		.width = (float)bw * w->scale,
-		.height = (float)bh * w->scale,
-	};
-	if (src.x + src.width > (float)w->out_w) {
-		src.width = (float)w->out_w - src.x;
-	}
-	if (src.y + src.height > (float)w->out_h) {
-		src.height = (float)w->out_h - src.y;
-	}
-	wlr_scene_node_set_enabled(&w->node->node, true);
-	wlr_scene_buffer_set_source_box(w->node, &src);
-	wlr_scene_buffer_set_dest_size(w->node, bw, bh);
-	wlr_scene_node_set_position(&w->node->node,
-		w->bounds.x + bx, w->bounds.y + by);
-	wlr_scene_node_raise_to_top(&w->node->node);
-}
-
-// 切到实时内容: 客户端已按目标尺寸重排, 之后网格直接采样 content_tex (掩码在
-// 着色器里重做), 不再需要每帧把 FBO 拷成纹理. 同时把内容区域更新到新尺寸.
-void rounded_warp_use_live(struct rounded_warp *w) {
-	if (w == NULL || w->live) {
-		return;
-	}
-	struct rounded_cache *rc = w->tl->rounded;
-	if (rc == NULL || rc->content_tex == 0 ||
-			rc->fbo_width <= 0 || rc->fbo_height <= 0 ||
-			rc->window_pw <= 0 || rc->window_ph <= 0) {
-		return;
-	}
-	rounded_warp_set_source_box(w);
-	w->live = true;
-}
-
-void rounded_warp_end(struct rounded_warp *w) {
-	if (w == NULL) {
-		return;
-	}
-	if (w->node != NULL) {
-		wlr_scene_node_destroy(&w->node->node);
-		w->node = NULL;
-	}
-	if (w->src_tex != 0 && wlr_renderer_is_gles2(w->server->renderer)) {
-		struct egl_context_state saved = {0};
-		if (rounded_begin_gl(w->server->renderer, &saved)) {
-			glDeleteTextures(1, &w->src_tex);
-			rounded_end_gl(&saved);
-		}
-	}
-	if (w->out != NULL) {
-		wlr_buffer_drop(w->out);
-		w->out = NULL;
-	}
-	free(w);
-}
-
-// 圆角 FBO 是否已按 width x height (布局像素) 发布, 且自上次发布后没有
-// 待处理的客户端内容更新. 显示框现由合成器决定 (toplevel_frame_box), 所以
-// 这只保证 FBO 已按目标尺寸重绘且是最新内容; 客户端是否真的在新尺寸下重排,
-// 另由 toplevel_content_at_size 判断. content_dirty 在同帧的 rounded_render_all
-// 之前为真, 所以要求它为假能保证最大化/还原切到实时内容时拿到的是重排后的内容.
-bool rounded_cache_size_ready(struct toplevel *tl, int width, int height) {
-	struct rounded_cache *rc = tl->rounded;
-	return rc != NULL && !rc->failed && rc->node != NULL &&
-		rc->node->buffer != NULL && !rc->content_dirty &&
-		rc->logical_width == width && rc->logical_height == height;
-}
-
 // 快照主 surface 的直接 subsurface 堆叠顺序, 供之后的提交检测
 // place_above/place_below 重排 (它们不带 buffer damage).
 // 顺序在发布时捕获 - 即缓存 FBO 实际反映的状态 - 并在提交时比较.
@@ -1868,10 +1358,6 @@ void rounded_render_all(struct server *server) {
 		// 永远不改变其尺寸, 只做仅掩码重绘
 		float shadow_w = (float)shadow_padding();
 
-		// 几何动画期间窗口由 warp 网格显示, 输出 FBO 不可见: 只更新 content_tex,
-		// 跳过 SDF/阴影绘制, 减轻动画帧里客户端重绘造成的卡顿 (结束时会补一次完整掩码).
-		bool draw_mask = !animate_toplevel_owns_geometry(tl);
-
 		if (!rc->content_dirty && !rc->mask_dirty &&
 				rc->logical_width == box.width &&
 				rc->logical_height == box.height && rc->scale == scale &&
@@ -1897,7 +1383,7 @@ void rounded_render_all(struct server *server) {
 				rc->logical_width == box.width &&
 				rc->logical_height == box.height && rc->scale == scale) {
 			rc->mask_dirty = false;
-			if (!rounded_render_mask(rc, NULL, draw_mask)) {
+			if (!rounded_render_mask(rc, NULL)) {
 				rc->mask_dirty = true;
 				continue;
 			}
@@ -1976,8 +1462,7 @@ void rounded_render_all(struct server *server) {
 		// (并重新发布)
 		rounded_expand_ring(rc);
 
-		if (!rounded_render_mask(rc, partial ? &rc->fbo_damage : NULL,
-				draw_mask)) {
+		if (!rounded_render_mask(rc, partial ? &rc->fbo_damage : NULL)) {
 			wlr_log(WLR_ERROR, "rounded: offscreen render failed");
 			rc->content_dirty = true;
 			rounded_fallback(rc);

@@ -275,11 +275,30 @@ static void fullscreen_box(struct server *server, struct wlr_output *output,
 // 全屏和最大化都必须用客户端 ack 后的状态 (current.fullscreen /
 // current.maximized), 绝不能用 set_fullscreen 立即置位的 tl->fullscreen:
 // 如果显示框在客户端重排前就跳到输出框, 圆角 FBO 会先按目标尺寸重绘但里面
-// 还是旧布局的内容, 动画的门控 (rounded_cache_size_ready) 会误判就绪,
-// 于是边框带着旧内容跑完缩放, 窗口要等动画结束才更新. 最大化用的就是
+// 还是旧布局的内容, 窗口会先显示旧内容再更新. 最大化用的就是
 // current.maximized, 所以从来没有这个问题; 全屏现在与它完全一致.
+// 客户端内容是否已重排到 w x h (最大化落框的等待门控):
+// 必须确认客户端真的把 buffer 重排到了目标尺寸. 只看 window geometry 不够:
+// 客户端可能先设 geometry 再在下一帧才 attach 新 buffer, 那样会用旧内容
+// 画满目标框 (小窗口出现在左上角). surface 尺寸总是 >= geometry, 所以
+// surface >= 目标就涵盖了 geometry == 目标的情形.
+static bool toplevel_content_at_size(struct toplevel *tl, int width, int height) {
+	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
+	if (base == NULL || base->surface == NULL || width <= 0 || height <= 0) {
+		return false;
+	}
+	return base->surface->current.width >= width &&
+		base->surface->current.height >= height;
+}
+
 void toplevel_frame_box(struct server *server, struct toplevel *tl,
 		struct wlr_box *box) {
+	// 最大化等待期间保持浮动框 (原位置 + 旧 geometry): 节点还没落框,
+	// 这样旧 buffer 不会先显示在作区左上角.
+	if (tl->pending_frame) {
+		toplevel_box(tl, box);
+		return;
+	}
 	struct wlr_output *output = toplevel_output(server, tl);
 	if (output != NULL) {
 		if (tl->xdg_toplevel->current.fullscreen) {
@@ -292,28 +311,6 @@ void toplevel_frame_box(struct server *server, struct toplevel *tl,
 		}
 	}
 	toplevel_box(tl, box);
-}
-
-// 客户端内容是否已按 w x h 重排 - 最大化/还原缩放的 "内容就绪" 门控.
-// 守规矩的客户端把 window geometry 设为目标 (最大化的 CSD 窗口也未必要
-// 缩小 geometry, 所以两者都要认):
-//  - geometry 恰好等于目标; 或
-//  - 最大化/全屏下 surface 已覆盖目标尺寸 (Chrome/QQ 只放大 surface 的情形).
-// FBO 尺寸不再是可靠信号 (显示框现在由合成器决定, 会在客户端重排前就位).
-bool toplevel_content_at_size(struct toplevel *tl, int width, int height) {
-	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
-	if (base == NULL || base->surface == NULL || width <= 0 || height <= 0) {
-		return false;
-	}
-	if (base->geometry.width == width && base->geometry.height == height) {
-		return true;
-	}
-	if ((tl->xdg_toplevel->current.maximized || tl->fullscreen) &&
-			base->surface->current.width >= width &&
-			base->surface->current.height >= height) {
-		return true;
-	}
-	return false;
 }
 
 // layer-shell 独占区变化后, 把现在落在状态栏下的已有窗口移回作区
@@ -344,6 +341,11 @@ void arrange_toplevels_work_area(struct server *server,
 			// 把最大化窗口重新适配到 (可能已缩小的) 作区
 			struct wlr_box mbox;
 			maximized_box(server, output, &mbox);
+			if (tl->pending_frame) {
+				// 还没落框: 只更新等待中的目标, 节点仍停在原位
+				tl->pending_frame_box = mbox;
+				continue;
+			}
 			if (box.x != mbox.x || box.y != mbox.y ||
 					box.width != mbox.width || box.height != mbox.height) {
 				wlr_xdg_toplevel_set_size(tl->xdg_toplevel, mbox.width,
@@ -499,19 +501,51 @@ void close_toplevel(struct toplevel *tl) {
 	wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
 }
 
+// 把保存的浮动/全屏框应用回窗口: 位置先经 restore_box_position 校正
+// (完全出屏时拉回, 新出现的状态栏不遮挡), 再重新声明尺寸并移动场景节点.
+static void apply_saved_box(struct server *server, struct toplevel *tl,
+		const struct wlr_box *box) {
+	tl->pending_frame = false; // 还原/退出全屏: 取消未完成的最大化落框
+	int x = box->x;
+	int y = box->y;
+	restore_box_position(server, box, &x, &y);
+	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box->width, box->height);
+	wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+}
+
+// 把窗口适配到其输出上的最大化框 (作区). 窗口没有输出时返回 false,
+// 调用方自行决定是否退回 "0x0 让客户端重新自选尺寸".
+static bool apply_maximized_box(struct server *server, struct toplevel *tl) {
+	struct wlr_output *output = toplevel_output(server, tl);
+	if (output == NULL) {
+		return false;
+	}
+	struct wlr_box box;
+	maximized_box(server, output, &box);
+	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box.width, box.height);
+	if (toplevel_content_at_size(tl, box.width, box.height)) {
+		// 内容已是目标尺寸 (如已最大化重新适配): 直接落框
+		wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
+		tl->pending_frame = false;
+	} else {
+		// 客户端还没重排: 节点停在原位, 等提交到目标尺寸再落框,
+		// 否则旧的小 buffer 会先显示在作区左上角 (wezterm 提交慢时可见)
+		tl->pending_frame = true;
+		tl->pending_frame_box = box;
+	}
+	return true;
+}
+
 void set_fullscreen(struct server *server, struct toplevel *tl,
 		bool fullscreen) {
 	if (tl->closing || tl->xdg_toplevel->base == NULL ||
 			tl->xdg_toplevel->current.fullscreen == fullscreen) {
 		return;
 	}
-	if (animate_toplevel_owns_geometry(tl)) {
-		// 最大化/还原缩放正在运行: 让全屏干净地接管, 而不是与运行中的缩放相互干扰
-		animate_toplevel_abort_geometry(tl);
-	}
 	tl->user_moved = true; // 全屏状态: 停止自动居中
+	tl->pending_frame = false; // 先取消未完成的落框; 进入全屏时下面重新设置
 	// 当前显示框必须在改动 tl->fullscreen 之前取 (toplevel_frame_box 依赖它),
-	// 缩小/放大动画的 from 框就是它.
+	// 进入全屏时用它记住还原框.
 	struct wlr_box from_box;
 	toplevel_frame_box(server, tl, &from_box);
 	if (fullscreen) {
@@ -530,12 +564,14 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 			fullscreen_box(server, output, &fbox);
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, fbox.width,
 				fbox.height);
-			// Windows 式缩放进入全屏框 (animate.c): 先继续显示浮动窗口,
-			// 直到客户端提交全屏内容, 再放大. 缩放无法运行时退回瞬时跳变.
-			struct wlr_box to_box = { fbox.x, fbox.y, fbox.width, fbox.height };
-			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
+			// 客户端重排到全屏尺寸前不移动节点: 否则旧的小 buffer 会先
+			// 显示在输出左上角. 与最大化一样等内容就绪再落框.
+			if (toplevel_content_at_size(tl, fbox.width, fbox.height)) {
 				wlr_scene_node_set_position(&tl->scene_tree->node, fbox.x,
 					fbox.y);
+			} else {
+				tl->pending_frame = true;
+				tl->pending_frame_box = fbox;
 			}
 		} else {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
@@ -543,22 +579,8 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 	} else {
 		if (tl->has_fullscreen_restore_box &&
 				tl->fullscreen_restore_box.width > 0) {
-			int x = tl->fullscreen_restore_box.x;
-			int y = tl->fullscreen_restore_box.y;
 			// 精确回到原位; 期间出现的状态栏是唯一可能移动它的东西
-			// (restore_box_position)
-			restore_box_position(server, &tl->fullscreen_restore_box,
-				&x, &y);
-			wlr_xdg_toplevel_set_size(tl->xdg_toplevel,
-				tl->fullscreen_restore_box.width,
-				tl->fullscreen_restore_box.height);
-			// Windows 式缩放回浮动框 (animate.c), 与最大化还原对称:
-			// 在客户端提交还原后的内容前保持全屏窗口在屏, 再缩小到位
-			struct wlr_box to_box = { x, y, tl->fullscreen_restore_box.width,
-				tl->fullscreen_restore_box.height };
-			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
-				wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
-			}
+			apply_saved_box(server, tl, &tl->fullscreen_restore_box);
 		}
 	}
 	wlr_xdg_toplevel_set_fullscreen(tl->xdg_toplevel, fullscreen);
@@ -577,11 +599,8 @@ void set_maximized(struct server *server, struct toplevel *tl,
 	if (tl->closing || tl->xdg_toplevel->base == NULL) {
 		return;
 	}
-	if (animate_toplevel_owns_geometry(tl)) {
-		// 正在进行的最大化/还原缩放拥有场景节点: 让新的最大化/还原请求
-		// 干净地替换它, 而不是与运行中的缩放相互干扰
-		// (快速切换, 或客户端在首个 configure ack 前重复声明 set_maximized)
-		animate_toplevel_abort_geometry(tl);
+	if (!maximized) {
+		tl->pending_frame = false; // 还原: 取消未完成的最大化落框
 	}
 	if (tl->fullscreen) {
 		// 全屏期间不可最大化/还原; 只有离开全屏才回到之前的状态
@@ -597,14 +616,7 @@ void set_maximized(struct server *server, struct toplevel *tl,
 		// (如客户端拖动一个从未还原的最大化窗口), 而客户端自己的最大化按钮
 		// 会发送 set_maximized, 否则就是静默空操作 - 窗口会卡住.
 		// 重新声明该框能让最大化请求总有响应.
-		struct wlr_output *output = toplevel_output(server, tl);
-		if (output != NULL) {
-			struct wlr_box box;
-			maximized_box(server, output, &box);
-			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box.width,
-				box.height);
-			wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
-		}
+		apply_maximized_box(server, tl);
 		return;
 	}
 	if (tl->xdg_toplevel->current.maximized == maximized) {
@@ -631,44 +643,16 @@ void set_maximized(struct server *server, struct toplevel *tl,
 			}
 		}
 
-		struct wlr_output *output = toplevel_output(server, tl);
-		if (output != NULL) {
-			struct wlr_box box;
-			maximized_box(server, output, &box);
-			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box.width,
-				box.height);
-			// Windows 式缩放进入最大化框 (animate.c): 先继续显示浮动窗口,
-			// 直到客户端提交最大化内容, 再放大. 缩放无法运行时退回瞬时跳变.
-			struct wlr_box from_box;
-			toplevel_frame_box(server, tl, &from_box);
-			struct wlr_box to_box = { box.x, box.y, box.width, box.height };
-			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
-				wlr_scene_node_set_position(&tl->scene_tree->node, box.x,
-					box.y);
-			}
-		} else {
+		if (!apply_maximized_box(server, tl)) {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
 		}
 	} else {
 		// 还原到最大化时保存的几何 (位置 + 尺寸), 让客户端自己的还原按钮
 		// 把窗口精确送回原位. 只有从未保存过浮动几何时才退回 0x0.
 		if (tl->has_restore_box && tl->restore_box.width > 0) {
-			int x = tl->restore_box.x;
-			int y = tl->restore_box.y;
-			// 精确还原到保存的位置 (即使半出屏); 只有期间出现的状态栏可能移动它
-			restore_box_position(server, &tl->restore_box, &x, &y);
-
-			wlr_xdg_toplevel_set_size(tl->xdg_toplevel,
-				tl->restore_box.width, tl->restore_box.height);
-			// Windows 式缩放回浮动框 (animate.c):
-			// 在客户端提交还原后的内容前保持最大化窗口在屏, 再缩小到位
-			struct wlr_box from_box;
-			toplevel_frame_box(server, tl, &from_box);
-			struct wlr_box to_box = { x, y, tl->restore_box.width,
-				tl->restore_box.height };
-			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
-				wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
-			}
+			// 精确还原到保存的位置 (即使半出屏); 期间出现的状态栏是唯一
+			// 可能移动它的东西
+			apply_saved_box(server, tl, &tl->restore_box);
 		} else {
 			// 0x0 让客户端重新自选尺寸
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
@@ -681,43 +665,16 @@ void set_maximized(struct server *server, struct toplevel *tl,
 }
 
 // 取消最大化回到之前保存的几何 (拖动最大化窗口的标题栏, 键盘/按钮切换).
-// `animate` 为真时还原播放与最大化相同的 Windows 式缩放 (animate.c),
-// 且调用方之后不得自行移动场景节点 - 缩放会把节点留在还原框.
-// 拖动还原传 false: 指针抓住还原后的窗口并按 motion 定位, 缩放会与抓取冲突.
-void restore_maximized_toplevel(struct toplevel *tl, bool animate) {
+void restore_maximized_toplevel(struct toplevel *tl) {
 	if (tl->closing || tl->xdg_toplevel->base == NULL ||
 			!tl->xdg_toplevel->current.maximized || tl->fullscreen) {
 		return;
 	}
-	if (animate_toplevel_owns_geometry(tl)) {
-		// 正在进行的最大化/还原缩放拥有场景节点
-		animate_toplevel_abort_geometry(tl);
-	}
 	tl->user_moved = true; // 拖动还原: 停止自动居中
 	if (tl->has_restore_box && tl->restore_box.width > 0) {
-		int x = tl->restore_box.x;
-		int y = tl->restore_box.y;
-		// 精确还原到保存的位置 (即使半出屏); 只有期间出现的状态栏可能移动它
-		restore_box_position(tl->server, &tl->restore_box, &x, &y);
-		wlr_xdg_toplevel_set_size(tl->xdg_toplevel, tl->restore_box.width,
-			tl->restore_box.height);
-		if (animate) {
-			// Windows 式缩放回浮动框, 与最大化对称 (animate.c)
-			struct wlr_box from_box;
-			toplevel_frame_box(tl->server, tl, &from_box);
-			struct wlr_box to_box = { x, y, tl->restore_box.width,
-				tl->restore_box.height };
-			if (animate_toplevel_geometry(tl->server, tl, &from_box,
-					&to_box)) {
-				wlr_xdg_toplevel_set_maximized(tl->xdg_toplevel, false);
-				if (tl->fthandle != NULL) {
-					wlr_foreign_toplevel_handle_v1_set_maximized(
-						tl->fthandle, false);
-				}
-				return;
-			}
-		}
-		wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+		// 精确还原到保存的位置 (即使半出屏); 期间出现的状态栏是唯一
+		// 可能移动它的东西
+		apply_saved_box(tl->server, tl, &tl->restore_box);
 	}
 	wlr_xdg_toplevel_set_maximized(tl->xdg_toplevel, false);
 	if (tl->fthandle != NULL) {
@@ -738,18 +695,13 @@ void set_minimized(struct server *server, struct toplevel *tl,
 	if (tl->minimized == minimized) {
 		return;
 	}
-	if (animate_toplevel_owns_geometry(tl)) {
-		// 正在进行的最大化/还原缩放拥有场景节点 (快速切换, 或客户端在首个
-		// configure ack 前重复声明 set_maximized): 让新请求替换它
-		animate_toplevel_abort_geometry(tl);
-	}
 	tl->minimized = minimized;
 	if (tl->fthandle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_minimized(tl->fthandle, minimized);
 	}
 	if (minimized && server->focused == tl) {
-		// 把键盘/光标焦点交给上一个可见窗口. 窗口在下落期间保持场景节点可见
-		// (animate.c), 但它已被标记为最小化, 所以没有东西会再聚焦它;
+		// 把键盘/光标焦点交给上一个可见窗口. 窗口已被标记为最小化,
+		// 所以没有东西会再聚焦它;
 		// 还原它 (焦点循环、foreign-toplevel 激活) 会把它放回原位.
 		struct toplevel *prev = neighbor_toplevel(server, tl, false, false);
 		server->focused = NULL;
@@ -769,15 +721,8 @@ void set_minimized(struct server *server, struct toplevel *tl,
 			}
 		}
 	}
-	if (minimized) {
-		// 动画下落; 没有动画时直接隐藏节点
-		// (窗口保持位置, 所以还原会把它精确放回原位)
-		if (!animate_toplevel_minimize(server, tl)) {
-			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
-		}
-	} else if (!animate_toplevel_restore(server, tl)) {
-		wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
-	}
+	// 直接隐藏/显示节点 (窗口保持位置, 所以还原会把它精确放回原位)
+	wlr_scene_node_set_enabled(&tl->scene_tree->node, !minimized);
 	// 隐藏窗口可能让光标下露出不同的 surface
 	update_cursor_style(server);
 }
@@ -1059,15 +1004,11 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	toplevel_sync_taskbar(server, tl);
 	// 处理首个提交前到达的全屏/最大化请求 (此时 surface 已初始化并映射)
 	if (tl->xdg_toplevel->requested.fullscreen) {
-		// 初始状态, 不是用户全屏动作: 瞬时应用
-		tl->skip_geom = true;
+		// 初始状态, 不是用户全屏动作
 		set_fullscreen(server, tl, true);
-		tl->skip_geom = false;
 	} else if (tl->xdg_toplevel->requested.maximized) {
-		// 初始状态, 不是用户最大化动作: 瞬时应用
-		tl->skip_geom = true;
+		// 初始状态, 不是用户最大化动作
 		set_maximized(server, tl, true);
-		tl->skip_geom = false;
 	}
 	focus_toplevel(server, tl);
 	update_toplevel_output(server, tl);
@@ -1276,6 +1217,15 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 	}
 	// 几何 (以及光标下的 resize/标题区) 可能变化; 圆角 FBO 缓存必须跟随任何
 	// 内容/几何变化. 提交附带的 damage 会被收集用于局部重绘 (rounded.c).
+	// 最大化/全屏: 客户端内容重排到目标尺寸后才把节点落到目标框 (见
+	// apply_maximized_box); 等待期间节点停在原位, 旧 buffer 不会跳到左上角.
+	if (tl->pending_frame && base != NULL &&
+			toplevel_content_at_size(tl, tl->pending_frame_box.width,
+				tl->pending_frame_box.height)) {
+		wlr_scene_node_set_position(&tl->scene_tree->node,
+			tl->pending_frame_box.x, tl->pending_frame_box.y);
+		tl->pending_frame = false;
+	}
 	rounded_cache_content_commit(tl);
 	update_cursor_style(tl->server);
 }

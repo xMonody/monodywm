@@ -185,15 +185,15 @@ struct toplevel {
 	bool closing;
 	bool positioned; // 初始位置已分配
 
-	// 每窗口动画状态 (animate.c): 映射淡入、最小化/还原垂直掉落、
-	// 关闭淡出、最大化/还原缩放. 窗口从未动画过时为 NULL;
+	// 每窗口动画状态 (animate.c): 映射淡入、关闭淡出. 窗口从未动画过时为 NULL;
 	// 窗口场景树销毁时释放该状态.
 	struct toplevel_anim *anim;
 
-	// map 处理器应用客户端初始状态 (应用启动即最大化) 期间置位:
-	// animate_toplevel_geometry 读取并清除它, 使首次最大化瞬时完成,
-	// 只有之后用户触发的最大化/还原才播放缩放
-	bool skip_geom;
+	// 最大化/全屏落框等待: 已发送目标尺寸 configure, 但客户端还没重排到位.
+	// 期间场景节点停在原位, 免得旧的小 buffer 先被画到作区/输出左上角
+	// (提交较慢的客户端可见); 客户端提交到目标尺寸后再落框.
+	bool pending_frame;
+	struct wlr_box pending_frame_box;
 
 	// 自动居中 (place.c): 新窗口在 surface 尺寸变化时重新居中,
 	// 直到用户与之交互 (移动/缩放/最大化/全屏会置 user_moved 并停止).
@@ -522,7 +522,6 @@ struct toplevel *toplevel_ipc_owner(struct toplevel *tl);
 void toplevel_box(struct toplevel *tl, struct wlr_box *box);
 void toplevel_frame_box(struct server *server, struct toplevel *tl,
 	struct wlr_box *box);
-bool toplevel_content_at_size(struct toplevel *tl, int width, int height);
 struct wlr_output *toplevel_output(struct server *server,
 	struct toplevel *tl);
 struct toplevel *neighbor_toplevel(struct server *server,
@@ -533,7 +532,7 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 	bool fullscreen);
 void set_maximized(struct server *server, struct toplevel *tl,
 	bool maximized);
-void restore_maximized_toplevel(struct toplevel *tl, bool animate);
+void restore_maximized_toplevel(struct toplevel *tl);
 void set_minimized(struct server *server, struct toplevel *tl,
 	bool minimized);
 void focus_toplevel(struct server *server, struct toplevel *tl);
@@ -564,28 +563,6 @@ void rounded_cache_hide_content(struct toplevel *tl);
 // (原始客户端内容以透明度 0 隐藏), 所以动画作用于该节点;
 // 在首次 FBO 发布之前 / 关闭圆角时, 改为淡出窗口树下的每个场景 buffer
 void rounded_window_set_opacity(struct toplevel *tl, float opacity);
-// 最大化/还原等待阶段的支持 (animate.c): 目标尺寸内容是否已就绪
-bool rounded_cache_size_ready(struct toplevel *tl, int width, int height);
-// macOS genie 网格形变支持 (animate.c): 把窗口当前圆角 FBO 的内容快照为纹理,
-// 按调用方给的三角形网格重绘到一张离屏 buffer, 再作为单个场景节点显示 -
-// 左右边缘是真正的斜线, 没有横条切片法在宽高变化处的阶梯与接缝.
-struct rounded_warp;
-// bounds 是布局坐标里覆盖整段动画的包围盒 (所有网格顶点都必须落在其中).
-// live 为 true 时网格直接采样实时内容纹理 (最小化/还原); 为 false 时先快照旧内容,
-// 等客户端重排后再调 rounded_warp_use_live (最大化/全屏).
-// 失败 (无 GL/FBO) 返回 NULL, 调用方退回整体缩放.
-struct rounded_warp *rounded_warp_begin(struct toplevel *tl,
-	const struct wlr_box *bounds, bool live);
-// verts 为交错数组 [x, y, u, v]: x,y 为布局坐标; u,v 为窗口内容纹理的
-// 归一化坐标 [0,1] (u 沿宽, v 沿高). indices 为三角形索引.
-// bbox 为网格在布局坐标里的紧包围盒 (用来摆放节点并触发场景 damage).
-void rounded_warp_update(struct rounded_warp *w, const float *verts,
-	int vert_count, const uint16_t *indices, int index_count,
-	const struct wlr_box *bbox);
-// 从快照切到实时内容 (客户端已按目标尺寸重排): 网格改为直接采样 content_tex,
-// 掩码在着色器里重做, 不再需要每帧 glCopyTexSubImage2D.
-void rounded_warp_use_live(struct rounded_warp *w);
-void rounded_warp_end(struct rounded_warp *w);
 void rounded_render_all(struct server *server);
 
 // ---- border.c: 窗口边框宽度与依赖焦点的颜色 ----
@@ -608,35 +585,18 @@ int shadow_padding(void);
 // 尺寸完全由客户端决定, 位置在输出 (屏幕) 上居中
 bool place_toplevel(struct server *server, struct toplevel *tl);
 
-// ---- animate.c: 窗口动画 ----
+// ---- animate.c: 窗口动画 (仅淡入淡出) ----
 //
 // 每个入口在启动了动画时返回 true. 返回 false 时调用方必须瞬时应用状态变化
-// (旧的、无动画行为):
+// (无动画行为):
 //
-//   animate_toplevel_minimize: 从当前位置垂直落下直到低于输出下边缘,
-//     然后隐藏场景节点 (调用方已置 tl->minimized 并移走焦点);
-//   animate_toplevel_restore:  隐藏的窗口从自身顶边上方落回, 精确落回原位;
 //   animate_toplevel_fade_in:  新窗口从透明度 0 淡入;
 //   animate_toplevel_close:    淡出, 窗口不可见后再发送 xdg close
 //     (淡出期间返回 true; 调用方不得自行发送 close);
-//   animate_toplevel_cancel:   停止正在运行的动画, 让窗口回到干净的可见/隐藏状态
+//   animate_toplevel_cancel:   停止正在运行的淡变, 让窗口回到干净的可见状态
 //     (窗口在动画结束前 unmaps 时使用).
-bool animate_toplevel_minimize(struct server *server, struct toplevel *tl);
-bool animate_toplevel_restore(struct server *server, struct toplevel *tl);
 bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl);
 bool animate_toplevel_close(struct toplevel *tl);
-// Windows 式最大化/还原缩放. `from` 是窗口当前显示的框, `to` 是目标框;
-// 调用方已发送最终尺寸 configure, 且不得自行移动场景节点 -
-// 缩放会在两个框之间缩放窗口, 并把节点留在 `to` 的原点.
-// 缩放无法运行时返回 false (调用方瞬时应用 `to`).
-bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
-	const struct wlr_box *from, const struct wlr_box *to);
-// 停止正在进行的最大化/还原缩放, 让窗口落在缩放目标上
-// (toplevel.c 在有新的最大化/还原请求替换正在运行的缩放时使用,
-// 如快速切换或客户端在首个 configure ack 前重复声明状态)
-void animate_toplevel_abort_geometry(struct toplevel *tl);
-// 是否有拥有场景节点的几何动画在运行 (最大化/还原缩放、最小化/还原)
-bool animate_toplevel_owns_geometry(struct toplevel *tl);
 void animate_toplevel_cancel(struct toplevel *tl);
 // 把所有运行中的窗口动画推进到给定的 CLOCK_MONOTONIC 时刻;
 // 由每个输出的 frame 处理器在场景渲染前调用 (output.c),

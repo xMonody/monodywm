@@ -457,7 +457,7 @@ static bool keyboard_shortcut(struct server *server,
 				if (server->focused != NULL) {
 					if (server->focused->xdg_toplevel->current.maximized) {
 						// 切换: 还原最大化前保存的尺寸/位置
-						restore_maximized_toplevel(server->focused, true);
+						restore_maximized_toplevel(server->focused);
 					} else {
 						set_maximized(server, server->focused, true);
 					}
