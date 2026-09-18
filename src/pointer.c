@@ -104,22 +104,22 @@ static bool is_double_click(struct server *server, uint32_t button) {
 
 void begin_move(struct server *server, struct toplevel *tl,
 		double ref_x, double ref_y) {
-	if (server->moving) {
+	// tl == NULL 表示没有可移动的窗口: 直接拒绝, 不进入 move 模式
+	// (移动中解引用 tl->scene_tree/tl->xdg_toplevel 会崩溃)
+	if (server->moving || tl == NULL) {
 		return;
 	}
 	// 全屏窗口覆盖整个输出, 无处可去:
 	// 拖动它 (只会把它从全屏剥下来并露出桌面) 永不生效, 用户必须先离开全屏.
 	// 在这里设门控可覆盖所有移动入口 - 左右和弦、标题条拖动和 xdg_toplevel.move -
 	// 所以合成器绝不可能移动全屏窗口.
-	if (tl != NULL && tl->fullscreen) {
+	if (tl->fullscreen) {
 		return;
 	}
 	server->moving = true;
 	server->input_mode = INPUT_MODE_MOVE;
 	server->move_toplevel = tl;
-	if (tl != NULL) {
-		tl->user_moved = true; // 用户移动: 停止自动居中
-	}
+	tl->user_moved = true; // 用户移动: 停止自动居中
 	server->move_ref_x = ref_x;
 	server->move_ref_y = ref_y;
 	server->grab_x = ref_x - tl->scene_tree->node.x;
@@ -137,8 +137,6 @@ void begin_move(struct server *server, struct toplevel *tl,
 }
 
 void end_move(struct server *server) {
-	if (server->moving) {
-	}
 	server->moving = false;
 	server->input_mode = INPUT_MODE_PASSTHROUGH;
 	server->move_deferred_restore = false;

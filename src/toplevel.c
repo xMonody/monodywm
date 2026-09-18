@@ -1308,14 +1308,31 @@ struct popup_unconstrain {
 	struct wl_listener destroy;
 	struct wlr_xdg_popup *popup;
 	struct server *server;
+	struct toplevel_popup *pp; // 反向引用: 释放时清空 pp->unconstrain
+	// 拥有它的 toplevel 的场景树: popup 树是它的子节点, 所以只要本监听器
+	// 还在, 它就一定活着; 提交时用它把约束框换算回 toplevel 本地坐标
+	struct wlr_scene_tree *toplevel_tree;
 };
+
+static void popup_unconstrain_free(struct popup_unconstrain *pu) {
+	if (pu->commit.link.prev != NULL) {
+		wl_list_remove(&pu->commit.link);
+	}
+	if (pu->destroy.link.prev != NULL) {
+		wl_list_remove(&pu->destroy.link);
+	}
+	if (pu->pp != NULL) {
+		pu->pp->unconstrain = NULL;
+	}
+	free(pu);
+}
 
 static void popup_unconstrain_handle_commit(struct wl_listener *listener,
 		void *data) {
 	struct popup_unconstrain *pu = wl_container_of(listener, pu, commit);
 	struct server *server = pu->server;
 	// popup 跟随光标, 所以把它限制进光标所在的输出
-	// (绝不碰拥有它的 toplevel - 它可能已经消失)
+	// (toplevel_tree 只由场景图保活, 不触碰可能已消失的 toplevel 对象)
 	struct wlr_output *output = wlr_output_layout_output_at(
 		server->output_layout, server->cursor->x, server->cursor->y);
 	if (output == NULL) {
@@ -1324,19 +1341,20 @@ static void popup_unconstrain_handle_commit(struct wl_listener *listener,
 	if (output != NULL) {
 		struct wlr_box box;
 		wlr_output_layout_get_box(server->output_layout, output, &box);
+		// 约束框必须是 toplevel 本地坐标 (wlr_xdg_popup_unconstrain_from_box
+		// 的约定), 而 wlr_output_layout_get_box 给的是布局全局坐标:
+		// 减去窗口的场景位置, 否则窗口不在原点时 popup 会被推出屏幕
+		box.x -= pu->toplevel_tree->node.x;
+		box.y -= pu->toplevel_tree->node.y;
 		wlr_xdg_popup_unconstrain_from_box(pu->popup, &box);
 	}
-	wl_list_remove(&pu->commit.link);
-	wl_list_remove(&pu->destroy.link);
-	free(pu);
+	popup_unconstrain_free(pu);
 }
 
 static void popup_unconstrain_handle_destroy(struct wl_listener *listener,
 		void *data) {
 	struct popup_unconstrain *pu = wl_container_of(listener, pu, destroy);
-	wl_list_remove(&pu->commit.link);
-	wl_list_remove(&pu->destroy.link);
-	free(pu);
+	popup_unconstrain_free(pu);
 }
 
 // ------------------------------------------------------------------
@@ -1363,6 +1381,11 @@ static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
 	(void)data;
 	listener_remove_if_attached(&pp->new_popup);
 	listener_remove_if_attached(&pp->destroy);
+	// popup 角色先销毁 (xdg_popup.destroy) 时 base/surface 可能还活着,
+	// 之后的一次 commit 会解引用已释放的 wlr_xdg_popup
+	if (pp->unconstrain != NULL) {
+		popup_unconstrain_free(pp->unconstrain);
+	}
 }
 
 // popup 的场景树销毁 (popup 的 xdg surface 销毁时 wlroots 会销毁它,
@@ -1373,6 +1396,11 @@ static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
 static void xdg_popup_tree_destroy(struct wl_listener *listener, void *data) {
 	struct toplevel_popup *pp = wl_container_of(listener, pp, tree_destroy);
 	(void)data;
+	// 父树 (toplevel) 先销毁而 popup base 还活着时, 约束监听仍挂在
+	// 它的信号上: 先解除反向引用再释放 pp
+	if (pp->unconstrain != NULL) {
+		popup_unconstrain_free(pp->unconstrain);
+	}
 	listener_remove_if_attached(&pp->tree_destroy);
 	listener_remove_if_attached(&pp->new_popup);
 	listener_remove_if_attached(&pp->destroy);
@@ -1394,6 +1422,9 @@ static void xdg_popup_attach(struct toplevel *tl, struct wlr_xdg_popup *popup,
 	if (pu != NULL) {
 		pu->popup = popup;
 		pu->server = tl->server;
+		pu->pp = pp;
+		pu->toplevel_tree = tl->scene_tree;
+		pp->unconstrain = pu;
 		pu->commit.notify = popup_unconstrain_handle_commit;
 		wl_signal_add(&popup->base->surface->events.commit, &pu->commit);
 		pu->destroy.notify = popup_unconstrain_handle_destroy;
@@ -1406,6 +1437,9 @@ static void xdg_popup_attach(struct toplevel *tl, struct wlr_xdg_popup *popup,
 	// 所以我们绝不自行销毁 (那会在信号发射中途释放 wlroots 的监听器).
 	pp->tree = wlr_scene_xdg_surface_create(parent_tree, popup->base);
 	if (pp->tree == NULL) {
+		if (pp->unconstrain != NULL) {
+			popup_unconstrain_free(pp->unconstrain);
+		}
 		free(pp);
 		return;
 	}

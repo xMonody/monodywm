@@ -1366,6 +1366,12 @@ void rounded_render_all(struct server *server) {
 			}
 		}
 
+		// 掩码参数 (边框/阴影/焦点) 变化时必须整幅重绘: 这一次的 damage
+		// 只来自内容提交, 覆盖不到阴影铺开的整个 FBO 边距. 若仍走局部
+		// 路径, 阴影环只会在被内容 damage 触及的那几像素上被更新, 其余
+		// 部分保留旧参数 - 例如失焦后仍残留一圈聚焦阴影.
+		bool mask_changed = rc->mask_dirty;
+
 		// 在合成之前清除脏标记. 如果客户端在我们渲染期间 (在场景采样之后、
 		// 下面发布之前) 又提交了一次, 提交处理器会再次置 dirty=true,
 		// 下一帧重绘 - 更新绝不会被静默丢弃.
@@ -1389,7 +1395,8 @@ void rounded_render_all(struct server *server) {
 		// 只对 damage 区域做局部重绘. 需要 FBO 已按当前尺寸发布
 		// (调整尺寸后的新 buffer 对内容是未初始化的, 必须整幅渲染),
 		// 且矩形数量有界.
-		bool partial = rc->node->buffer == rc->rounded_buf &&
+		bool partial = !mask_changed &&
+			rc->node->buffer == rc->rounded_buf &&
 			!pixman_region32_empty(&rc->fbo_damage) &&
 			pixman_region32_n_rects(&rc->fbo_damage) <=
 				ROUNDED_MAX_DAMAGE_RECTS;

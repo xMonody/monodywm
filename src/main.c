@@ -589,7 +589,7 @@ int main(int argc, char *argv[]) {
 
 	setenv("WAYLAND_DISPLAY", socket, true);
 	// Wayland 套接字已就绪: WM 起来了, 现在启动用户的守护进程
-	// (来自 ~/.config/mywm/run, 外加任何 -s 命令)
+	// (来自 ~/.config/monodywm/run, 外加任何 -s 命令)
 	run_startup_file();
 	if (startup_cmd != NULL) {
 		spawn_command(startup_cmd);

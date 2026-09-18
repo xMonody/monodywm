@@ -215,8 +215,8 @@ Run (from a TTY / with a seat):
 ```
 
 **Autostart** — once the compositor is up (backend started, Wayland socket
-live) it reads the user's startup commands from **`~/.config/mywm/run`**
-(`$XDG_CONFIG_HOME/mywm/run` if set) and launches them one per line through
+live) it reads the user's startup commands from **`~/.config/monodywm/run`**
+(`$XDG_CONFIG_HOME/monodywm/run` if set) and launches them one per line through
 `/bin/sh -c`, so `~`, $VARS, quotes and shell syntax all work. **Every line
 is backgrounded automatically** (an explicit trailing `&` is optional and
 handled without double-`&` errors), blank lines and `#` comments are

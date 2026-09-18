@@ -223,10 +223,175 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	}
 	wl_list_remove(&ls->destroy.link);
 	wl_list_remove(&ls->commit.link);
+	wl_list_remove(&ls->new_popup.link);
 	wl_list_remove(&ls->link);
 	// 独占区消失: 让最大化窗口重新铺开
 	arrange_for_layer_surface(ls);
 	free(ls);
+}
+
+// ------------------------------------------------------------------
+// layer popup (面板/状态栏菜单、工具提示)
+// ------------------------------------------------------------------
+
+// layer-shell 的 xdg popup: 场景树挂在所属 layer surface 的树下面,
+// 所以跟着 layer surface 一起移动/销毁. wlroots 的 scene layer surface
+// 不处理 popup, 必须由合成器建节点并在首次提交时做约束(configure),
+// 否则 waybar 菜单这类 popup 永远不会映射.
+struct layer_popup_unconstrain;
+
+struct layer_popup {
+	struct layer_surface *ls;
+	struct wlr_scene_tree *tree;
+
+	// 首次提交前的约束跟踪; popup 角色销毁/树销毁时也要一并清理,
+	// 否则之后的一次 surface commit 会解引用已释放的 wlr_xdg_popup
+	struct layer_popup_unconstrain *unconstrain;
+
+	struct wl_listener tree_destroy; // 树销毁时释放 lp
+	struct wl_listener new_popup;    // 嵌套 popup (子菜单)
+	struct wl_listener destroy;      // popup 角色销毁: 摘掉上面两个监听器
+};
+
+// 首次提交时把 popup 限制进所属输出. 与 lp 分开分配:
+// tree_destroy 会先释放 lp, 反向引用用于在释放时清空 lp->unconstrain.
+struct layer_popup_unconstrain {
+	struct layer_popup *lp;
+	struct layer_surface *ls;
+	struct wlr_xdg_popup *popup;
+	struct wl_listener commit;
+	struct wl_listener destroy;
+};
+
+// wayland 的 wl_list_remove 会把 link 置空; 对同一监听器重复移除会崩
+static void listener_remove_if_attached(struct wl_listener *listener) {
+	if (listener->link.prev != NULL) {
+		wl_list_remove(&listener->link);
+	}
+}
+
+static void layer_popup_unconstrain_free(struct layer_popup_unconstrain *lu) {
+	listener_remove_if_attached(&lu->commit);
+	listener_remove_if_attached(&lu->destroy);
+	if (lu->lp != NULL) {
+		lu->lp->unconstrain = NULL;
+	}
+	free(lu);
+}
+
+static void layer_popup_unconstrain_apply(
+		struct layer_popup_unconstrain *lu) {
+	struct server *server = lu->ls->server;
+	struct wlr_output *output = lu->ls->layer_surface->output;
+	if (output == NULL) {
+		output = wlr_output_layout_get_center_output(server->output_layout);
+	}
+	if (output != NULL) {
+		struct wlr_box box;
+		wlr_output_layout_get_box(server->output_layout, output, &box);
+		// 约束框是 wlr_xdg_popup_unconstrain_from_box 要求的"toplevel 本地"
+		// 坐标 (layer popup 的基准是所属 layer surface 左上角), 而
+		// wlr_output_layout_get_box 给的是布局全局坐标: 减去 layer surface
+		// 的场景位置, 否则面板不在原点时菜单会被 positioner 推出屏幕
+		box.x -= lu->ls->scene_layer->tree->node.x;
+		box.y -= lu->ls->scene_layer->tree->node.y;
+		wlr_xdg_popup_unconstrain_from_box(lu->popup, &box);
+	}
+	layer_popup_unconstrain_free(lu);
+}
+
+static void layer_popup_unconstrain_commit(struct wl_listener *listener,
+		void *data) {
+	struct layer_popup_unconstrain *lu =
+		wl_container_of(listener, lu, commit);
+	layer_popup_unconstrain_apply(lu);
+}
+
+static void layer_popup_unconstrain_destroy(struct wl_listener *listener,
+		void *data) {
+	struct layer_popup_unconstrain *lu =
+		wl_container_of(listener, lu, destroy);
+	layer_popup_unconstrain_free(lu);
+}
+
+static void layer_popup_tree_destroy(struct wl_listener *listener, void *data) {
+	struct layer_popup *lp = wl_container_of(listener, lp, tree_destroy);
+	// 父树 (layer surface) 先销毁而 popup base 还活着时, 约束监听仍挂在
+	// 它的信号上: 先解除反向引用再释放 lp
+	if (lp->unconstrain != NULL) {
+		layer_popup_unconstrain_free(lp->unconstrain);
+	}
+	listener_remove_if_attached(&lp->tree_destroy);
+	listener_remove_if_attached(&lp->new_popup);
+	listener_remove_if_attached(&lp->destroy);
+	free(lp);
+}
+
+static void layer_popup_destroy(struct wl_listener *listener, void *data) {
+	struct layer_popup *lp = wl_container_of(listener, lp, destroy);
+	listener_remove_if_attached(&lp->new_popup);
+	listener_remove_if_attached(&lp->destroy);
+	// popup 角色先销毁 (xdg_popup.destroy) 时 base/surface 可能还活着,
+	// 之后的一次 commit 会解引用已释放的 wlr_xdg_popup
+	if (lp->unconstrain != NULL) {
+		layer_popup_unconstrain_free(lp->unconstrain);
+	}
+}
+
+static void layer_popup_attach(struct layer_surface *ls,
+		struct wlr_xdg_popup *popup, struct wlr_scene_tree *parent_tree);
+
+static void layer_popup_new_popup(struct wl_listener *listener, void *data) {
+	struct layer_popup *lp = wl_container_of(listener, lp, new_popup);
+	// 嵌套 popup (子菜单) 挂在父 popup 自己的树下面
+	layer_popup_attach(lp->ls, data, lp->tree);
+}
+
+static void layer_popup_attach(struct layer_surface *ls,
+		struct wlr_xdg_popup *popup, struct wlr_scene_tree *parent_tree) {
+	struct layer_popup *lp = calloc(1, sizeof(*lp));
+	if (lp == NULL) {
+		return;
+	}
+	lp->ls = ls;
+
+	struct layer_popup_unconstrain *lu = calloc(1, sizeof(*lu));
+	if (lu != NULL) {
+		lu->lp = lp;
+		lu->ls = ls;
+		lu->popup = popup;
+		lp->unconstrain = lu;
+		lu->commit.notify = layer_popup_unconstrain_commit;
+		wl_signal_add(&popup->base->surface->events.commit, &lu->commit);
+		lu->destroy.notify = layer_popup_unconstrain_destroy;
+		wl_signal_add(&popup->base->events.destroy, &lu->destroy);
+	}
+
+	// wlr_scene_xdg_surface_create 处理 popup surface 及其 subsurface,
+	// 并在每次提交时把树定位到 popup->current.geometry;
+	// 它注册的监听器会在 popup 的 xdg surface 销毁时销毁该树
+	lp->tree = wlr_scene_xdg_surface_create(parent_tree, popup->base);
+	if (lp->tree == NULL) {
+		if (lp->unconstrain != NULL) {
+			layer_popup_unconstrain_free(lp->unconstrain);
+		}
+		free(lp);
+		return;
+	}
+	// 打标签: 命中测试据此知道光标在 popup 上, 合成器边框手势让路
+	xdg_surface_tag(lp->tree, TAG_POPUP, popup);
+
+	lp->tree_destroy.notify = layer_popup_tree_destroy;
+	wl_signal_add(&lp->tree->node.events.destroy, &lp->tree_destroy);
+	lp->new_popup.notify = layer_popup_new_popup;
+	wl_signal_add(&popup->base->events.new_popup, &lp->new_popup);
+	lp->destroy.notify = layer_popup_destroy;
+	wl_signal_add(&popup->events.destroy, &lp->destroy);
+}
+
+static void layer_surface_new_popup(struct wl_listener *listener, void *data) {
+	struct layer_surface *ls = wl_container_of(listener, ls, new_popup);
+	layer_popup_attach(ls, data, ls->scene_layer->tree);
 }
 
 void server_new_layer_surface(struct wl_listener *listener, void *data) {
@@ -257,6 +422,9 @@ void server_new_layer_surface(struct wl_listener *listener, void *data) {
 	wl_signal_add(&layer_surface->events.destroy, &ls->destroy);
 	ls->commit.notify = layer_surface_commit;
 	wl_signal_add(&layer_surface->surface->events.commit, &ls->commit);
+	// 面板菜单/工具提示: 建场景节点并做首次约束, 否则 popup 不会映射
+	ls->new_popup.notify = layer_surface_new_popup;
+	wl_signal_add(&layer_surface->events.new_popup, &ls->new_popup);
 
 	wl_list_insert(server->layer_surfaces.prev, &ls->link);
 

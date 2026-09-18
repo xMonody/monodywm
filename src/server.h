@@ -131,6 +131,9 @@ struct toplevel_popup {
 	struct toplevel *tl;
 	struct wlr_xdg_popup *popup;
 	struct wlr_scene_tree *tree;
+	// 首次提交前的约束跟踪 (定义在 toplevel.c); popup 角色/树先销毁时
+	// 必须一并释放, 否则之后的一次 commit 会解引用已释放的 wlr_xdg_popup
+	struct popup_unconstrain *unconstrain;
 	struct wl_listener tree_destroy;  // 树销毁时释放 pp
 	struct wl_listener commit;
 	struct wl_listener new_popup;
@@ -273,6 +276,9 @@ struct layer_surface {
 
 	struct wl_listener destroy;
 	struct wl_listener commit;
+	// layer-shell 的 xdg popup (面板菜单/工具提示): scene 由 layer.c 处理,
+	// 挂在 ls->scene_layer->tree 下, 随 layer surface 一起销毁
+	struct wl_listener new_popup;
 };
 
 // 顶部标题栏按压臂置的双击动作: 在没有拖动的情况下 (第二次) 点击释放时触发
@@ -635,6 +641,11 @@ struct keyboard {
 	struct wl_listener key;
 	struct wl_listener modifiers;
 	struct wl_listener destroy;
+
+	// 被合成器快捷键消费的按下键码 (evdev, 与 event->keycode 一致):
+	// 其释放也必须吞掉, 客户端绝不能收到没有对应按下的 release
+	uint32_t consumed_keys[16];
+	size_t consumed_key_count;
 };
 
 // ---- input.c: seat、键盘焦点、快捷键 ----

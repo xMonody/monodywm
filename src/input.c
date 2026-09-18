@@ -313,6 +313,34 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	wlr_seat_keyboard_notify_modifiers(server->seat, &keyboard->modifiers);
 }
 
+// 记录被合成器快捷键消费的按下键码; 其释放也必须吞掉
+// (键码用 evdev 原始值, 与 wlr_keyboard_key_event.keycode 一致).
+// 自动重复会再次投递 PRESSED, 已记录的直接跳过.
+static void keyboard_consumed_add(struct keyboard *kb, uint32_t keycode) {
+	for (size_t i = 0; i < kb->consumed_key_count; i++) {
+		if (kb->consumed_keys[i] == keycode) {
+			return;
+		}
+	}
+	if (kb->consumed_key_count >=
+			sizeof(kb->consumed_keys) / sizeof(kb->consumed_keys[0])) {
+		return; // 记录满: 退回旧行为, 释放可能被转发
+	}
+	kb->consumed_keys[kb->consumed_key_count++] = keycode;
+}
+
+// 该释放是否属于之前被消费的按下? 是则移除并返回 true
+static bool keyboard_consumed_remove(struct keyboard *kb, uint32_t keycode) {
+	for (size_t i = 0; i < kb->consumed_key_count; i++) {
+		if (kb->consumed_keys[i] == keycode) {
+			kb->consumed_keys[i] =
+				kb->consumed_keys[--kb->consumed_key_count];
+			return true;
+		}
+	}
+	return false;
+}
+
 // 相对聚焦窗口的下一个/上一个已映射 toplevel, 会绕回链表.
 // 含最小化窗口 (调用方会还原它们); 跳过未映射的 toplevel.
 static struct toplevel *cycle_toplevel(struct server *server, bool next) {
@@ -546,6 +574,13 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	bool handled = false;
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		handled = keyboard_shortcut(server, kb->keyboard, keycode);
+		if (handled) {
+			keyboard_consumed_add(kb, event->keycode);
+		}
+	} else if (keyboard_consumed_remove(kb, event->keycode)) {
+		// 按下被合成器快捷键消费: 释放也必须吞掉, 不能作为孤立 release
+		// 发给客户端 (被消费的键不会到达 IM, 所以这里是 seat 客户端路径)
+		handled = true;
 	}
 	if (ime_keyboard_grabbed(server, kb->keyboard)) {
 		if (!handled) {
