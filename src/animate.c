@@ -331,10 +331,14 @@ static void anim_warp_end(struct toplevel_anim *a, bool restore_tree) {
 		// 恢复自然透明度后重新显示窗口 (最大化的等待阶段曾用它隐藏窗口)
 		rounded_window_set_opacity(tl, 1.0f);
 		wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+		// 动画期间掩码 pass 只更新了 content_tex, 没画输出 FBO: 现在窗口要重新
+		// 显示, 补一次完整掩码重绘, 免得露出一帧陈旧的圆角/边框.
+		rounded_cache_dirty_mask(tl);
 	}
 }
 
-// 开始形变: 快照窗口当前 FBO 并建立网格 buffer. 返回 false 时调用方退回瞬时行为.
+// 开始形变: 建立网格 buffer, 并视 live 决定用旧快照还是实时内容纹理.
+// 返回 false 时调用方退回瞬时行为.
 // 网格顶点永远落在 geom_from/geom_to 的并集里, 所以用它作为离屏 buffer 的包围盒.
 static bool anim_warp_begin(struct toplevel_anim *a) {
 	if (!CONFIG_ANIM_GENIE) {
@@ -356,7 +360,10 @@ static bool anim_warp_begin(struct toplevel_anim *a) {
 	int y1 = (from->y + from->height) > (to->y + to->height) ?
 		(from->y + from->height) : (to->y + to->height);
 	struct wlr_box bounds = { x0, y0, x1 - x0, y1 - y0 };
-	a->warp = rounded_warp_begin(tl, &bounds);
+	// 最小化/还原没有等待阶段, 一开始就用实时内容纹理; 最大化/全屏先快照旧内容,
+	// 等客户端按目标尺寸重排后再切到实时 (见 anim_advance).
+	bool live = a->kind != ANIM_GEOM;
+	a->warp = rounded_warp_begin(tl, &bounds, live);
 	return a->warp != NULL;
 }
 
@@ -477,13 +484,18 @@ static void anim_advance(struct toplevel_anim *a, uint32_t now_ms) {
 	uint32_t elapsed = now_ms - a->start_ms;
 
 	// ANIM_GEOM 等待阶段: 网格已接管并以 p=0 显示旧内容 (与窗口一致).
-	// 直到客户端确实按目标尺寸重排了内容 (toplevel_content_at_size) 才重拍快照
+	// 直到客户端确实按目标尺寸重排了内容 (toplevel_content_at_size) 才切换到实时内容
 	// 并开始缩放 - 这样窗口绝不会在浮动布局和目标布局之间跳变. 圆角 FBO 现在
 	// 按合成器的显示框分配, 客户端重排前就已经是目标尺寸, 所以只看 FBO 尺寸不够.
+	//
+	// 注意 anim_frame_tick 在 rounded_render_all 之前运行: 客户端提交新尺寸的
+	// 那一帧, FBO 还没重绘. 所以超时只能以 "客户端内容是否到目标尺寸" 为准 -
+	// 内容已就绪但 FBO 慢一帧时必须继续等, 否则会在最后时刻放弃缩放、直接
+	// 拍到目标框 (看起来就是卡一下然后突然最大化).
 	if (a->kind == ANIM_GEOM && !a->geom_zooming) {
-		if (rounded_cache_size_ready(tl, a->geom_to.width,
-				a->geom_to.height) &&
-				toplevel_content_at_size(tl, a->geom_to.width,
+		bool content_ok = toplevel_content_at_size(tl, a->geom_to.width,
+			a->geom_to.height);
+		if (content_ok && rounded_cache_size_ready(tl, a->geom_to.width,
 				a->geom_to.height)) {
 			a->geom_zooming = true;
 			a->duration_ms = anim_geom_duration(&a->geom_from,
@@ -493,21 +505,16 @@ static void anim_advance(struct toplevel_anim *a, uint32_t now_ms) {
 				"zooming for app_id \"%s\" (%u ms)",
 				tl->app_id != NULL ? tl->app_id : "?",
 				a->duration_ms);
-			// 目标尺寸内容已就绪: 换掉网格的源快照, 从 from 框开始缩放.
+			// 目标尺寸内容已就绪: 换成实时内容纹理, 从 from 框开始缩放.
 			// 窗口树保持启用但透明 (等待阶段已设), 命中测试继续走原始内容.
-			rounded_warp_resnapshot(a->warp);
+			rounded_warp_use_live(a->warp);
 			rounded_window_set_opacity(tl, 0.0f);
 			anim_apply(a, 0.0f);
 			struct wlr_box sweep;
 			geom_sweep_box(a, &sweep);
 			anim_schedule_frames(tl->server, &sweep);
-		} else if (elapsed >= a->duration_ms) {
+		} else if (!content_ok && elapsed >= a->duration_ms) {
 			// 客户端始终没提交目标尺寸: 放弃缩放并瞬时落在目标几何上
-			wlr_log(WLR_DEBUG, "animate: %s content %dx%d never arrived, "
-				"giving up for app_id \"%s\"",
-				anim_kind_name(a->kind), a->geom_to.width,
-				a->geom_to.height,
-				tl->app_id != NULL ? tl->app_id : "?");
 			anim_stop(a);
 			rounded_cache_dirty(tl);
 		}
@@ -552,21 +559,22 @@ static int anim_watchdog(void *data) {
 		}
 		active = true;
 		if (a->kind == ANIM_GEOM && !a->geom_zooming) {
-			// 纯等待: 场景静止, 所以这里不请求帧;
-			// 就绪检查在由客户端提交驱动的 frame tick 里进行.
-			// 只有超时需要墙钟.
-			if (!(rounded_cache_size_ready(tl, a->geom_to.width,
-					a->geom_to.height) &&
-					toplevel_content_at_size(tl, a->geom_to.width,
-					a->geom_to.height)) &&
+			// 等待阶段: 画面静止, 通常由客户端提交驱动 frame tick.
+			// 只要内容已就绪就主动请求帧: FBO 还差一帧时把重绘推完,
+			// FBO 也就绪时必须再出一帧让 anim_advance 看到并开始缩放 -
+			// 否则发布 FBO 的那一帧之后不再有帧, 动画永远停在等待阶段.
+			bool content_ok = toplevel_content_at_size(tl,
+				a->geom_to.width, a->geom_to.height);
+			if (!content_ok &&
 					mono_ms() - a->start_ms >= a->duration_ms) {
-				wlr_log(WLR_DEBUG, "animate: watchdog: %s content %dx%d "
-					"never arrived for app_id \"%s\"",
-					anim_kind_name(a->kind), a->geom_to.width,
-					a->geom_to.height,
-					tl->app_id != NULL ? tl->app_id : "?");
 				anim_stop(a);
 				rounded_cache_dirty(tl);
+			} else if (content_ok) {
+				struct wlr_output *output =
+					toplevel_output(tl->server, tl);
+				if (output != NULL && output->enabled) {
+					wlr_output_schedule_frame(output);
+				}
 			}
 			continue;
 		}
@@ -768,7 +776,10 @@ bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 	// 画面完全由网格节点显示: 窗口自身内容变透明, 但场景树保持启用 -
 	// 禁用树会让动画期间窗口无法被指针命中 (命中测试走原始客户端内容).
 	// 提升到顶层, 使命中测试与置顶显示的网格一致.
+	// 同步隐藏原始客户端内容: 客户端可能刚提交过, wlroots 在提交时会把
+	// scene_surface 透明度重新置 1, 不等下一帧 rounded_render_all 就会闪一下.
 	rounded_window_set_opacity(tl, 0.0f);
+	rounded_cache_hide_content(tl);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
 	struct wlr_box sweep;
 	geom_sweep_box(a, &sweep);
@@ -820,6 +831,7 @@ bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
 	// 画面完全由网格节点显示: 窗口自身内容透明, 但场景树保持启用,
 	// 这样动画期间窗口仍可被指针命中; 并提升到顶层使命中与网格一致.
 	rounded_window_set_opacity(tl, 0.0f);
+	rounded_cache_hide_content(tl);
 	wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
 	struct wlr_box sweep;
@@ -863,7 +875,7 @@ bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl) {
 // 最大化/还原/全屏的 genie 形变. 调用方已向客户端发送目标尺寸,
 // 且不得自行移动场景节点 (形变期间场景树停在 from 框).
 // 网格先以 from 框显示当前内容, 直到客户端确实按目标尺寸重排了内容
-// (toplevel_content_at_size), 再重拍快照并在两个框之间形变 - 最大化从浮动矩形
+// (toplevel_content_at_size), 再切到实时内容并在两个框之间形变 - 最大化从浮动矩形
 // 放大, 还原缩回浮动矩形. 结束时场景树落到 `to` 的原点.
 bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
 		const struct wlr_box *from, const struct wlr_box *to) {
@@ -912,6 +924,7 @@ bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
 	// 目标尺寸的内容才能在客户端提交后重绘; 命中测试也依赖它找到窗口.
 	// 用 0 透明度隐藏窗口, 画面由网格节点显示. 不会闪目标几何.
 	rounded_window_set_opacity(tl, 0.0f);
+	rounded_cache_hide_content(tl);
 	anim_warp_apply(a, 0.0f);
 	struct wlr_box sweep;
 	geom_sweep_box(a, &sweep);

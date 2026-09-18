@@ -571,18 +571,20 @@ bool rounded_cache_size_ready(struct toplevel *tl, int width, int height);
 // 左右边缘是真正的斜线, 没有横条切片法在宽高变化处的阶梯与接缝.
 struct rounded_warp;
 // bounds 是布局坐标里覆盖整段动画的包围盒 (所有网格顶点都必须落在其中).
+// live 为 true 时网格直接采样实时内容纹理 (最小化/还原); 为 false 时先快照旧内容,
+// 等客户端重排后再调 rounded_warp_use_live (最大化/全屏).
 // 失败 (无 GL/FBO) 返回 NULL, 调用方退回整体缩放.
 struct rounded_warp *rounded_warp_begin(struct toplevel *tl,
-	const struct wlr_box *bounds);
+	const struct wlr_box *bounds, bool live);
 // verts 为交错数组 [x, y, u, v]: x,y 为布局坐标; u,v 为窗口内容纹理的
 // 归一化坐标 [0,1] (u 沿宽, v 沿高). indices 为三角形索引.
 // bbox 为网格在布局坐标里的紧包围盒 (用来摆放节点并触发场景 damage).
 void rounded_warp_update(struct rounded_warp *w, const float *verts,
 	int vert_count, const uint16_t *indices, int index_count,
 	const struct wlr_box *bbox);
-// 重新快照窗口 FBO 的内容 (源尺寸/内容框可能已变). 用于最大化等待阶段:
-// 网格先以旧内容显示, 客户端提交目标尺寸后再换成新内容并开始缩放.
-void rounded_warp_resnapshot(struct rounded_warp *w);
+// 从快照切到实时内容 (客户端已按目标尺寸重排): 网格改为直接采样 content_tex,
+// 掩码在着色器里重做, 不再需要每帧 glCopyTexSubImage2D.
+void rounded_warp_use_live(struct rounded_warp *w);
 void rounded_warp_end(struct rounded_warp *w);
 void rounded_render_all(struct server *server);
 

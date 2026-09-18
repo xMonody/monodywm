@@ -271,11 +271,18 @@ static void fullscreen_box(struct server *server, struct wlr_output *output,
 // QQ/Chrome 自己发起最大化时会先提交 current.maximized 但保留旧 geometry,
 // 随后只把 surface 放大到目标尺寸; 若渲染/动画按 geometry 走, 窗口就会只显示
 // 旧尺寸、还原时先跳到左上角. 用合成器自己的框就没这个问题.
+//
+// 全屏和最大化都必须用客户端 ack 后的状态 (current.fullscreen /
+// current.maximized), 绝不能用 set_fullscreen 立即置位的 tl->fullscreen:
+// 如果显示框在客户端重排前就跳到输出框, 圆角 FBO 会先按目标尺寸重绘但里面
+// 还是旧布局的内容, 动画的门控 (rounded_cache_size_ready) 会误判就绪,
+// 于是边框带着旧内容跑完缩放, 窗口要等动画结束才更新. 最大化用的就是
+// current.maximized, 所以从来没有这个问题; 全屏现在与它完全一致.
 void toplevel_frame_box(struct server *server, struct toplevel *tl,
 		struct wlr_box *box) {
 	struct wlr_output *output = toplevel_output(server, tl);
 	if (output != NULL) {
-		if (tl->fullscreen) {
+		if (tl->xdg_toplevel->current.fullscreen) {
 			fullscreen_box(server, output, box);
 			return;
 		}
