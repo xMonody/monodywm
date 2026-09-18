@@ -1,10 +1,8 @@
 // pointer.c - 合成器光标交互
 //
-// 无装饰窗口获得合成器拥有的边框:
-//   - 顶部条 (三色标题边框): 长按/拖动移动窗口; 双击某段最小化 (左)、
-//     切换最大化/还原 (中) 或关闭 (右); 按住右键滚轮上/下切换最大化-还原/最小化-还原
-//   - 边缘/角: 缩放
-// 边框内的按压被合成器吞掉, 绝不到达客户端; 客户端自绘装饰的窗口保留其原生控件.
+// 无装饰窗口的合成器边框: 顶部条 (拖动/长按移动, 双击左/中/右 = 最小化/
+// 最大化切换/关闭, 右键+滚轮 = 最大化-还原/最小化-还原), 边缘/角缩放.
+// 边框内的按压被合成器吞掉, 不到达客户端; 客户端自绘装饰保留原生控件.
 
 #include "server.h"
 
@@ -225,12 +223,8 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 	if (tl == NULL) {
 		return;
 	}
-	// 移动来自客户端 (xdg_toplevel.move - 如 QQ 自己的标题栏在普通点击时
-	// 也会发, 而不只是拖动) 的最大化窗口: 延迟还原到真正拖动时,
-	// 这样单纯点击 - 或双击的第一次按下及其几像素手抖 - 绝不会取消最大化
-	// 并把窗口猛拽到别处. 只有这里 (不是 request_move) 才能把点击和拖动区分开,
-	// 且只有光标越过 CONFIG_DRAG_THRESHOLD 后才可以 (标题条区也用同一阈值设门控;
-	// 没有它的话客户端标题栏在第一像素抖动时就会还原, 打乱双击).
+	// 客户端 (如 QQ 标题栏单击) 也会发 xdg_toplevel.move: 只有光标越过拖动
+	// 阈值才还原最大化窗口, 免得单击/双击被误判成拖动
 	if (tl->xdg_toplevel->current.maximized) {
 		double ddx = server->cursor->x - server->move_ref_x;
 		double ddy = server->cursor->y - server->move_ref_y;
@@ -241,13 +235,8 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 			return;
 		}
 		restore_maximized_toplevel(tl); // 拖动: 抓取接管几何
-		// 重新锚定抓取: 把按压点在最大化框内部的偏移按比例映射进还原框,
-		// 光标持续抓住按下时同一个窗口内部位置. 单纯的绝对偏移会让它停在同一个像素,
-		// 在更窄的还原窗口上会向右漂 (例如按在最大化 gvim 居中标题文字上,
-		// 窗口缩小时光标会飘过文字); 按比例映射会落在同一个相对位置 -
-		// 正是居中内容 (标题文字) 所在之处.
-		// 绝不要相对还原后的原点重新锚定: 那会让抓取变负
-		// (按压点通常在它左上方) 并把窗口推开.
+		// 按比例把抓取点从最大化框映射进还原框, 让光标抓住同一个相对位置
+		// (绝不相对于还原后的原点重锚: 那会让抓取变负并把窗口推开)
 		if (server->move_deferred_restore && tl->has_restore_box &&
 				tl->restore_box.width > 0 && server->move_max_w > 0) {
 			server->grab_x = server->grab_x * tl->restore_box.width /
@@ -911,13 +900,9 @@ void end_resize(struct server *server) {
 // 和弦手势
 // ------------------------------------------------------------------
 
-// 按住一个鼠标按钮, 再按另一个:
-//   按住右键 + 双击左键 -> 切换最大化/还原
-//   按住左键 + 双击右键 -> 关闭窗口
-//   按住另一个按钮       -> 移动光标下的窗口
-//                           (光标变为 CONFIG_MOVE_CURSOR; 释放恢复之前的光标样式)
-// 全屏窗口绝不因按住和弦而移动 (它覆盖整个输出; 先离开全屏),
-// 而最大化/还原在全屏时本来就是空操作, 所以那里只有关闭和弦仍适用.
+// 和弦: 按住一个按钮再按另一个
+//   右键 + 双击左键 -> 最大化/还原; 左键 + 双击右键 -> 关闭;
+//   按住另一个按钮   -> 移动光标下的窗口 (全屏窗口不移动)
 
 // 用光标开始移动和弦的窗口; 抓取锚定在触发按钮的按压点
 // (server->press_x/press_y), 所以整个拖动距离都得到尊重;
@@ -1271,6 +1256,21 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 	}
 }
 
+// 重做命中测试并更新指针焦点/光标样式 (窗口被隐藏/销毁后调用,
+// 否则光标要等到下一次 motion 才更新)
+void refresh_pointer_focus(struct server *server) {
+	if (pointer_constraint_active(server)) {
+		// 指针被客户端捕获: 焦点属于它, 只刷新合成器光标样式
+		update_cursor_style(server);
+		return;
+	}
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	uint32_t now_ms = (uint32_t)now.tv_sec * 1000u +
+		(uint32_t)(now.tv_nsec / 1000000u);
+	process_cursor_motion(server, now_ms);
+}
+
 static void process_cursor_button(struct server *server, uint32_t time_msec,
 		uint32_t button, enum wl_pointer_button_state state) {
 	// 客户端持有指针期间 (pointer-constraints 锁定/限定, 如 QEMU 的 Ctrl+Alt+G 抓取),
@@ -1517,14 +1517,8 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	wlr_seat_pointer_notify_button(server->seat, time_msec, button, state);
 }
 
-// 按住右键 + 滚轮手势 (上滚切换最大化/还原, 下滚最小化):
-// 触控板轻扫或高分辨率滚轮一次突发会投递很多 tick, 会把状态切换很多次.
-// 两个阈值决定一个 tick 是同一手势还是下一个动作
-// (只有 CONFIG_WHEEL_DEBOUNCE_ENABLED 为真时才会走到 - 调用方用总开关门控整个手势):
-//   - CONFIG_WHEEL_BURST_NS: 一次连续滚动 (无论多快) 最多算一个动作这么久;
-//     tick 超过突发起点 + 这个值即新动作.
-//   - CONFIG_WHEEL_TICK_GAP_NS: 两个 tick 至少相隔这么远就是下一个动作,
-//     即使仍在突发窗口内.
+// 右键+滚轮手势 (上滚切换最大化/还原, 下滚最小化): 一次滚轮突发只算一个
+// 动作. 两个阈值 (见 CONFIG_WHEEL_*): 突发窗口最长时长, 以及两次 tick 的最小间隔.
 static bool wheel_action_allowed(struct server *server) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1607,13 +1601,9 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 // pointer constraints (锁定/限定) + relative pointer
 // ------------------------------------------------------------------
 
-// 需要捕获鼠标输入的客户端 (QEMU 抓取、游戏 mouselook、远程桌面查看器)
-// 请求 pointer-constraints-v1 把指针锁定/限定到自己的某个 surface.
-// 同一时刻最多一个约束活动 - 当前拥有指针焦点的 surface 上的那个 -
-// 并作用于每个 motion 事件: 限定指针被钳制在约束区域内,
-// 锁定指针则完全不动合成器光标. 两种情况下原始增量仍通过 relative-pointer-v1
-// 到达客户端, 那才是实际驱动客户端自己光标的东西.
-// (pointer-gestures-v1 无关: 它承载触控板捏合/滑动/长按事件, 不是鼠标捕获.)
+// pointer-constraints-v1: 需要捕获鼠标的客户端 (QEMU/游戏/远控) 把指针锁定或
+// 限定到自己的 surface. 同一时刻最多一个活动约束 (指针焦点所在 surface 上的);
+// 原始增量仍经 relative-pointer-v1 送给客户端. (与 pointer-gestures-v1 无关.)
 
 // 每约束记账: 客户端可随时销毁约束, 此时活动指针必须被丢弃
 struct pointer_constraint {

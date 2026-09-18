@@ -1,34 +1,8 @@
 // rounded.c - 离屏圆角合成 (wlroots gles2 + FBO)
 //
-// 每个 toplevel 在离屏 FBO 对里缓存一份圆角化的客户端内容副本:
-//
-//   1. 客户端内容 (xdg surface 加其 subsurface, 不含 popup) 通过普通 wlroots
-//      渲染 pass 合成到第一个 DMA-BUF;
-//   2. 一个 GLES2 片元着色器把该 buffer 经圆角矩形 SDF 掩码重绘到第二个 DMA-BUF.
-//
-// 圆角结果作为 wlr_scene_buffer 显示在客户端内容"下面". 客户端内容本身留在场景里
-// (继续接收输入、frame 回调并处理 popup 堆叠), 但透明度设为零,
-// 所以场景实际只绘制圆角 FBO 副本.
-//
-// FBO 对是缓存: 只有内容被标记为脏 (客户端 commit、subsurface commit、几何变化) 时才重绘.
-// 内容不变时直接复用缓存 buffer, 不做任何重绘.
-//
-// 两项优化让重绘开销与实际变化成正比:
-//
-//   - damage 驱动的局部重绘: 每次 surface commit (主 surface 和 subsurface)
-//     把 buffer damage 收集到每 surface 的区域. 渲染时把累积 damage 映射到 FBO 坐标,
-//     两个 pass 都按它做 scissor, 所以小提交 (输入一个字、光标闪烁) 只重新合成和掩码
-//     变化的像素, 且只把该区域重新发布到场景. 触及边框环的 damage 会扩大,
-//     好让混合了变化内容的环像素也重绘.
-//
-//   - 仅掩码重绘: 边框/阴影参数 (焦点切换) 可以只变参数而不变内容.
-//     此时完全跳过内容 pass, 只对缓存内容重跑 SDF 掩码 pass.
-//     为此 FBO 始终预留最大阴影边距, 焦点切换永远不会改变 buffer 尺寸.
-//
-// 离屏 FBO 尺寸取 xdg 窗口 geometry, 所以客户端自绘装饰在 geometry 之外的
-// (CSD 阴影边距) 会被裁掉; 无装饰窗口 (geometry == surface) 不受影响.
-//
-// 合成结果从不离开 GPU: 本文件任何地方都没有用 glReadPixels.
+// 每个 toplevel 缓存圆角化副本: 客户端内容合成到 buf1, 再用 SDF 掩码着色器重绘到
+// buf2; buf2 显示在客户端内容下面 (内容留在场景收输入/frame, 透明度 0).
+// 只重绘脏区域 (两个 pass 按 damage scissor); FBO 取 window geometry, CSD 阴影被裁掉.
 
 #include "server.h"
 
@@ -53,10 +27,8 @@
 #include <wlr/util/log.h>
 #include <wlr/util/transform.h>
 
-// 全屏四边形顶点着色器. a_pos 在 [0,1], (0,0) 在左上角.
-// y 映射 (clip.y = 2*y - 1) 与 wlroots 的 gles2 渲染器一致:
-// 它以 buffer 第一行在 GL framebuffer 底部的方式渲染, 并用 UV (0,0)
-// 采样 buffer 顶行.
+// 全屏四边形顶点着色器. a_pos 在 [0,1], (0,0) 在左上角;
+// y 映射与 wlroots gles2 渲染器一致 (buffer 首行在 framebuffer 底部).
 static const char *rounded_vert_src =
 	"attribute vec2 a_pos;\n"
 	"varying vec2 v_uv;\n"
@@ -65,15 +37,9 @@ static const char *rounded_vert_src =
 	"  gl_Position = vec4(a_pos.x * 2.0 - 1.0, a_pos.y * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
-// 在采样内容纹理上的圆角矩形 SDF 掩码, 可选地在圆角边缘内侧画边框环.
-// 环的顶部被分成三段 (左/中/右), 各有颜色, 对应标题栏手势区;
-// 其余部分用依赖焦点的基础色.
-//
-// 圆角矩形外侧绘制柔和的高斯投影 (仅当 u_shadow_sigma > 0, 即聚焦窗口).
-// 其颜色与峰值透明度来自 u_shadow_color / u_shadow_alpha, 与边框色无关;
-// 衰减是 SDF 距离上的 exp(-d^2 / 2 sigma^2), 呈现为 scenefx 风格的模糊盒阴影,
-// 而不是生硬的向外渐隐环.
-//
+// 圆角矩形 SDF 掩码, 可选地在圆角内侧画边框环 (顶部三段各一色, 对应标题栏
+// 手势区; 其余用依赖焦点的基础色). 聚焦窗口还在外侧画高斯投影
+// (颜色/峰值透明度来自 u_shadow_color/alpha, 与边框色无关).
 // (着色器内注释保持 ASCII: GLSL ES 1.00 源码字符集是 ASCII.)
 static const char *rounded_frag_src =
 	"precision mediump float;\n"
@@ -389,14 +355,9 @@ static void rounded_release_buffers(struct rounded_cache *rc) {
 	rc->logical_width = rc->logical_height = 0;
 }
 
-// 选取 >= shadow_logical 的最小整数布局边距, 使它与输出缩放的乘积落在物理像素上.
-//
-// 这样 rounded_alloc_buffers() 推出的物理边距 shadow_px 与 rounded_publish()
-// 设的逻辑 dest 尺寸 (width + 2*shadow_i) 一致:
-//   dest_logical * scale == window_pw + 2*shadow_px == fbo 尺寸
-// 于是场景按 1:1 采样 FBO, 分数缩放下不会重采样 (前提是窗口逻辑尺寸 * scale
-// 也是整数 - 这正是 wp_fractional_scale 客户端侧的约定, Wayfire 的
-// scaling-test 也正是挑选 6x6 逻辑 / 10x10 物理这样的尺寸).
+// 选取 >= shadow_logical 的最小整数布局边距, 使它与输出缩放的乘积落在物理像素上,
+// 从而场景能 1:1 采样 FBO (dest_logical*scale == FBO 尺寸), 分数缩放不重采样.
+// (前提: 窗口逻辑尺寸 * scale 也是整数, 即 wp_fractional_scale 客户端的约定.)
 static int rounded_shadow_logical_aligned(float shadow_logical, float scale) {
 	int base = (int)ceilf(shadow_logical);
 	if (scale <= 0.0f) {
@@ -1217,13 +1178,9 @@ static void rounded_expand_ring(struct rounded_cache *rc) {
 	pixman_region32_fini(&expanded);
 }
 
-// 只把 FBO 节点相对窗口树的位置和显示尺寸同步到当前显示框, 不重绘/不重设 buffer.
-// FBO 节点是场景树的子节点, 所以它的位置相对树原点: 用窗口框原点减去树原点来偏移.
-//
-// 缓存命中时也必须调用. 显示框 (toplevel_frame_box) 与窗口树原点不一定一起移动:
-// 最大化/全屏缩放期间树停在 from 框而显示框已是目标框 (作区左上角), 动画结束时
-// 树才落到目标框. 若只在重绘那几帧设置节点位置, 结束帧会带着按旧树原点算出的
-// 相对偏移显示出来 - 窗口会闪到左上角并停住, 直到客户端下一次提交触发重绘才归位.
+// 只把 FBO 节点相对窗口树的位置/尺寸同步到当前显示框, 不重绘. 缓存命中时也要
+// 调: 显示框与树原点不一定一起移动 (最大化/全屏等待期间树停在原位),
+// 不在每帧同步就会用旧相对偏移把窗口画到左上角.
 static void rounded_sync_node(struct rounded_cache *rc,
 		const struct wlr_box *box) {
 	struct toplevel *tl = rc->tl;
@@ -1362,13 +1319,8 @@ void rounded_render_all(struct server *server) {
 				rc->logical_width == box.width &&
 				rc->logical_height == box.height && rc->scale == scale &&
 				rc->shadow_logical == shadow_w) {
-			// 缓存新鲜: wlroots 的 scene_surface 在每次 surface 提交
-			// (surface_reconfigure) 时会把透明度重新应用为 1.0,
-			// 所以场景渲染前再隐藏一次内容. 已发布了有效 FBO,
-			// 所以这绝不会让窗口透明.
-			//
-			// 内容没变但显示框原点可能变了 (最大化缩放结束时窗口树才落到目标框);
-			// 仍然同步节点位置, 否则这一帧会用旧的相对偏移把窗口画到左上角.
+			// 每次 surface 提交会重置透明度, 场景渲染前再隐藏一次;
+			// 内容没变但显示框原点可能变, 仍要同步节点位置
 			rounded_sync_node(rc, &box);
 			rounded_cache_hide_content(tl);
 			continue;

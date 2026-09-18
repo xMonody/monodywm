@@ -185,13 +185,11 @@ struct toplevel {
 	bool closing;
 	bool positioned; // 初始位置已分配
 
-	// 每窗口动画状态 (animate.c): 映射淡入、关闭淡出. 窗口从未动画过时为 NULL;
-	// 窗口场景树销毁时释放该状态.
+	// 每窗口动画状态 (animate.c); 场景树销毁时释放
 	struct toplevel_anim *anim;
 
-	// 最大化/全屏落框等待: 已发送目标尺寸 configure, 但客户端还没重排到位.
-	// 期间场景节点停在原位, 免得旧的小 buffer 先被画到作区/输出左上角
-	// (提交较慢的客户端可见); 客户端提交到目标尺寸后再落框.
+	// 已发目标尺寸 configure 但客户端 buffer 还没到位: 节点停在原位,
+	// 等提交到目标尺寸再落框 (否则旧 buffer 会先闪到作区/输出左上角)
 	bool pending_frame;
 	struct wlr_box pending_frame_box;
 
@@ -586,22 +584,14 @@ int shadow_padding(void);
 bool place_toplevel(struct server *server, struct toplevel *tl);
 
 // ---- animate.c: 窗口动画 (仅淡入淡出) ----
-//
-// 每个入口在启动了动画时返回 true. 返回 false 时调用方必须瞬时应用状态变化
-// (无动画行为):
-//
-//   animate_toplevel_fade_in:  新窗口从透明度 0 淡入;
-//   animate_toplevel_close:    淡出, 窗口不可见后再发送 xdg close
-//     (淡出期间返回 true; 调用方不得自行发送 close);
-//   animate_toplevel_cancel:   停止正在运行的淡变, 让窗口回到干净的可见状态
-//     (窗口在动画结束前 unmaps 时使用).
+// 返回 false 时调用方必须瞬时应用状态变化.
+//   fade_in:  新窗口 0 -> 1
+//   close:    1 -> 0, 不可见后再发 xdg close (期间返回 true, 调用方不要自行 close)
+//   cancel:   窗口提前 unmaps, 停止动画并恢复可见状态
 bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl);
 bool animate_toplevel_close(struct toplevel *tl);
 void animate_toplevel_cancel(struct toplevel *tl);
-// 把所有运行中的窗口动画推进到给定的 CLOCK_MONOTONIC 时刻;
-// 由每个输出的 frame 处理器在场景渲染前调用 (output.c),
-// 这样每个渲染帧显示的都是它自己 vblank 的缓动状态
-// (不存在固定定时器与显示刷新之间的节拍错位; 高刷输出按比例插值出更多状态)
+// 推进所有动画到给定时刻; 由输出 frame 处理器在场景渲染前调用 (output.c)
 void anim_frame_tick(struct server *server, uint32_t now_ms);
 
 // ---- layer.c: wlr-layer-shell + 作区 ----
@@ -685,6 +675,8 @@ void resize_grab_clear(struct server *server);
 // 客户端仍收到 motion 并保留悬停反馈, 只是不能改光标.
 bool pointer_over_frame_zone(struct server *server);
 void update_cursor_style(struct server *server);
+// 重新做一次光标下的命中测试并更新指针焦点/光标样式 (窗口被隐藏/销毁时用)
+void refresh_pointer_focus(struct server *server);
 // 显示聚焦客户端当前想要的光标 (形状、surface 或默认箭头);
 // 合成器光标覆盖结束时使用
 void reapply_client_cursor(struct server *server);

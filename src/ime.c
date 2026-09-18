@@ -450,9 +450,9 @@ static struct wlr_keyboard *ime_find_grab_keyboard(struct server *server,
 
 static void ime_grab_keyboard(struct wl_listener *listener, void *data) {
 	struct ime *ime = wl_container_of(listener, ime, grab_keyboard);
-	struct wlr_input_method_keyboard_grab_v2 *keyboard_grab = data;
 	struct server *server = ime->server;
 	struct wlr_keyboard *keyboard = ime_find_grab_keyboard(server, ime);
+	(void)data;
 	wlr_log(WLR_DEBUG, "ime: grab_keyboard event, grab keyboard=%p "
 		"(seat=%p)", (void *)keyboard,
 		(void *)wlr_seat_get_keyboard(server->seat));
