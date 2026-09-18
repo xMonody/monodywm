@@ -587,9 +587,12 @@ bool place_toplevel(struct server *server, struct toplevel *tl);
 // 返回 false 时调用方必须瞬时应用状态变化.
 //   fade_in:  新窗口 0 -> 1
 //   close:    1 -> 0, 不可见后再发 xdg close (期间返回 true, 调用方不要自行 close)
+//   minimize: 最小化淡出后隐藏节点; restore: 显示节点并淡入
 //   cancel:   窗口提前 unmaps, 停止动画并恢复可见状态
 bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl);
 bool animate_toplevel_close(struct toplevel *tl);
+bool animate_toplevel_minimize(struct server *server, struct toplevel *tl);
+bool animate_toplevel_restore(struct server *server, struct toplevel *tl);
 void animate_toplevel_cancel(struct toplevel *tl);
 // 推进所有动画到给定时刻; 由输出 frame 处理器在场景渲染前调用 (output.c)
 void anim_frame_tick(struct server *server, uint32_t now_ms);

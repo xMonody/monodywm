@@ -26,6 +26,8 @@ enum anim_kind {
 	ANIM_NONE = 0,
 	ANIM_FADE_IN,
 	ANIM_FADE_OUT,
+	ANIM_MINIMIZE, // 淡出后隐藏节点
+	ANIM_RESTORE,  // 最小化还原: 显示节点并淡入
 };
 
 struct toplevel_anim {
@@ -86,6 +88,8 @@ static const char *anim_kind_name(enum anim_kind kind) {
 	switch (kind) {
 	case ANIM_FADE_IN:  return "fade-in";
 	case ANIM_FADE_OUT: return "fade-out";
+	case ANIM_MINIMIZE: return "minimize";
+	case ANIM_RESTORE:  return "restore";
 	default:            return "none";
 	}
 }
@@ -106,6 +110,19 @@ static void anim_finish(struct toplevel_anim *a) {
 	anim_apply(a, 1.0f);
 	switch (kind) {
 	case ANIM_FADE_IN:
+		rounded_window_set_opacity(tl, 1.0f);
+		a->op_cur = 1.0f;
+		break;
+	case ANIM_MINIMIZE:
+		rounded_window_set_opacity(tl, 0.0f);
+		a->op_cur = 0.0f;
+		a->kind = ANIM_NONE;
+		if (tl->scene_tree != NULL && tl->minimized) {
+			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
+			refresh_pointer_focus(tl->server);
+		}
+		return;
+	case ANIM_RESTORE:
 		rounded_window_set_opacity(tl, 1.0f);
 		a->op_cur = 1.0f;
 		break;
@@ -282,7 +299,7 @@ bool animate_toplevel_close(struct toplevel *tl) {
 		return true; // 已在淡出
 	}
 
-	bool interrupting_fade_in = a->kind == ANIM_FADE_IN;
+	bool interrupting = a->kind != ANIM_NONE;
 	struct wlr_box box;
 	toplevel_frame_box(tl->server, tl, &box);
 
@@ -291,8 +308,8 @@ bool animate_toplevel_close(struct toplevel *tl) {
 	a->win_y = box.y;
 	a->win_w = box.width;
 	a->win_h = box.height;
-	// 打断淡入时从当前透明度继续, 避免闪回 100%
-	a->op_from = interrupting_fade_in ? a->op_cur : 1.0f;
+	// 从当前透明度继续, 避免闪回 100%
+	a->op_from = interrupting ? a->op_cur : 1.0f;
 	a->op_to = 0.0f;
 	a->op_cur = a->op_from;
 
@@ -300,6 +317,69 @@ bool animate_toplevel_close(struct toplevel *tl) {
 	struct wlr_box sweep;
 	anim_sweep_box(a, &sweep);
 	anim_schedule_frames(tl->server, &sweep);
+	return true;
+}
+
+// 最小化: 淡出后隐藏节点
+bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
+	if (!CONFIG_ANIM_ENABLE) {
+		return false;
+	}
+	struct toplevel_anim *a = anim_get(tl);
+	if (a == NULL) {
+		return false;
+	}
+	if (tl->scene_tree == NULL || !tl->scene_tree->node.enabled) {
+		return false; // 已经隐藏
+	}
+	bool interrupting = a->kind != ANIM_NONE;
+	struct wlr_box box;
+	toplevel_frame_box(server, tl, &box);
+
+	anim_begin(a, ANIM_MINIMIZE, CONFIG_ANIM_FADE_MS);
+	a->win_x = box.x;
+	a->win_y = box.y;
+	a->win_w = box.width;
+	a->win_h = box.height;
+	a->op_from = interrupting ? a->op_cur : 1.0f;
+	a->op_to = 0.0f;
+	a->op_cur = a->op_from;
+
+	rounded_window_set_opacity(tl, a->op_from);
+	struct wlr_box sweep;
+	anim_sweep_box(a, &sweep);
+	anim_schedule_frames(server, &sweep);
+	return true;
+}
+
+// 从最小化还原: 先显示节点, 再淡入
+bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
+	if (!CONFIG_ANIM_ENABLE) {
+		return false;
+	}
+	struct toplevel_anim *a = anim_get(tl);
+	if (a == NULL || tl->scene_tree == NULL) {
+		return false;
+	}
+	bool interrupting = a->kind != ANIM_NONE;
+	struct wlr_box box;
+	toplevel_frame_box(server, tl, &box);
+
+	// 最小化时节点被禁用: 先显示, 再从当前/零透明度淡入
+	wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+	anim_begin(a, ANIM_RESTORE, CONFIG_ANIM_FADE_MS);
+	a->win_x = box.x;
+	a->win_y = box.y;
+	a->win_w = box.width;
+	a->win_h = box.height;
+	a->op_from = interrupting ? a->op_cur : 0.0f;
+	a->op_to = 1.0f;
+	a->op_cur = a->op_from;
+
+	rounded_window_set_opacity(tl, a->op_from);
+	struct wlr_box sweep;
+	anim_sweep_box(a, &sweep);
+	anim_schedule_frames(server, &sweep);
 	return true;
 }
 

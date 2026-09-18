@@ -682,8 +682,14 @@ void set_minimized(struct server *server, struct toplevel *tl,
 			}
 		}
 	}
-	// 直接隐藏/显示节点 (窗口保持位置, 所以还原会把它精确放回原位)
-	wlr_scene_node_set_enabled(&tl->scene_tree->node, !minimized);
+	// 淡出后隐藏 / 显示后淡入; 动画不可用时直接隐藏/显示节点
+	if (minimized) {
+		if (!animate_toplevel_minimize(server, tl)) {
+			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
+		}
+	} else if (!animate_toplevel_restore(server, tl)) {
+		wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+	}
 	// 隐藏/显示窗口都可能让光标下露出/盖上不同的 surface:
 	// 重做命中测试, 让指针焦点和光标样式立刻跟上
 	refresh_pointer_focus(server);
