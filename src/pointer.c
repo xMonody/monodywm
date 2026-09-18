@@ -992,8 +992,11 @@ static void arm_chord_timer(struct server *server) {
 		CONFIG_DOUBLE_CLICK_NS / 1000000);
 }
 
-// 完全结束一次和弦手势及其启动的所有抓取
-static void end_chord(struct server *server) {
+// 完全结束一次和弦手势及其启动的所有抓取.
+// 注意: 不清空 chord_toplevel - 双击触发路径需要在 end_chord() 之后
+// 继续用 chord_double_click() 读取它. 窗口销毁路径由 toplevel_unfocus()
+// 负责清空, 避免悬空指针.
+void end_chord(struct server *server) {
 	disarm_chord_timer(server);
 	disarm_zone_timer(server);
 	server->moving = false;

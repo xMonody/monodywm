@@ -845,6 +845,12 @@ static void toplevel_unfocus(struct server *server, struct toplevel *tl) {
 			}
 		}
 	}
+	if (server->chord_toplevel == tl) {
+		// 和弦作用的窗口正在销毁: 结束手势并把指针置空,
+		// 否则之后 chord_timer_cb()/process_cursor_motion() 会解引用已释放的窗口
+		end_chord(server);
+		server->chord_toplevel = NULL;
+	}
 	if (server->zone_toplevel == tl || server->move_toplevel == tl) {
 		end_move(server);
 	}

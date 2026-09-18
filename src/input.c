@@ -248,17 +248,35 @@ void seat_request_start_drag(struct wl_listener *listener, void *data) {
 	wlr_seat_start_drag(server->seat, event->drag, event->serial);
 }
 
+static void drag_tree_destroy(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server,
+		drag_tree_destroy);
+	(void)data;
+	wl_list_remove(&server->drag_tree_destroy.link);
+	server->drag_tree = NULL;
+}
+
 void seat_start_drag(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server, seat_start_drag);
 	struct wlr_drag *drag = data;
 	if (drag->icon == NULL) {
 		return;
 	}
+	// 防御性: 若上一个拖拽图标仍未销毁, 先摘掉它的 destroy 监听器,
+	// 避免重复挂接同一个 listener 破坏链表
+	if (server->drag_tree_destroy.link.prev != NULL) {
+		wl_list_remove(&server->drag_tree_destroy.link);
+	}
 	server->drag_tree = wlr_scene_drag_icon_create(
 		server->layers[LAYER_OVERLAY], drag->icon);
 	if (server->drag_tree != NULL) {
 		wlr_scene_node_set_position(&server->drag_tree->node,
 			server->cursor->x, server->cursor->y);
+		// 该场景树会随拖拽图标一起销毁; 监听它, 使 drag_tree 在任何
+		// 销毁路径下都被清空, 否则之后每次指针移动都会写已释放的节点
+		server->drag_tree_destroy.notify = drag_tree_destroy;
+		wl_signal_add(&server->drag_tree->node.events.destroy,
+			&server->drag_tree_destroy);
 	}
 }
 

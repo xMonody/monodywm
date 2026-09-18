@@ -206,6 +206,14 @@ static void ipc_client_handle_input(struct server *server,
 			}
 			client->in_len = 0;
 			i++;
+		} else if (i < len) {
+			// 内层循环因缓冲区满而退出 (行超过 sizeof(client->in)):
+			// 丢弃该行剩余部分直到换行符. 没有这一步 i 不再前进,
+			// 外层 while 会永远自旋 (一条超长无换行的输入即可卡死合成器).
+			while (i < len && data[i] != '\n') {
+				i++;
+			}
+			client->in_len = 0;
 		}
 	}
 }

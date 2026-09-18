@@ -388,6 +388,9 @@ struct server {
 	uint32_t next_window_id;
 
 	struct wlr_scene_tree *drag_tree;
+	// 拖拽图标的场景树被 wlroots 在其图标销毁时一并销毁; 监听它以便
+	// 及时把 drag_tree 置空, 避免指针移动访问已释放的节点
+	struct wl_listener drag_tree_destroy;
 
 	// 指针交互状态
 	struct toplevel *zone_toplevel; // 活动标题栏按压下的 toplevel
@@ -706,6 +709,9 @@ void begin_move(struct server *server, struct toplevel *tl,
 void begin_resize(struct server *server, struct toplevel *tl, uint32_t edges);
 void end_move(struct server *server);
 void end_resize(struct server *server);
+// 结束进行中的和弦手势 (不含 chord_toplevel 的清理; 调用方若持有该窗口
+// 的销毁路径需自行置空, 见 toplevel_unfocus)
+void end_chord(struct server *server);
 // 清空缩放抓取状态但不应用几何 (轮廓模式下最终提交落地时, 以及 toplevel
 // 在抓取中途消失时使用)
 void resize_grab_clear(struct server *server);
