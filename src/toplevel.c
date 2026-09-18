@@ -75,10 +75,9 @@ static struct toplevel *window_ancestor(struct server *server, pid_t pid) {
 	}
 	return NULL;
 }
-
-// 布局坐标下有效的窗口几何框: xdg 窗口 geometry
-// (按 xdg-shell 的窗口边界, 不含 CSD 边距/投影).
-// xdg 场景树锚定在该框的左上角.
+// 客户端上报的 xdg window geometry 框 (按 xdg-shell 的窗口边界, 不含 CSD
+// 边距/投影). xdg 场景树锚定在该框的左上角. 仅用于定位/约束/保存浮动几何 -
+// 渲染、动画、命中一律用 toplevel_frame_box() (见下).
 void toplevel_box(struct toplevel *tl, struct wlr_box *box) {
 	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 	box->x = tl->scene_tree->node.x;
@@ -263,6 +262,53 @@ static void fullscreen_box(struct server *server, struct wlr_output *output,
 	wlr_output_layout_get_box(server->output_layout, output, box);
 }
 
+// 合成器为窗口安排的显示框 (渲染/动画/命中用):
+//  - 最大化 -> 合成器算出的作区矩形 (maximized_box);
+//  - 全屏   -> 整个输出框;
+//  - 浮动   -> 客户端上报的 window geometry (裁掉 CSD 阴影, 阴影由合成器画).
+//
+// 这是标准模型: 布局由合成器决定, 不回读客户端可能过期的 window geometry.
+// QQ/Chrome 自己发起最大化时会先提交 current.maximized 但保留旧 geometry,
+// 随后只把 surface 放大到目标尺寸; 若渲染/动画按 geometry 走, 窗口就会只显示
+// 旧尺寸、还原时先跳到左上角. 用合成器自己的框就没这个问题.
+void toplevel_frame_box(struct server *server, struct toplevel *tl,
+		struct wlr_box *box) {
+	struct wlr_output *output = toplevel_output(server, tl);
+	if (output != NULL) {
+		if (tl->fullscreen) {
+			fullscreen_box(server, output, box);
+			return;
+		}
+		if (tl->xdg_toplevel->current.maximized) {
+			maximized_box(server, output, box);
+			return;
+		}
+	}
+	toplevel_box(tl, box);
+}
+
+// 客户端内容是否已按 w x h 重排 - 最大化/还原缩放的 "内容就绪" 门控.
+// 守规矩的客户端把 window geometry 设为目标 (最大化的 CSD 窗口也未必要
+// 缩小 geometry, 所以两者都要认):
+//  - geometry 恰好等于目标; 或
+//  - 最大化/全屏下 surface 已覆盖目标尺寸 (Chrome/QQ 只放大 surface 的情形).
+// FBO 尺寸不再是可靠信号 (显示框现在由合成器决定, 会在客户端重排前就位).
+bool toplevel_content_at_size(struct toplevel *tl, int width, int height) {
+	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
+	if (base == NULL || base->surface == NULL || width <= 0 || height <= 0) {
+		return false;
+	}
+	if (base->geometry.width == width && base->geometry.height == height) {
+		return true;
+	}
+	if ((tl->xdg_toplevel->current.maximized || tl->fullscreen) &&
+			base->surface->current.width >= width &&
+			base->surface->current.height >= height) {
+		return true;
+	}
+	return false;
+}
+
 // layer-shell 独占区变化后, 把现在落在状态栏下的已有窗口移回作区
 // (状态栏绝不能盖住它们), 并把最大化窗口重新适配到新作区
 void arrange_toplevels_work_area(struct server *server,
@@ -277,6 +323,8 @@ void arrange_toplevels_work_area(struct server *server,
 			// 全屏窗口有意覆盖整个输出 (含状态栏)
 			continue;
 		}
+		// 用客户端上报的 geometry 判断是否偏离作区: 最大化窗口的显示框由
+		// toplevel_frame_box 自动跟踪作区, 不能拿它比较 (那会让重适配永不触发).
 		struct wlr_box box;
 		toplevel_box(tl, &box);
 		if (box.width <= 0 || box.height <= 0) {
@@ -455,15 +503,20 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 		animate_toplevel_abort_geometry(tl);
 	}
 	tl->user_moved = true; // 全屏状态: 停止自动居中
+	// 当前显示框必须在改动 tl->fullscreen 之前取 (toplevel_frame_box 依赖它),
+	// 缩小/放大动画的 from 框就是它.
+	struct wlr_box from_box;
+	toplevel_frame_box(server, tl, &from_box);
+	if (fullscreen) {
+		// 记住全屏前的显示框, 供之后还原. 与 restore_box 分开保存:
+		// 从最大化进入全屏不得覆盖最大化保存的浮动几何.
+		tl->fullscreen_restore_box = from_box;
+		tl->has_fullscreen_restore_box = true;
+	}
 	tl->fullscreen = fullscreen;
 	// 边框宽度/颜色依赖全屏状态
 	rounded_cache_dirty(tl);
 	if (fullscreen) {
-		// 记住全屏前的几何, 供之后还原. 与 restore_box 分开保存:
-		// 从最大化进入全屏不得覆盖最大化保存的浮动几何.
-		toplevel_box(tl, &tl->fullscreen_restore_box);
-		tl->has_fullscreen_restore_box = true;
-
 		struct wlr_output *output = toplevel_output(server, tl);
 		if (output != NULL) {
 			struct wlr_box fbox;
@@ -472,8 +525,6 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 				fbox.height);
 			// Windows 式缩放进入全屏框 (animate.c): 先继续显示浮动窗口,
 			// 直到客户端提交全屏内容, 再放大. 缩放无法运行时退回瞬时跳变.
-			struct wlr_box from_box;
-			toplevel_box(tl, &from_box);
 			struct wlr_box to_box = { fbox.x, fbox.y, fbox.width, fbox.height };
 			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
 				wlr_scene_node_set_position(&tl->scene_tree->node, fbox.x,
@@ -496,8 +547,6 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 				tl->fullscreen_restore_box.height);
 			// Windows 式缩放回浮动框 (animate.c), 与最大化还原对称:
 			// 在客户端提交还原后的内容前保持全屏窗口在屏, 再缩小到位
-			struct wlr_box from_box;
-			toplevel_box(tl, &from_box);
 			struct wlr_box to_box = { x, y, tl->fullscreen_restore_box.width,
 				tl->fullscreen_restore_box.height };
 			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
@@ -584,7 +633,7 @@ void set_maximized(struct server *server, struct toplevel *tl,
 			// Windows 式缩放进入最大化框 (animate.c): 先继续显示浮动窗口,
 			// 直到客户端提交最大化内容, 再放大. 缩放无法运行时退回瞬时跳变.
 			struct wlr_box from_box;
-			toplevel_box(tl, &from_box);
+			toplevel_frame_box(server, tl, &from_box);
 			struct wlr_box to_box = { box.x, box.y, box.width, box.height };
 			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
 				wlr_scene_node_set_position(&tl->scene_tree->node, box.x,
@@ -607,7 +656,7 @@ void set_maximized(struct server *server, struct toplevel *tl,
 			// Windows 式缩放回浮动框 (animate.c):
 			// 在客户端提交还原后的内容前保持最大化窗口在屏, 再缩小到位
 			struct wlr_box from_box;
-			toplevel_box(tl, &from_box);
+			toplevel_frame_box(server, tl, &from_box);
 			struct wlr_box to_box = { x, y, tl->restore_box.width,
 				tl->restore_box.height };
 			if (!animate_toplevel_geometry(server, tl, &from_box, &to_box)) {
@@ -648,7 +697,7 @@ void restore_maximized_toplevel(struct toplevel *tl, bool animate) {
 		if (animate) {
 			// Windows 式缩放回浮动框, 与最大化对称 (animate.c)
 			struct wlr_box from_box;
-			toplevel_box(tl, &from_box);
+			toplevel_frame_box(tl->server, tl, &from_box);
 			struct wlr_box to_box = { x, y, tl->restore_box.width,
 				tl->restore_box.height };
 			if (animate_toplevel_geometry(tl->server, tl, &from_box,

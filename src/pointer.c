@@ -47,7 +47,7 @@ static bool is_in_titlebar_zone(struct server *server, struct toplevel *tl) {
 		return false;
 	}
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 	if (box.width <= 0) {
 		return false;
 	}
@@ -68,7 +68,7 @@ static enum zone_action title_strip_action(struct server *server,
 		return ZONE_CLOSE;
 	}
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 	if (box.width <= 0) {
 		return ZONE_CLOSE;
 	}
@@ -132,7 +132,7 @@ void begin_move(struct server *server, struct toplevel *tl,
 	server->move_max_h = 0;
 	if (tl->xdg_toplevel->current.maximized) {
 		struct wlr_box box;
-		toplevel_box(tl, &box);
+		toplevel_frame_box(server, tl, &box);
 		server->move_max_w = box.width;
 		server->move_max_h = box.height;
 	}
@@ -159,7 +159,7 @@ void end_move(struct server *server) {
 static void clamp_drag_position(struct server *server, struct toplevel *tl,
 		double *x, double *y) {
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 	if (box.width <= 0 || box.height <= 0) {
 		return;
 	}

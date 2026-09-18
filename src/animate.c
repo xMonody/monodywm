@@ -477,10 +477,13 @@ static void anim_advance(struct toplevel_anim *a, uint32_t now_ms) {
 	uint32_t elapsed = now_ms - a->start_ms;
 
 	// ANIM_GEOM 等待阶段: 网格已接管并以 p=0 显示旧内容 (与窗口一致).
-	// 直到圆角缓存持有目标尺寸的内容 (客户端已提交且缓存已重绘) 才重拍快照
-	// 并开始缩放 - 这样窗口绝不会在浮动布局和目标布局之间跳变.
+	// 直到客户端确实按目标尺寸重排了内容 (toplevel_content_at_size) 才重拍快照
+	// 并开始缩放 - 这样窗口绝不会在浮动布局和目标布局之间跳变. 圆角 FBO 现在
+	// 按合成器的显示框分配, 客户端重排前就已经是目标尺寸, 所以只看 FBO 尺寸不够.
 	if (a->kind == ANIM_GEOM && !a->geom_zooming) {
 		if (rounded_cache_size_ready(tl, a->geom_to.width,
+				a->geom_to.height) &&
+				toplevel_content_at_size(tl, a->geom_to.width,
 				a->geom_to.height)) {
 			a->geom_zooming = true;
 			a->duration_ms = anim_geom_duration(&a->geom_from,
@@ -500,6 +503,11 @@ static void anim_advance(struct toplevel_anim *a, uint32_t now_ms) {
 			anim_schedule_frames(tl->server, &sweep);
 		} else if (elapsed >= a->duration_ms) {
 			// 客户端始终没提交目标尺寸: 放弃缩放并瞬时落在目标几何上
+			wlr_log(WLR_DEBUG, "animate: %s content %dx%d never arrived, "
+				"giving up for app_id \"%s\"",
+				anim_kind_name(a->kind), a->geom_to.width,
+				a->geom_to.height,
+				tl->app_id != NULL ? tl->app_id : "?");
 			anim_stop(a);
 			rounded_cache_dirty(tl);
 		}
@@ -547,9 +555,16 @@ static int anim_watchdog(void *data) {
 			// 纯等待: 场景静止, 所以这里不请求帧;
 			// 就绪检查在由客户端提交驱动的 frame tick 里进行.
 			// 只有超时需要墙钟.
-			if (!rounded_cache_size_ready(tl, a->geom_to.width,
+			if (!(rounded_cache_size_ready(tl, a->geom_to.width,
 					a->geom_to.height) &&
+					toplevel_content_at_size(tl, a->geom_to.width,
+					a->geom_to.height)) &&
 					mono_ms() - a->start_ms >= a->duration_ms) {
+				wlr_log(WLR_DEBUG, "animate: watchdog: %s content %dx%d "
+					"never arrived for app_id \"%s\"",
+					anim_kind_name(a->kind), a->geom_to.width,
+					a->geom_to.height,
+					tl->app_id != NULL ? tl->app_id : "?");
 				anim_stop(a);
 				rounded_cache_dirty(tl);
 			}
@@ -716,7 +731,7 @@ bool animate_toplevel_minimize(struct server *server, struct toplevel *tl) {
 		return true;
 	}
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 	if (box.width <= 0 || box.height <= 0) {
 		return false; // 没有可用几何: 调用方瞬时隐藏
 	}
@@ -773,7 +788,7 @@ bool animate_toplevel_restore(struct server *server, struct toplevel *tl) {
 		return true;
 	}
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 	if (box.width <= 0 || box.height <= 0) {
 		return false; // 没有可用几何: 调用方瞬时显示
 	}
@@ -826,7 +841,7 @@ bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl) {
 		return true;
 	}
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 
 	anim_begin(a, ANIM_FADE_IN, CONFIG_ANIM_FADE_MS);
 	a->from_x = a->to_x = box.x;
@@ -847,9 +862,9 @@ bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl) {
 
 // 最大化/还原/全屏的 genie 形变. 调用方已向客户端发送目标尺寸,
 // 且不得自行移动场景节点 (形变期间场景树停在 from 框).
-// 网格先以 from 框显示当前内容, 直到圆角缓存持有目标尺寸的内容,
-// 再重拍快照并在两个框之间形变 - 最大化从浮动矩形放大, 还原缩回浮动矩形.
-// 结束时场景树落到 `to` 的原点.
+// 网格先以 from 框显示当前内容, 直到客户端确实按目标尺寸重排了内容
+// (toplevel_content_at_size), 再重拍快照并在两个框之间形变 - 最大化从浮动矩形
+// 放大, 还原缩回浮动矩形. 结束时场景树落到 `to` 的原点.
 bool animate_toplevel_geometry(struct server *server, struct toplevel *tl,
 		const struct wlr_box *from, const struct wlr_box *to) {
 	if (!CONFIG_ANIM_ENABLE || CONFIG_ANIM_MAXIMIZE_MS <= 0) {
@@ -954,7 +969,7 @@ bool animate_toplevel_close(struct toplevel *tl) {
 
 	bool interrupting_fade_in = a->kind == ANIM_FADE_IN;
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(tl->server, tl, &box);
 
 	anim_begin(a, ANIM_FADE_OUT, CONFIG_ANIM_FADE_MS);
 	a->from_x = a->to_x = box.x;

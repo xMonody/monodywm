@@ -1622,13 +1622,15 @@ void rounded_warp_end(struct rounded_warp *w) {
 	free(w);
 }
 
-// 圆角 FBO 当前是否恰好持有按 width x height (布局像素) 渲染的内容:
-// 最大化/还原缩放用它检测客户端已提交目标尺寸且缓存已按该尺寸重绘,
-// 从而可以在不跳变的情况下开始/继续缩放
+// 圆角 FBO 是否已按 width x height (布局像素) 发布, 且自上次发布后没有
+// 待处理的客户端内容更新. 显示框现由合成器决定 (toplevel_frame_box), 所以
+// 这只保证 FBO 已按目标尺寸重绘且是最新内容; 客户端是否真的在新尺寸下重排,
+// 另由 toplevel_content_at_size 判断. content_dirty 在同帧的 rounded_render_all
+// 之前为真, 所以要求它为假能保证最大化/还原快照拿到的是重排后的内容.
 bool rounded_cache_size_ready(struct toplevel *tl, int width, int height) {
 	struct rounded_cache *rc = tl->rounded;
 	return rc != NULL && !rc->failed && rc->node != NULL &&
-		rc->node->buffer != NULL &&
+		rc->node->buffer != NULL && !rc->content_dirty &&
 		rc->logical_width == width && rc->logical_height == height;
 }
 
@@ -1731,7 +1733,7 @@ void rounded_render_all(struct server *server) {
 		}
 
 		struct wlr_box box;
-		toplevel_box(tl, &box);
+		toplevel_frame_box(server, tl, &box);
 		if (box.width <= 0 || box.height <= 0) {
 			continue;
 		}

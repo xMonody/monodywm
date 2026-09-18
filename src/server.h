@@ -520,6 +520,9 @@ struct toplevel *toplevel_ipc_owner(struct toplevel *tl);
 
 // ---- toplevel.c: xdg-shell 窗口、窗口状态、装饰 ----
 void toplevel_box(struct toplevel *tl, struct wlr_box *box);
+void toplevel_frame_box(struct server *server, struct toplevel *tl,
+	struct wlr_box *box);
+bool toplevel_content_at_size(struct toplevel *tl, int width, int height);
 struct wlr_output *toplevel_output(struct server *server,
 	struct toplevel *tl);
 struct toplevel *neighbor_toplevel(struct server *server,
