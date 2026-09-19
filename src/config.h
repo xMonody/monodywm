@@ -57,11 +57,11 @@
 #define CONFIG_CENTER_AVOID_BARS 0
 
 // 组合键修饰符, 按需组合使用
-#define MODKEY0 (WLR_MODIFIER_ALT)                        // alt (单独按 Alt)
+#define MODKEY0 (WLR_MODIFIER_ALT)                         // alt (单独按 Alt)
 #define MODKEY1 (WLR_MODIFIER_LOGO)                        // win
 #define MODKEY2 (WLR_MODIFIER_SHIFT | WLR_MODIFIER_ALT)    // shift+alt
 #define MODKEY3 (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL)   // shift+ctrl
-#define MODKEY4  (WLR_MODIFIER_ALT    | WLR_MODIFIER_CTRL)  // alt+ctrl
+#define MODKEY4 (WLR_MODIFIER_ALT   | WLR_MODIFIER_CTRL)   // alt+ctrl
 
 // 动作列表
 enum config_action {
@@ -83,24 +83,15 @@ struct config_action_shortcut {
 	xkb_keysym_t key;  // keysyms 见 /usr/include/xkbcommon/xkbcommon-keysyms.h
 };
 
-// MODKEY0(alt) MODKEY1(win) MODKEY2(shift+alt) MODKEY3(shift+ctrl) MODKEY4(ctrl+alt)
 static const struct config_action_shortcut config_action_shortcuts[] = {
-	//{ CONFIG_ACTION_QUIT,        MODKEY1, XKB_KEY_q },       // win+q 退出合成器
-	//{ CONFIG_ACTION_NEXT_WINDOW, MODKEY1, XKB_KEY_n },       // win+n
-	//{ CONFIG_ACTION_PREV_WINDOW, MODKEY1, XKB_KEY_p },       // win+p
-	//{ CONFIG_ACTION_CLOSE,       MODKEY1, XKB_KEY_c },       // win+c
-	//{ CONFIG_ACTION_MINIMIZE,    MODKEY1, XKB_KEY_m },       // win+m
-	//{ CONFIG_ACTION_CLOSE_OTHER, MODKEY1, XKB_KEY_q },       // win+q
-
-	{ CONFIG_ACTION_MAXIMIZE,    MODKEY1, XKB_KEY_Return },  // win+Enter
-	{ CONFIG_ACTION_MAXIMIZE,    MODKEY2, XKB_KEY_Return },  // shift+alt+Enter
-	{ CONFIG_ACTION_MAXIMIZE,    MODKEY4, XKB_KEY_Return },  // ctrl+alt+Enter
+	{ CONFIG_ACTION_MAXIMIZE,    MODKEY1, XKB_KEY_Return },  // alt+Enter 最大化还原
+	{ CONFIG_ACTION_MAXIMIZE,    MODKEY2, XKB_KEY_Return },  // win+Enter 最大化还原
 	{ CONFIG_ACTION_QUIT,        MODKEY3, XKB_KEY_q },       // shift+ctrl+q 退出合成器
-	{ CONFIG_ACTION_NEXT_WINDOW, MODKEY4, XKB_KEY_n },       // ctrl+alt+n
-	{ CONFIG_ACTION_PREV_WINDOW, MODKEY4, XKB_KEY_p },       // ctrl+alt+p
-	{ CONFIG_ACTION_CLOSE,       MODKEY4, XKB_KEY_c },       // ctrl+alt+c
-	{ CONFIG_ACTION_MINIMIZE,    MODKEY2, XKB_KEY_m },       // shift+alt+m
-	{ CONFIG_ACTION_CLOSE_OTHER, MODKEY4, XKB_KEY_q },       // ctrl+alt+q
+	{ CONFIG_ACTION_NEXT_WINDOW, MODKEY4, XKB_KEY_n },       // ctrl+alt+n 下一个窗口
+	{ CONFIG_ACTION_PREV_WINDOW, MODKEY4, XKB_KEY_p },       // ctrl+alt+p 上一个窗口
+	{ CONFIG_ACTION_CLOSE,       MODKEY4, XKB_KEY_c },       // ctrl+alt+c 关闭当前窗口
+	{ CONFIG_ACTION_MINIMIZE,    MODKEY2, XKB_KEY_m },       // shift+alt+m 最小化窗口
+	{ CONFIG_ACTION_CLOSE_OTHER, MODKEY4, XKB_KEY_q },       // ctrl+alt+q 退出合成器
 
 	{ CONFIG_ACTION_TASK,        MODKEY1, XKB_KEY_1 },       // win+1..9 切换窗口
 	{ CONFIG_ACTION_TASK,        MODKEY1, XKB_KEY_2 },

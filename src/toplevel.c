@@ -173,7 +173,9 @@ static void clamp_to_work_area(struct server *server, int *x, int *y,
 	// 右边: 那里有状态栏时把窗口贴着作区边缘钳制 (绝不压到栏下);
 	// 没有状态栏时, 窗口比作区大时至少保留 40px 可见
 	if (area.x + area.width < out.x + out.width) { // 右侧有栏
-		if (*x + width > area.x + area.width) {
+		// 窗口比作区宽时无法真正放下: 不要用它的宽度算出作区左边的
+		// 负坐标 (还原/全屏后 buffer 还停在旧的大尺寸时会这样)
+		if (width <= area.width && *x + width > area.x + area.width) {
 			*x = area.x + area.width - width;
 		}
 	} else if (*x + 40 > area.x + area.width) {
@@ -182,7 +184,10 @@ static void clamp_to_work_area(struct server *server, int *x, int *y,
 	// 底边: 同样规则 - 那里有栏时把窗口底边钳制到作区边缘,
 	// 这样还原/映射的窗口绝不会滑到栏下面
 	if (area.y + area.height < out.y + out.height) { // 底部有栏
-		if (*y + height > area.y + area.height) {
+		// 窗口比作区高时不能按它的高度把顶部推到作区上方 (典型的全屏
+		// buffer 未重排时: y = 作区高 - 全屏高 < 作区顶); 放不下就不动它,
+		// 等客户端 ack 新的小尺寸
+		if (height <= area.height && *y + height > area.y + area.height) {
 			*y = area.y + area.height - height;
 		}
 	} else if (*y + 40 > area.y + area.height) {
