@@ -96,6 +96,8 @@ A minimal floating Wayland compositor written in C on top of **wlroots 0.20**.
 | `wp_cursor_shape_manager_v1` | clients pick a cursor shape; the compositor renders it from its own xcursor theme at the output's (fractional) scale, so the size always matches — no client-side guessing |
 | `xdg_activation_v1` | client-driven window activation/focus; activation requests focus (and restore) the matching toplevel |
 | `wp_fractional_scale_v1` | surfaces are told the output's exact fractional scale |
+| `wp_color_manager_v1` (v2) | client-declared **parametric** image descriptions (named transfer function + named primaries); only advertised when the renderer supports input color transforms (currently only the Vulkan renderer, so run with `WLR_RENDERER=vulkan`), and the manager is attached to the scene so surfaces render with their description — otherwise clients fall back to sRGB. ICC v2/v4 and mastering-display metadata are not supported |
+| `wp_single_pixel_buffer_manager_v1` | clients fill a surface with one solid color (backgrounds/overlays) without allocating a 1×1 `wl_shm`/dmabuf buffer |
 | `ext_data_control_manager_v1` | privileged selection/clipboard control used by `wl-clipboard` (`wl-copy`/`wl-paste`) and clipboard managers, which is how terminal editors such as `vim` reach the Wayland clipboard |
 | `zwlr_data_control_manager_v1` | legacy wlroots clipboard-control protocol; still the only one bound by CopyQ and older clipboard tools, advertised alongside the `ext-` variant |
 | `zwp_primary_selection_device_manager_v1` | the standard PRIMARY selection (middle-click paste); the seat request listener drives `wlr_seat_set_primary_selection()` |

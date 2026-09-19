@@ -17,7 +17,7 @@
 
 #define CONFIG_ROUNDED_RADIUS    8           // 窗口圆角半径 (px)
 #define CONFIG_BORDER_WIDTH      2.0           // 窗口边框宽度 (px)
-#define CONFIG_BORDER_UNFOCUSED_DRAW 2.0         // 未聚焦窗口是否绘制边框
+#define CONFIG_BORDER_UNFOCUSED_DRAW 2.0         // 未聚焦窗口边框宽度
 
 #define CONFIG_BORDER_FOCUSED    0x7c73b0    // 有焦点边框颜色 0xRRGGBB
 #define CONFIG_BORDER_UNFOCUSED  0x7c73b0    // 无焦点边框颜色 0xRRGGBB
@@ -30,10 +30,13 @@
 #define CONFIG_FULLSCREEN_BORDER 1              // 全屏窗口是否显示边框 0/1
 #define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 // 全屏边框颜色 0xRRGGBB
 
-// 窗口阴影 (scenefx 风格高斯柔影, 颜色独立于边框色):
+// 窗口阴影 (高斯柔影, 颜色独立于边框色):
 #define CONFIG_SHADOW_BLUR_SIGMA 16.0f
 #define CONFIG_SHADOW_COLOR      0x22222f
 #define CONFIG_SHADOW_ALPHA      0.4f
+
+#define CONFIG_ANIM_ENABLE   1   // 设为 0 则关闭动画, 行为与原来一致: 瞬时切换
+#define CONFIG_ANIM_FADE_MS  50  // 创建淡入 / 关闭淡出 时长 (ms)
 
 #define CONFIG_TITLEBAR_HEIGHT  6           // 移动窗口标题栏范围
 #define CONFIG_EDGE_THICKNESS   6           // 调整窗口大小边框范围
@@ -53,18 +56,12 @@
 // (屏幕减去 layer-shell 状态栏的独占区), 保证新窗口不被状态栏盖住.
 #define CONFIG_CENTER_AVOID_BARS 0
 
-// 设为 0 则关闭动画, 行为与原来一致: 瞬时切换
-#define CONFIG_ANIM_ENABLE   1
-
-#define CONFIG_ANIM_FADE_MS  50      // 创建淡入 / 关闭淡出 时长 (ms)
-
 // 组合键修饰符, 按需组合使用
 #define MODKEY0 (WLR_MODIFIER_ALT)                        // alt (单独按 Alt)
 #define MODKEY1 (WLR_MODIFIER_LOGO)                        // win
 #define MODKEY2 (WLR_MODIFIER_SHIFT | WLR_MODIFIER_ALT)    // shift+alt
 #define MODKEY3 (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL)   // shift+ctrl
 #define MODKEY4  (WLR_MODIFIER_ALT    | WLR_MODIFIER_CTRL)  // alt+ctrl
-
 
 // 动作列表
 enum config_action {

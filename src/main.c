@@ -37,6 +37,7 @@
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
@@ -48,6 +49,7 @@
 #include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_shm.h>
+#include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
 
 #include <wlr/types/wlr_scene.h>
@@ -278,6 +280,9 @@ static void init_logging(void) {
 	wlr_log_init(debug ? WLR_DEBUG : WLR_INFO, log_callback);
 }
 
+// wp_color_manager_v1 协议版本 (wlroots 内部上限为 2, 未导出对应宏)
+#define COLOR_MANAGEMENT_V1_VERSION 2
+
 int main(int argc, char *argv[]) {
 	// 正常输出只到 stderr; WLR_DEBUG=1 时额外写 $XDG_RUNTIME_DIR/monodywm.log,
 	// 显式 MONODYWWM_LOG=<path> 则只写该文件
@@ -406,6 +411,13 @@ int main(int argc, char *argv[]) {
 	struct wlr_xdg_shell *xdg_shell =
 		wlr_xdg_shell_create(server.display, 6);
 	wlr_viewporter_create(server.display);
+	// wp_single_pixel_buffer_manager_v1: 客户端用一个纯色 buffer 填满
+	// surface (solid 背景/遮罩), 而不必为 1x1 像素分配 wl_shm 或 dmabuf.
+	// wlroots 在服务端实现整个协议, 这里只注册 global.
+	if (wlr_single_pixel_buffer_manager_v1_create(server.display) == NULL) {
+		wlr_log(WLR_ERROR,
+			"failed to create single-pixel-buffer-v1 global");
+	}
 	wlr_presentation_create(server.display, server.backend, 2);
 
 	// ---- wlroots 协议 ----
@@ -468,6 +480,63 @@ int main(int argc, char *argv[]) {
 		wlr_fractional_scale_manager_v1_create(server.display, 1);
 	if (server.fractional_scale_manager == NULL) {
 		wlr_log(WLR_ERROR, "failed to create fractional-scale-v1 global");
+	}
+
+	// wp_color_manager_v1: 客户端声明/查询输出的颜色管理. 只支持参数化
+	// 图像描述 (命名传输函数 + 命名 primaries), 不支持 ICC。只有渲染器
+	// 支持输入色彩变换时创建; 创建后关联到 scene, 场景才会按 surface 的
+	// 图像描述渲染。渲染器不支持时直接不注册 global, 客户端会退回 sRGB。
+	if (server.renderer->features.input_color_transform) {
+		const enum wp_color_manager_v1_render_intent render_intents[] = {
+			WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL,
+		};
+		size_t transfer_functions_len = 0;
+		enum wp_color_manager_v1_transfer_function *transfer_functions =
+			wlr_color_manager_v1_transfer_function_list_from_renderer(
+				server.renderer, &transfer_functions_len);
+		size_t primaries_len = 0;
+		enum wp_color_manager_v1_primaries *primaries =
+			wlr_color_manager_v1_primaries_list_from_renderer(
+				server.renderer, &primaries_len);
+
+		if (transfer_functions == NULL || primaries == NULL) {
+			// 渲染器声明支持输入色彩变换, 却给不出任何描述, 多半是 OOM;
+			// 此时注册一个不带 TF/primaries 的空 manager 只会误导客户端
+			wlr_log(WLR_ERROR, "failed to query renderer color "
+				"descriptions, disabling color-management-v1");
+		} else {
+			server.color_manager = wlr_color_manager_v1_create(
+				server.display, COLOR_MANAGEMENT_V1_VERSION,
+				&(struct wlr_color_manager_v1_options){
+					.features = {
+						.parametric = true,
+						// wlroots 尚未在 get_information 回传 mastering
+						// primaries/luminance, 补全前不对外声明该 feature
+						.set_mastering_display_primaries = false,
+					},
+					.render_intents = render_intents,
+					.render_intents_len = sizeof(render_intents) /
+						sizeof(render_intents[0]),
+					.transfer_functions = transfer_functions,
+					.transfer_functions_len = transfer_functions_len,
+					.primaries = primaries,
+					.primaries_len = primaries_len,
+				});
+
+			if (server.color_manager == NULL) {
+				wlr_log(WLR_ERROR,
+					"failed to create color-management-v1 global");
+			} else {
+				wlr_scene_set_color_manager_v1(server.scene,
+					server.color_manager);
+			}
+		}
+
+		free(transfer_functions);
+		free(primaries);
+	} else {
+		wlr_log(WLR_INFO, "renderer lacks input color transform, "
+			"disabling color-management-v1");
 	}
 
 	// ---- 输入法 (fcitx5 / ibus) ----

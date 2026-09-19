@@ -19,6 +19,7 @@
 #include <wayland-server-protocol.h>
 
 #include <wlr/types/wlr_cursor.h>
+#include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
@@ -339,6 +340,12 @@ struct server {
 	// (大小总能匹配输出缩放, 无需客户端猜测); 处理方式类似 wl_pointer.set_cursor
 	struct wlr_cursor_shape_manager_v1 *cursor_shape_manager;
 	struct wl_listener cursor_shape_set_shape;
+
+	// color-management-v1: 客户端声明/查询输出的颜色管理, 仅支持参数化
+	// 图像描述 (命名传输函数 + 命名 primaries), 不支持 ICC. 只有渲染器支持
+	// 输入色彩变换时创建, 并关联到 scene 以便按 surface 的图像描述渲染.
+	// wlroots 自行随 display 销毁, 无需显式清理.
+	struct wlr_color_manager_v1 *color_manager;
 
 	// ext-data-control-v1: 面向 wl-clipboard (wl-copy/wl-paste) 和剪贴板管理器
 	// 的剪贴板/选择区特权控制, vim 这类终端编辑器就是这样访问 Wayland 剪贴板的.
