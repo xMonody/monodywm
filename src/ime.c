@@ -114,6 +114,15 @@ static void ime_send_text_input_state(struct server *server,
 // 聚焦 surface / 活动 text input
 // ------------------------------------------------------------------
 
+// 显式清空客户端侧的 preedit.
+// text-input-v3 规定收到 leave 时客户端应自行重置 preedit, 但并非所有客户端
+// (例如 wezterm) 都这么做: 组合串会残留在终端里, 直到下一次 preedit 更新
+// 才被覆盖. 所以离开 / 提交清空时主动发一个空 preedit + done.
+static void text_input_clear_preedit(struct wlr_text_input_v3 *input) {
+	wlr_text_input_v3_send_preedit_string(input, "", 0, 0);
+	wlr_text_input_v3_send_done(input);
+}
+
 // 向每个 text input 发送 enter/leave, 使恰好"聚焦 surface 所属客户端"的
 // text input 处于聚焦状态. 发送 enter 让客户端知道可以启用文本输入了
 // (GTK/Qt 只在 enter 之后才 enable).
@@ -131,6 +140,7 @@ static void update_text_inputs_focused_surface(struct server *server) {
 			continue;
 		}
 		if (ti->focused_surface != NULL) {
+			text_input_clear_preedit(input);
 			wlr_text_input_v3_send_leave(input);
 			ti->focused_surface = NULL;
 		}
@@ -175,6 +185,10 @@ static void update_active_text_input(struct server *server) {
 		wlr_input_method_v2_send_done(server->input_method);
 	}
 	server->focused_text_input = new_active;
+	// 兜底 (当前注释): 协议要求 deactivate 后候选窗不可见, 但 fcitx5 会自己
+	// 销毁 popup, 实测合成器无需介入. 若以后遇到某个 IM 失焦后候选窗残留,
+	// 取消下面一行注释, 并配合 ime_update_popup() 里的 set_enabled.
+	// ime_update_popup(server);
 }
 
 static void ime_focused_surface_destroy(struct wl_listener *listener,
@@ -310,6 +324,11 @@ void ime_update_popup(struct server *server) {
 			popup_x, popup_y);
 		// 确保候选列表浮在 layer-shell surface 之上
 		wlr_scene_node_raise_to_top(&scene_surface->buffer->node);
+		// 兜底 (当前注释): deactivate 后按协议候选窗应不可见.
+		// fcitx5 会自行销毁 popup, 不需要这里隐藏; 保留代码以防某个 IM
+		// 不销毁 popup 导致候选窗残留.
+		// wlr_scene_node_set_enabled(&scene_surface->buffer->node,
+		// 	ime->input_method != NULL && ime->input_method->active);
 
 		// 告诉 IM 文本光标的位置 (相对 popup).
 		// 该矩形是光标在 surface 局部的框, 换算到 popup surface 的坐标系;
@@ -536,11 +555,13 @@ static void ime_commit(struct wl_listener *listener, void *data) {
 		return;
 	}
 	struct wlr_input_method_v2_state *state = &context->current;
-	if (state->preedit.text != NULL) {
-		wlr_text_input_v3_send_preedit_string(text_input,
-			state->preedit.text, state->preedit.cursor_begin,
-			state->preedit.cursor_end);
-	}
+	// 始终转发 preedit, 空串也要发: 输入法用"本次 commit 没有 set_preedit_string"
+	// 表示清空组合串. 若这里跳过, 客户端会一直显示上一次的 preedit
+	// (终端里残留的 "nihao" 就是这么来的).
+	wlr_text_input_v3_send_preedit_string(text_input,
+		state->preedit.text != NULL ? state->preedit.text : "",
+		state->preedit.text != NULL ? state->preedit.cursor_begin : 0,
+		state->preedit.text != NULL ? state->preedit.cursor_end : 0);
 	if (state->commit_text != NULL) {
 		wlr_text_input_v3_send_commit_string(text_input,
 			state->commit_text);
