@@ -249,8 +249,8 @@ void ime_update_popup(struct server *server) {
 			have_caret = true;
 		}
 
-		int lx = server->cursor->x;
-		int ly = server->cursor->y;
+		int lx = (int)server->cursor->x;
+		int ly = (int)server->cursor->y;
 		int caret_global_x = 0;
 		int caret_global_y = 0;
 		int surface_global_x = 0;
@@ -584,7 +584,7 @@ static void ime_new_popup_surface(struct wl_listener *listener, void *data) {
 		return;
 	}
 	wlr_scene_node_set_position(&scene_surface->buffer->node,
-		server->cursor->x, server->cursor->y);
+		(int)server->cursor->x, (int)server->cursor->y);
 	wlr_scene_node_raise_to_top(&scene_surface->buffer->node);
 
 	ime->popup_scene_surface = scene_surface;

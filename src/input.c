@@ -271,7 +271,7 @@ void seat_start_drag(struct wl_listener *listener, void *data) {
 		server->layers[LAYER_OVERLAY], drag->icon);
 	if (server->drag_tree != NULL) {
 		wlr_scene_node_set_position(&server->drag_tree->node,
-			server->cursor->x, server->cursor->y);
+			(int)server->cursor->x, (int)server->cursor->y);
 		// 该场景树会随拖拽图标一起销毁; 监听它, 使 drag_tree 在任何
 		// 销毁路径下都被清空, 否则之后每次指针移动都会写已释放的节点
 		server->drag_tree_destroy.notify = drag_tree_destroy;

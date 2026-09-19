@@ -8,7 +8,7 @@ A minimal floating Wayland compositor written in C on top of **wlroots 0.20**.
 * The compositor draws **no window decorations of its own**: client-side
   decorated windows keep their native controls, and undecorated windows get
   only invisible grab zones (title strip and resize edges).  The previous
-  rounded-corner / border-ring / shadow decorations (scenefx) have been
+  rounded-corner / border-ring 
   removed.
 * **Client-side decorated** windows (mode `CLIENT_SIDE` via xdg-decoration, or
   apps with their own header bars) keep their native controls: the client's own

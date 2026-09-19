@@ -1067,10 +1067,10 @@ static void rounded_map_damage(pixman_region32_t *dst,
 	const pixman_box32_t *boxes = pixman_region32_rectangles(src, &n);
 	for (int i = 0; i < n; i++) {
 		const pixman_box32_t *b = &boxes[i];
-		int x1 = dst_box->x + (int)floorf(b->x1 * xs);
-		int y1 = dst_box->y + (int)floorf(b->y1 * ys);
-		int x2 = dst_box->x + (int)ceilf(b->x2 * xs);
-		int y2 = dst_box->y + (int)ceilf(b->y2 * ys);
+		int x1 = dst_box->x + (int)floorf((float)b->x1 * xs);
+		int y1 = dst_box->y + (int)floorf((float)b->y1 * ys);
+		int x2 = dst_box->x + (int)ceilf((float)b->x2 * xs);
+		int y2 = dst_box->y + (int)ceilf((float)b->y2 * ys);
 		pixman_region32_union_rect(dst, dst, x1, y1, x2 - x1, y2 - y1);
 	}
 }

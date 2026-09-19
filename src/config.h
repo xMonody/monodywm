@@ -31,8 +31,8 @@
 #define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 // 全屏边框颜色 0xRRGGBB
 
 // 窗口阴影 (scenefx 风格高斯柔影, 颜色独立于边框色):
-#define CONFIG_SHADOW_BLUR_SIGMA 20.0f
-#define CONFIG_SHADOW_COLOR      0x000000
+#define CONFIG_SHADOW_BLUR_SIGMA 16.0f
+#define CONFIG_SHADOW_COLOR      0x22222f
 #define CONFIG_SHADOW_ALPHA      0.4f
 
 #define CONFIG_TITLEBAR_HEIGHT  6           // 移动窗口标题栏范围
@@ -53,7 +53,6 @@
 // (屏幕减去 layer-shell 状态栏的独占区), 保证新窗口不被状态栏盖住.
 #define CONFIG_CENTER_AVOID_BARS 0
 
-// 窗口动画 (animate.c): 仅保留创建淡入与关闭淡出.
 // 设为 0 则关闭动画, 行为与原来一致: 瞬时切换
 #define CONFIG_ANIM_ENABLE   1
 

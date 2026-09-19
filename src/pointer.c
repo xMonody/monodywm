@@ -256,7 +256,7 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 	double nx = lx - server->grab_x;
 	double ny = ly - server->grab_y;
 	clamp_drag_position(server, tl, &nx, &ny);
-	wlr_scene_node_set_position(&tl->scene_tree->node, nx, ny);
+	wlr_scene_node_set_position(&tl->scene_tree->node, (int)nx, (int)ny);
 }
 
 // 拖动的最大化窗口先还原到保存的浮动几何, 并把抓取参考点钳进还原后的窗口
@@ -1133,7 +1133,7 @@ static bool toplevel_surface_origin(struct server *server,
 static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 	if (server->drag_tree != NULL) {
 		wlr_scene_node_set_position(&server->drag_tree->node,
-			server->cursor->x, server->cursor->y);
+			(int)server->cursor->x, (int)server->cursor->y);
 	}
 
 	// 让输入法的候选窗贴着光标
