@@ -81,40 +81,42 @@ void seat_request_set_cursor(struct wl_listener *listener, void *data) {
 	if (server->seat->pointer_state.button_count > 0) {
 		return;
 	}
-	// 合成器自己的边框区 (标题栏/resize 边缘) 在那里接管光标, 忽略客户端请求 -
-	// 客户端仍收到 motion 并保留悬停反馈, 只是不能改光标.
+	// 只接受当前聚焦客户端的请求: 其余直接丢弃, 避免记住别的客户端的光标
+	if (event->seat_client != server->seat->pointer_state.focused_client) {
+		return;
+	}
+	// 光标 surface 覆盖此前设置的任何光标形状
+	// (混用两种协议的客户端: 最后一次请求生效)
+	server->client_cursor_shape = 0;
+	if (server->client_cursor_shape_client != NULL) {
+		listener_remove_if_attached(
+			&server->client_cursor_shape_client_destroy);
+		server->client_cursor_shape_client = NULL;
+	}
+	// 记住客户端光标, 以便合成器光标覆盖 (标题栏/resize 边缘) 结束后恢复
+	if (server->client_cursor_surface != event->surface) {
+		if (server->client_cursor_surface != NULL) {
+			listener_remove_if_attached(&server->client_cursor_destroy);
+		}
+		server->client_cursor_surface = event->surface;
+		if (event->surface != NULL) {
+			server->client_cursor_destroy.notify =
+				client_cursor_surface_destroy;
+			wl_signal_add(&event->surface->events.destroy,
+				&server->client_cursor_destroy);
+		}
+	}
+	server->client_cursor_hotspot_x = event->hotspot_x;
+	server->client_cursor_hotspot_y = event->hotspot_y;
+	// 合成器自己的边框区 (标题栏/resize 边缘) 或进行中的覆盖接管光标:
+	// 客户端仍收到 motion 并保留悬停反馈, 但不能立即改光标.
+	// 仍要记住客户端的偏好 - 否则离开边框区后 reapply_client_cursor()
+	// 无光标可恢复, 就会错误地退回默认箭头.
 	// 被捕获的指针 (pointer-constraints) 即使在边框区也属于客户端,
 	// 所以它可以在那里设置或隐藏自己的光标.
 	if (!pointer_constraint_active(server) &&
-			pointer_over_frame_zone(server)) {
-		return;
-	}
-	if (event->seat_client == server->seat->pointer_state.focused_client) {
-		// 光标 surface 覆盖此前设置的任何光标形状
-		// (混用两种协议的客户端: 最后一次请求生效)
-		server->client_cursor_shape = 0;
-		if (server->client_cursor_shape_client != NULL) {
-			listener_remove_if_attached(
-				&server->client_cursor_shape_client_destroy);
-			server->client_cursor_shape_client = NULL;
-		}
-		// 记住客户端光标, 以便合成器光标覆盖 (标题栏/resize 边缘) 结束后恢复
-		if (server->client_cursor_surface != event->surface) {
-			if (server->client_cursor_surface != NULL) {
-				listener_remove_if_attached(&server->client_cursor_destroy);
-			}
-			server->client_cursor_surface = event->surface;
-			if (event->surface != NULL) {
-				server->client_cursor_destroy.notify =
-					client_cursor_surface_destroy;
-				wl_signal_add(&event->surface->events.destroy,
-					&server->client_cursor_destroy);
-			}
-		}
-		server->client_cursor_hotspot_x = event->hotspot_x;
-		server->client_cursor_hotspot_y = event->hotspot_y;
-		wlr_cursor_set_surface(server->cursor, event->surface,
-			event->hotspot_x, event->hotspot_y);
+			(pointer_over_frame_zone(server) ||
+			 server->cursor_override != NULL)) {
 		if (server->cursor_override != NULL) {
 			// 进入 surface 会让客户端重新请求光标; 当我们接管光标
 			// (标题区/resize 边缘) 时, 立即重新套用自己的光标,
@@ -122,7 +124,10 @@ void seat_request_set_cursor(struct wl_listener *listener, void *data) {
 			wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
 				server->cursor_override);
 		}
+		return;
 	}
+	wlr_cursor_set_surface(server->cursor, event->surface,
+		event->hotspot_x, event->hotspot_y);
 }
 
 // 指针所在的 toplevel (其 surface 或它同客户端的 surface); 找不到返回 NULL.
@@ -165,11 +170,8 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 	if (server->seat->pointer_state.button_count > 0) {
 		return;
 	}
-	// 合成器自己的边框区在那里接管光标; 客户端仍收到 motion 和悬停反馈,
-	// 只是不能改光标
-	if (pointer_over_frame_zone(server)) {
-		return;
-	}
+	// 只接受当前聚焦客户端发的形状: 非聚焦客户端的请求直接丢弃,
+	// 避免把别的窗口的形状记成当前窗口的
 	if (event->seat_client != server->seat->pointer_state.focused_client) {
 		return;
 	}
@@ -213,11 +215,16 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 	}
 	server->client_cursor_shape = event->shape;
 	wlr_log(WLR_DEBUG, "cursor: shape %d", event->shape);
-	if (server->cursor_override != NULL) {
-		// 我们接管着光标 (标题区/resize 边缘): 保持覆盖,
-		// 只记住客户端的偏好供以后使用
-		wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
-			server->cursor_override);
+	// 合成器自己的边框区 (标题条/resize 边缘) 或进行中的覆盖接管光标:
+	// 不要切换可见光标, 但必须先把客户端的偏好记下来.
+	// 客户端只为同一次 enter 发一次 set_shape; 若这里直接丢弃,
+	// 离开边框区后 reapply_client_cursor() 无形状可恢复, 就会错误地
+	// 退回默认箭头 (如终端文本框的竖线丢失).
+	if (pointer_over_frame_zone(server) || server->cursor_override != NULL) {
+		if (server->cursor_override != NULL) {
+			wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
+				server->cursor_override);
+		}
 		return;
 	}
 	// 自己渲染形状: 图像来自合成器 xcursor 主题并按当前输出缩放,
