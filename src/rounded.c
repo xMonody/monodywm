@@ -120,6 +120,7 @@ struct rounded_cache {
 	int logical_width, logical_height; // 窗口尺寸 (布局像素)
 	float shadow_logical;            // 阴影宽度 (布局像素)
 	float scale;                     // FBO 渲染时使用的输出缩放
+	float shadow_sigma_baked;        // 上次成功烘焙进 FBO 的阴影 sigma
 
 	bool content_dirty;              // 客户端内容变化: 两个 pass 都跑
 	bool mask_dirty;                 // 仅边框/阴影参数变化: 只跑掩码 pass
@@ -854,6 +855,7 @@ struct rounded_cache *rounded_cache_create(struct server *server,
 	pixman_region32_init(&rc->content_damage);
 	pixman_region32_init(&rc->fbo_damage);
 	wl_array_init(&rc->subsurface_order);
+	rc->shadow_sigma_baked = -1.0f;
 
 	if (!wlr_renderer_is_gles2(server->renderer)) {
 		wlr_log(WLR_INFO, "rounded: renderer is not gles2, disabling rounded corners");
@@ -1315,6 +1317,13 @@ void rounded_render_all(struct server *server) {
 		// 永远不改变其尺寸, 只做仅掩码重绘
 		float shadow_w = (float)shadow_padding();
 
+		// 阴影开关 (聚焦 / 最大化 / 全屏) 变化不像尺寸那样体现在 damage 里:
+		// 与已烘焙值不同就强制重绘 mask. 内容没变时下面会走 mask-only 分支.
+		float sigma_now = shadow_sigma(tl);
+		if (sigma_now != rc->shadow_sigma_baked) {
+			rc->mask_dirty = true;
+		}
+
 		if (!rc->content_dirty && !rc->mask_dirty &&
 				rc->logical_width == box.width &&
 				rc->logical_height == box.height && rc->scale == scale &&
@@ -1341,6 +1350,7 @@ void rounded_render_all(struct server *server) {
 			}
 			// 整个边框环和阴影颜色都变了
 			rounded_publish(rc, &box, NULL);
+			rc->shadow_sigma_baked = sigma_now;
 			rounded_note_surface_state(rc);
 			rounded_cache_hide_content(tl);
 			wlr_log(WLR_DEBUG, "rounded: published mask-only FBO for app_id "
@@ -1430,6 +1440,7 @@ void rounded_render_all(struct server *server) {
 
 		// 发布新结果; damage 为 NULL = 整个 buffer
 		rounded_publish(rc, &box, partial ? &rc->fbo_damage : NULL);
+		rc->shadow_sigma_baked = sigma_now;
 		rounded_note_surface_state(rc);
 		// 注意: 不要在这里清除 dirty - 它在渲染前已清除,
 		// 而渲染中途到达的提交已经把它重新置 true, 所以下一帧会重绘更新的内容.

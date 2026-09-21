@@ -3,6 +3,7 @@
 // 阴影由 rounded.c 的圆角着色器绘制, 表现为 SDF 距离外的高斯衰减.
 // 本文件只管策略:
 //   - 只有聚焦窗口投影 (未聚焦 sigma 为 0);
+//   - 最大化 / 全屏窗口不投影 (铺满工作区/输出, 阴影不可见);
 //   - 柔度 (sigma)、颜色、峰值透明度来自 config.h;
 //   - 阴影颜色与边框色无关.
 //
@@ -16,6 +17,15 @@
 float shadow_sigma(struct toplevel *tl) {
 	// 只有聚焦窗口投影
 	if (tl->server->focused != tl) {
+		return 0.0f;
+	}
+	// 最大化 / 全屏窗口铺满工作区/输出: 阴影要么被屏幕边缘裁掉,
+	// 要么落到相邻输出上, 没有意义. 只保留 (可选的) 边框环.
+	if (tl->fullscreen) {
+		return 0.0f;
+	}
+	if (tl->xdg_toplevel != NULL &&
+			tl->xdg_toplevel->current.maximized) {
 		return 0.0f;
 	}
 	return CONFIG_SHADOW_BLUR_SIGMA;
