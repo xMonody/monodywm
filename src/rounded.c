@@ -1,8 +1,10 @@
-// rounded.c - 离屏圆角合成 (wlroots gles2 + FBO)
+// rounded.c - 离屏圆角合成 (wlroots gles2 + EGLImage 纹理)
 //
-// 每个 toplevel 缓存圆角化副本: 客户端内容合成到 buf1, 再用 SDF 掩码着色器重绘到
-// buf2; buf2 显示在客户端内容下面 (内容留在场景收输入/frame, 透明度 0).
+// 每个 toplevel 缓存圆角化副本: 客户端内容合成到 buf1 (FBO), 再把 buf1 的
+// DMA-BUF 作为 EGLImage 纹理 (wlr_texture_from_buffer) 直接采样, 用 SDF 掩码
+// 着色器重绘到 buf2; buf2 显示在客户端内容下面 (内容留在场景收输入/frame, 透明度 0).
 // 只重绘脏区域 (两个 pass 按 damage scissor); FBO 取 window geometry, CSD 阴影被裁掉.
+// 掩码 pass 不做 glCopyTexSubImage2D: EGLImage 纹理直接别名 buf1 的存储.
 
 #include "server.h"
 
@@ -110,8 +112,6 @@ struct rounded_cache {
 	// 离屏缓存: 内容先合成到这里, 再掩码进 rounded_buf, 后者才是场景实际显示的
 	struct wlr_buffer *content_buf;
 	struct wlr_buffer *rounded_buf;
-	GLuint content_tex;              // content_buf 的 GPU 侧副本
-	int content_tex_width, content_tex_height;
 
 	int fbo_width, fbo_height;       // 当前 FBO 尺寸 (物理像素)
 	int window_pw, window_ph;        // 窗口尺寸 (物理像素)
@@ -311,14 +311,6 @@ static bool rounded_mask_gl_init(void) {
 
 	mask_gl.ready = true;
 	return true;
-}
-
-// 每个窗口只删自己的内容纹理; 共享的 program/VBO 进程级保留.
-static void rounded_gl_fini(struct rounded_cache *rc) {
-	if (rc->content_tex != 0) {
-		glDeleteTextures(1, &rc->content_tex);
-		rc->content_tex = 0;
-	}
 }
 
 // --- buffer 缓存 ---
@@ -635,9 +627,11 @@ static bool rounded_render_content(struct rounded_cache *rc,
 
 // --- 圆角掩码 pass (原生 GLES2) ---
 
-// 把内容 FBO 拷进内容纹理 (供掩码着色器采样), 并把 SDF 掩码画到输出 FBO.
-// region 为 NULL 时刷新整个 FBO, 否则只处理它的矩形 (glScissor 限定,
-// 拷贝和采样都不越界).
+// 把 content_buf 作为 EGLImage 纹理直接采样 (wlr_texture_from_buffer 内部用
+// glEGLImageTargetTexture2DOES 绑定它的 DMA-BUF), 并把 SDF 掩码画到输出 FBO.
+// 不再逐 damage 矩形做 glCopyTexSubImage2D: 掩码着色器直接读刚渲染进
+// content_buf 的内容, 只保留 glScissor 限定重绘区域.
+// region 为 NULL 时刷新整个 FBO.
 static bool rounded_render_mask(struct rounded_cache *rc,
 		const pixman_region32_t *region) {
 	struct wlr_renderer *renderer = rc->server->renderer;
@@ -645,11 +639,9 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		return false;
 	}
 
-	GLuint content_fbo =
-		wlr_gles2_renderer_get_buffer_fbo(renderer, rc->content_buf);
 	GLuint out_fbo =
 		wlr_gles2_renderer_get_buffer_fbo(renderer, rc->rounded_buf);
-	if (content_fbo == 0 || out_fbo == 0) {
+	if (out_fbo == 0) {
 		return false;
 	}
 
@@ -658,22 +650,27 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 		return false;
 	}
 
-	// FBO 尺寸变化时 (重新) 分配 GPU 侧内容纹理
-	if (rc->content_tex == 0 || rc->content_tex_width != rc->fbo_width ||
-			rc->content_tex_height != rc->fbo_height) {
-		if (rc->content_tex != 0) {
-			glDeleteTextures(1, &rc->content_tex);
-		}
-		glGenTextures(1, &rc->content_tex);
-		glBindTexture(GL_TEXTURE_2D, rc->content_tex);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rc->fbo_width,
-			rc->fbo_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		rc->content_tex_width = rc->fbo_width;
-		rc->content_tex_height = rc->fbo_height;
+	// 每次都重新 import: gles2 只保证 external-only 纹理自动看到外部修改,
+	// GL_TEXTURE_2D 需要重新绑定 EGLImage 才能看到我们刚写进 content_buf
+	// 的内容. import 会锁住 content_buf, 用完 wlr_texture_destroy() 解锁.
+	struct wlr_texture *content_tex =
+		wlr_texture_from_buffer(renderer, rc->content_buf);
+	if (content_tex == NULL) {
+		wlr_log(WLR_ERROR, "rounded: failed to import content buffer as "
+			"EGLImage texture");
+		rounded_end_gl(&saved);
+		return false;
+	}
+	struct wlr_gles2_texture_attribs attribs;
+	wlr_gles2_texture_get_attribs(content_tex, &attribs);
+	// 掩码着色器用 sampler2D: ARGB8888 的 content_buf 应该总是 GL_TEXTURE_2D,
+	// 若驱动给出 external-only (例如 YUV) 就放弃这一帧
+	if (attribs.target != GL_TEXTURE_2D) {
+		wlr_log(WLR_ERROR, "rounded: unexpected EGLImage texture target "
+			"0x%x", attribs.target);
+		wlr_texture_destroy(content_tex);
+		rounded_end_gl(&saved);
+		return false;
 	}
 
 	int n_rects = 0;
@@ -693,7 +690,13 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 	glUseProgram(mask_gl.program);
 
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, rc->content_tex);
+	glBindTexture(attribs.target, attribs.tex);
+	// EGLImage 纹理默认 min filter 带 mipmap, 没有 mipmap 会采样成黑;
+	// 强制线性过滤 (与以前的中间纹理一致)
+	glTexParameteri(attribs.target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(attribs.target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(attribs.target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(attribs.target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glUniform1i(mask_gl.u_tex, 0);
 	glUniform2f(mask_gl.u_size, (float)rc->fbo_width, (float)rc->fbo_height);
 	glUniform2f(mask_gl.u_window_origin, (float)rc->shadow_px,
@@ -713,34 +716,26 @@ static bool rounded_render_mask(struct rounded_cache *rc,
 	glVertexAttribPointer(mask_gl.a_pos, 2, GL_FLOAT, GL_FALSE, 0, NULL);
 
 	if (partial) {
-		// 逐矩形: 把刚合成的内容拷进纹理 (纯 GPU 拷贝, 没有 glReadPixels),
-		// 然后在同一 scissor 下画四边形. 拷贝与绘制的坐标都是 buffer 坐标:
-		// 着色器的 y 映射在 buffer 行与 GL 窗口行之间是恒等的.
+		// 纹理已经是完整内容: 逐 damage 矩形设 scissor 重画四边形即可,
+		// 不再需要任何拷贝. 纹理行与 buffer 行的 y 映射是恒等的.
 		glEnable(GL_SCISSOR_TEST);
 		for (int i = 0; i < n_rects; i++) {
 			const pixman_box32_t *b = &boxes[i];
-			int x = b->x1, y = b->y1;
-			int w = b->x2 - b->x1, h = b->y2 - b->y1;
-			glScissor(x, y, w, h);
-			glBindFramebuffer(GL_FRAMEBUFFER, content_fbo);
-			// 纹理偏移和 framebuffer 源都用该矩形的坐标: 纹理逐行镜像 FBO
-			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, y, x, y, w, h);
-			glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
+			glScissor(b->x1, b->y1, b->x2 - b->x1, b->y2 - b->y1);
 			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		}
 		glDisable(GL_SCISSOR_TEST);
 	} else {
 		glDisable(GL_SCISSOR_TEST);
-		glBindFramebuffer(GL_FRAMEBUFFER, content_fbo);
-		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-			rc->fbo_width, rc->fbo_height);
-		glBindFramebuffer(GL_FRAMEBUFFER, out_fbo);
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	}
 
 	glDisableVertexAttribArray(mask_gl.a_pos);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
-	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindTexture(attribs.target, 0);
+
+	// 释放纹理引用 (解锁 content_buf; EGLImage 本身归 buffer 所有)
+	wlr_texture_destroy(content_tex);
 
 	// 掩码绘制命令在同一 GL 上下文中排在场景渲染之前,
 	// 所以场景采样时能立即看到刚写入的圆角 FBO
@@ -878,14 +873,8 @@ void rounded_cache_destroy(struct rounded_cache *rc) {
 	if (rc == NULL) {
 		return;
 	}
-	struct egl_context_state saved = {0};
-	// 共享 program 已就绪说明渲染器是 gles2, 且该窗口确实创建过 GL 资源
-	bool have_gl = !rc->failed && mask_gl.ready &&
-		wlr_renderer_is_gles2(rc->server->renderer);
-	if (have_gl && rounded_begin_gl(rc->server->renderer, &saved)) {
-		rounded_gl_fini(rc);
-		rounded_end_gl(&saved);
-	}
+	// 每个窗口没有常驻 GL 资源: content_buf 的 EGLImage 纹理在 mask pass 里
+	// 临时 import / 释放, 共享的 program/VBO 是进程级的.
 	rounded_release_buffers(rc);
 	pixman_region32_fini(&rc->content_damage);
 	pixman_region32_fini(&rc->fbo_damage);
