@@ -1,6 +1,6 @@
 // server.h - xmonodywm 的共享类型与跨模块声明
 //
-// 合成器拆成多个小模块 (main、ipc、scene、border、toplevel、layer、
+// 合成器拆成多个小模块 (main、ipc、scene、decor、toplevel、layer、
 // output、input、pointer); 它们需要共享的东西都放在这里.
 
 #ifndef XMONODYWM_SERVER_H
@@ -67,15 +67,13 @@ struct scene_tag {
 	struct wl_listener destroy; // 节点销毁时释放该标签
 };
 
-#include <wlr/types/wlr_scene.h>
+#include <scenefx/types/wlr_scene.h>
 
 struct ipc_client;     // 定义在 ipc.c
 struct wlr_swapchain;  // 定义在 wlr/render/swapchain.h
 struct server;
 struct toplevel;
-struct toplevel_anim;  // 定义在 animate.c
 struct layer_surface;
-struct rounded_cache;  // 定义在 rounded.c
 
 // 一个已连接的输入法 (fcitx5/ibus); 只使用第一个
 struct ime {
@@ -141,37 +139,26 @@ struct toplevel_popup {
 	struct wl_listener destroy;
 };
 
-// toplevel surface 的一个 subsurface (Firefox/Chromium 用 subsurface 覆盖
-// 窗口边缘); 它的 commit 把圆角 FBO 缓存标记为脏, 内容变化时重绘离屏副本
-struct toplevel_subsurface {
-	struct toplevel *tl;
-	struct wlr_subsurface *subsurface;
-	struct wl_list link; // tl->subsurfaces
-	struct wl_listener commit;
-	struct wl_listener new_subsurface; // 嵌套 subsurface
-	struct wl_listener destroy;
-
-	// 自上次 FBO 渲染以来累积的 buffer damage, 采用 surface 局部坐标
-	// (rounded.c 在渲染时, 即最终布局位置已知时, 映射到 FBO 空间)
-	pixman_region32_t damage;
-	// 上次 commit 时的几何 (相对父 surface 的位置 + surface 局部尺寸),
-	// 这样移动/缩放时也能损坏旧区域
-	int prev_x, prev_y, prev_w, prev_h;
-};
+// ---- decor.c: scenefx 圆角 / 边框 / 阴影 ----
+// 顶部三段边框 (最小化/最大化/关闭手势区) 用 3 个段 rect + 2*STEPS 个渐变 rect 拼成
+#define DECOR_BORDER_TOP_RECTS (3 + 2 * CONFIG_BORDER_GRADIENT_STEPS)
 
 struct toplevel {
 	struct server *server;
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	struct wlr_scene_tree *scene_tree;
+	// toplevel 自身的 subsurface 树 (scene_tree 的子节点; popup 树是它的兄弟).
+	// 内容裁切只作用在它上面, 否则会递归到 popup 把菜单也裁掉
+	struct wlr_scene_tree *surface_tree;
 	struct wlr_foreign_toplevel_handle_v1 *fthandle;
 	struct wlr_output *last_output;
 
-	// 离屏圆角 FBO 缓存 (rounded.c); 禁用时为 NULL
-	struct rounded_cache *rounded;
-
-	// 窗口 surface 的 subsurface (它们的 commit 标记圆角缓存脏);
-	// 随 toplevel 一起清理
-	struct wl_list subsurfaces;      // struct toplevel_subsurface.link
+	// scenefx 装饰 (decor.c): 圆角边框环 + 投影, 挂在 scene_tree 下
+	struct wlr_scene_rect *border;
+	// 顶部三段边框: [0,1,2]=左/中/右段, 其余为交界渐变条 (见 DECOR_BORDER_TOP_RECTS)
+	struct wlr_scene_rect *border_top[DECOR_BORDER_TOP_RECTS];
+	struct wlr_scene_shadow *shadow;
+	struct wlr_scene_blur *blur;    // 背景模糊 (整块窗口内容区)
 
 	// popup 是 scene_tree 的子场景树, 其树销毁时自行清理, 无需显式列表
 
@@ -181,21 +168,19 @@ struct toplevel {
 	bool decoration_configured;
 
 	bool minimized;
-	// 已请求关闭, 关闭淡出 (animate.c) 接管 wlr_xdg_toplevel 的关闭请求,
-	// 窗口不可见后再发送. 在真正消失前窗口是惰性的: 不可聚焦、不可提升、
-	// 排除在窗口循环之外, 且拒绝最小化/最大化. 淡出结束时其场景节点被禁用,
-	// 这样不理会关闭请求的客户端也不会留下一个不可见却阻塞输入的窗口.
-	// 只在 surface 销毁时清除 (关闭期间重新映射会被再次关闭, 绝不重新显示).
-	bool closing;
 	bool positioned; // 初始位置已分配
-
-	// 每窗口动画状态 (animate.c); 场景树销毁时释放
-	struct toplevel_anim *anim;
 
 	// 已发目标尺寸 configure 但客户端 buffer 还没到位: 节点停在原位,
 	// 等提交到目标尺寸再落框 (否则旧 buffer 会先闪到作区/输出左上角)
 	bool pending_frame;
 	struct wlr_box pending_frame_box;
+
+	// 还原 (取消最大化/全屏) 已移动节点, 但客户端还没 ack 翻转
+	// current.maximized/fullscreen: 这期间用保存的尺寸占位, 让边框/阴影立刻
+	// 跟到还原后的尺寸, 而不是以旧尺寸挂在新位置上 (右下角闪一下).
+	// 位置恒取当前节点 (scene_tree->node.x/y), 拖动还原时自动跟随, 无需保存.
+	bool restore_frame_pending;
+	int restore_frame_w, restore_frame_h;
 
 	// 自动居中 (place.c): 新窗口在 surface 尺寸变化时重新居中,
 	// 直到用户与之交互 (移动/缩放/最大化/全屏会置 user_moved 并停止).
@@ -240,7 +225,6 @@ struct toplevel {
 	struct wl_listener set_app_id;
 	struct wl_listener set_parent;
 	struct wl_listener new_popup;
-	struct wl_listener new_subsurface;
 
 	struct wl_listener ft_request_maximize;
 	struct wl_listener ft_request_minimize;
@@ -256,6 +240,8 @@ struct layer_surface {
 	struct server *server;
 	struct wlr_layer_surface_v1 *layer_surface;
 	struct wlr_scene_layer_surface_v1 *scene_layer;
+	// 状态栏/面板的背景模糊 (挂在 scene_layer 树下, 尺寸随 surface 变化)
+	struct wlr_scene_blur *blur;
 
 	struct wl_list link; // server.layer_surfaces
 
@@ -458,12 +444,6 @@ struct server {
 	bool resize_final_pending;    // 轮廓模式: 等待最终提交
 	struct wl_event_source *resize_final_timer; // 轮廓模式: 客户端始终不提交时的看门狗
 
-	// animate.c: 全局节拍看门狗, 有任何窗口动画运行时臂置
-	// (动画状态本身在 output.c 的 frame 处理器里逐渲染帧推进, 与 vsync 同步 -
-	// 这个定时器只在场景 damage 无法驱动帧流时兜底, 并执行墙钟超时).
-	// 惰性创建, 空闲时解除.
-	struct wl_event_source *anim_timer;
-
 	// 当前合成器驱动的光标名, 显示客户端光标时为 NULL (用于避免重复更新)
 	const char *cursor_override;
 
@@ -559,56 +539,16 @@ void server_new_toplevel(struct wl_listener *listener, void *data);
 void server_new_xdg_dialog(struct wl_listener *listener, void *data);
 void server_new_decoration(struct wl_listener *listener, void *data);
 
-// ---- rounded.c: 离屏圆角 FBO 缓存 ----
-struct rounded_cache *rounded_cache_create(struct server *server,
-	struct toplevel *tl);
-void rounded_cache_destroy(struct rounded_cache *rc);
-void rounded_cache_dirty(struct toplevel *tl);
-void rounded_cache_dirty_content(struct toplevel *tl);
-void rounded_cache_dirty_mask(struct toplevel *tl);
-void rounded_cache_content_commit(struct toplevel *tl);
-void rounded_cache_subsurface_commit(struct toplevel *tl,
-	struct toplevel_subsurface *ts);
-void rounded_cache_hide_content(struct toplevel *tl);
-// 整体淡入淡出窗口 (animate.c): 通常只有圆角 FBO 节点可见
-// (原始客户端内容以透明度 0 隐藏), 所以动画作用于该节点;
-// 在首次 FBO 发布之前 / 关闭圆角时, 改为淡出窗口树下的每个场景 buffer
-void rounded_window_set_opacity(struct toplevel *tl, float opacity);
-void rounded_render_all(struct server *server);
-
-// ---- border.c: 窗口边框宽度与依赖焦点的颜色 ----
-float border_width(struct toplevel *tl);
-float border_gradient_width(struct toplevel *tl);
-struct wlr_render_color border_color(struct server *server,
-	struct toplevel *tl);
-void border_top_colors(struct toplevel *tl,
-	struct wlr_render_color *left, struct wlr_render_color *mid,
-	struct wlr_render_color *right);
-void border_focus_changed(struct toplevel *tl, struct toplevel *prev);
-
-// ---- shadow.c: 窗口阴影宽度/透明度策略 ----
-float shadow_sigma(struct toplevel *tl);
-float shadow_alpha(void);
-struct wlr_render_color shadow_color(void);
-int shadow_padding(void);
+// ---- decor.c: scenefx 圆角 / 边框 / 阴影 ----
+void decor_attach(struct toplevel *tl);
+void decor_update(struct toplevel *tl);
+void decor_hide(struct toplevel *tl);
+void decor_focus_changed(struct toplevel *tl, struct toplevel *prev);
+float decor_border_width(struct toplevel *tl);
 
 // ---- place.c: 初始窗口放置 ----
 // 尺寸完全由客户端决定, 位置在输出 (屏幕) 上居中
 bool place_toplevel(struct server *server, struct toplevel *tl);
-
-// ---- animate.c: 窗口动画 (仅淡入淡出) ----
-// 返回 false 时调用方必须瞬时应用状态变化.
-//   fade_in:  新窗口 0 -> 1
-//   close:    1 -> 0, 不可见后再发 xdg close (期间返回 true, 调用方不要自行 close)
-//   minimize: 最小化淡出后隐藏节点; restore: 显示节点并淡入
-//   cancel:   窗口提前 unmaps, 停止动画并恢复可见状态
-bool animate_toplevel_fade_in(struct server *server, struct toplevel *tl);
-bool animate_toplevel_close(struct toplevel *tl);
-bool animate_toplevel_minimize(struct server *server, struct toplevel *tl);
-bool animate_toplevel_restore(struct server *server, struct toplevel *tl);
-void animate_toplevel_cancel(struct toplevel *tl);
-// 推进所有动画到给定时刻; 由输出 frame 处理器在场景渲染前调用 (output.c)
-void anim_frame_tick(struct server *server, uint32_t now_ms);
 
 // ---- layer.c: wlr-layer-shell + 作区 ----
 void get_work_area(struct server *server, struct wlr_output *output,

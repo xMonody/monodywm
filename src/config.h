@@ -1,6 +1,6 @@
 // config.h - xmonodywm 编译期配置
 //
-// 所有可调项都在这里: 移动/缩放抓取区、窗口动画、合成器快捷键等.
+// 所有可调项都在这里: 移动/缩放抓取区、窗口装饰、合成器快捷键等.
 // 改完数值重新编译即可.
 
 #ifndef XMONODYWM_CONFIG_H
@@ -11,13 +11,13 @@
 #include <wlr/types/wlr_keyboard.h>
 
 //#define CONFIG_CURSOR_THEME    "McMojave-cursors"      // 光标主题
-#define CONFIG_CURSOR_THEME    "Adwaita"      // 光标主题
-#define CONFIG_TITLEBAR_CURSOR "pointer"      // 悬停标题栏时显示的光标
-#define CONFIG_MOVE_CURSOR     "all-scroll"   // 拖动(移动)窗口时显示的光标
+#define CONFIG_CURSOR_THEME    "Adwaita"     // 光标主题
+#define CONFIG_TITLEBAR_CURSOR "pointer"     // 悬停标题栏时显示的光标
+#define CONFIG_MOVE_CURSOR     "all-scroll"  // 拖动(移动)窗口时显示的光标
 
-#define CONFIG_ROUNDED_RADIUS    8           // 窗口圆角半径 (px)
-#define CONFIG_BORDER_WIDTH      2.0           // 窗口边框宽度 (px)
-#define CONFIG_BORDER_UNFOCUSED_DRAW 2.0         // 未聚焦窗口边框宽度
+#define CONFIG_ROUNDED_RADIUS        8       // 窗口圆角半径 (px)
+#define CONFIG_BORDER_WIDTH          2.0     // 窗口边框宽度 (px)
+#define CONFIG_BORDER_UNFOCUSED_DRAW 1       // 未聚焦窗口是否边框
 
 #define CONFIG_BORDER_FOCUSED    0x7c73b0    // 有焦点边框颜色 0xRRGGBB
 #define CONFIG_BORDER_UNFOCUSED  0x7c73b0    // 无焦点边框颜色 0xRRGGBB
@@ -25,30 +25,41 @@
 #define CONFIG_BORDER_TOP_LEFT   0x7c73b0    // 顶部边框左1/3颜色 (最小化)
 #define CONFIG_BORDER_TOP_MID    0xb87898    // 顶部边框中1/3颜色 (最大化)
 #define CONFIG_BORDER_TOP_RIGHT  0x7c73b0    // 顶部边框右1/3颜色 (关闭)
-#define CONFIG_BORDER_GRADIENT_WIDTH 15       // 顶部边框三段颜色拼接处渐变宽度 (px)
+#define CONFIG_BORDER_GRADIENT_WIDTH 15      // 顶部边框三段颜色拼接处渐变宽度 (px)
+#define CONFIG_BORDER_GRADIENT_STEPS 8 // 分段越多越平滑, 每窗节点数 = 3 + 2*该值)
 
 #define CONFIG_FULLSCREEN_BORDER 1              // 全屏窗口是否显示边框 0/1
 #define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 // 全屏边框颜色 0xRRGGBB
+#define CONFIG_FULLSCREEN_ROUNDED_RADIUS 8      // 全屏窗口圆角半径 (px, 0 = 直角)
 
-// 窗口阴影 (高斯柔影, 颜色独立于边框色):
-#define CONFIG_SHADOW_BLUR_SIGMA 16.0f
-#define CONFIG_SHADOW_COLOR      0x22222f
-#define CONFIG_SHADOW_ALPHA      0.4f
+// 背景模糊: 和 swayfx 一样, 模糊整块窗口内容区, 不额外叠任何颜色层.
+// 毛玻璃的颜色完全由窗口自身的半透明背景色决定 (所以不需要指定颜色).
+// 不透明窗口看不到模糊. 数值越大越糊:
+//   passes 影响最大 (每 +1 约翻倍), radius 是每遍的采样半径.
+#define CONFIG_BLUR 1           // 是否启用背景模糊 0/1
+// 状态栏/面板 (layer-shell 非 overlay 层) 是否也加背景模糊.
+// overlay 层是 rofi/wofi/fuzzel 这类全屏启动器, 始终不加模糊 (否则整块
+// 桌面都会被糊住 - 点击状态栏弹出的通常正是这类窗口).
+#define CONFIG_BLUR_LAYER 1
+#define CONFIG_BLUR_RADIUS 5    // 模糊半径 (scenefx 默认 5)
+#define CONFIG_BLUR_PASSES 2    // 降采样遍数 (scenefx 默认 3)
 
-#define CONFIG_ANIM_ENABLE   1   // 设为 0 则关闭动画, 行为与原来一致: 瞬时切换
-#define CONFIG_ANIM_FADE_MS  50  // 创建淡入 / 关闭淡出 时长 (ms)
+// 窗口阴影 高斯柔影 颜色独立于边框色
+#define CONFIG_SHADOW_BLUR_SIGMA 15.0f
+#define CONFIG_SHADOW_COLOR      0x000000
+#define CONFIG_SHADOW_ALPHA      0.5f
 
-#define CONFIG_TITLEBAR_HEIGHT  6           // 移动窗口标题栏范围
-#define CONFIG_EDGE_THICKNESS   6           // 调整窗口大小边框范围
+#define CONFIG_TITLEBAR_HEIGHT  6            // 移动窗口标题栏范围
+#define CONFIG_EDGE_THICKNESS   6            // 调整窗口大小边框范围
 #define CONFIG_RESIZE_DRAW_CONTENTS 1        // 1 = 实时 resize 客户端; 0 = 拖动时只画轮廓、松开再应用 (边缘跟手)
-#define CONFIG_RESIZE_FINAL_TIMEOUT_MS 500  // outline 模式: 松开后客户端迟迟不提交最终尺寸时的强制结束宽限
+#define CONFIG_RESIZE_FINAL_TIMEOUT_MS 500   // outline 模式: 松开后客户端迟迟不提交最终尺寸时的强制结束宽限
 
 #define CONFIG_DOUBLE_CLICK_NS (400 * 1000000L) // 双击窗口判定窗口 (ns)
-#define CONFIG_LONG_PRESS_NS (350 * 1000000L) // 标题栏按住这么久即抓取窗口 (ns)
-#define CONFIG_DRAG_THRESHOLD 4.0         // 判断是否移动窗口
+#define CONFIG_LONG_PRESS_NS (350 * 1000000L)   // 标题栏按住这么久即抓取窗口 (ns)
+#define CONFIG_DRAG_THRESHOLD 4.0               // 判断是否移动窗口
 
-#define CONFIG_WHEEL_DEBOUNCE_ENABLED true // 控制是否启用鼠标组合手势
-#define CONFIG_WHEEL_BURST_NS (800 * 1000000L)   // 一次连续滚动最长算一个动作 (0.8 s)
+#define CONFIG_WHEEL_DEBOUNCE_ENABLED true        // 控制是否启用鼠标组合手势
+#define CONFIG_WHEEL_BURST_NS (800 * 1000000L)    // 一次连续滚动最长算一个动作 (0.8 s)
 #define CONFIG_WHEEL_TICK_GAP_NS (300 * 1000000L) // 两次滚轮间隔达到此值即算下一个动作 (0.3 s)
 
 // 新窗口放置 (place.c): 创建时大小完全尊重客户端, 位置在屏幕上左右上下居中.

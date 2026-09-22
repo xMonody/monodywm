@@ -11,14 +11,13 @@ add_compile_definitions(WLR_USE_UNSTABLE)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(WLROOTS REQUIRED IMPORTED_TARGET wlroots-0.20)
+pkg_check_modules(SCENEFX REQUIRED IMPORTED_TARGET scenefx-0.5)
 pkg_check_modules(WAYLAND_SERVER REQUIRED IMPORTED_TARGET wayland-server)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(CJSON REQUIRED IMPORTED_TARGET libcjson)
 pkg_check_modules(PIXMAN REQUIRED IMPORTED_TARGET pixman-1)
 pkg_check_modules(LIBINPUT REQUIRED IMPORTED_TARGET libinput)
-pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
-pkg_check_modules(GLESV2 REQUIRED IMPORTED_TARGET glesv2)
 
 find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
 
@@ -201,10 +200,7 @@ set(COMPOSITOR_SOURCES
 	src/scene.c
 	src/ime.c
 	src/toplevel.c
-	src/rounded.c
-	src/border.c
-	src/shadow.c
-	src/animate.c
+	src/decor.c
 	src/place.c
 	src/layer.c
 	src/output.c
@@ -217,15 +213,18 @@ target_include_directories(monodywm PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/src
 	${PROTOCOL_GEN_DIR} # wlroots' installed headers #include generated ones
 )
+# 注意: SCENEFX 必须链接在 WLROOTS 之前。scenefx 是 wlroots scene 的扩展 fork,
+# 两者都导出 wlr_scene_* 符号; 只有让 libscenefx 先链接, 动态链接器才会把
+# wlr_scene_create / wlr_scene_node_at 等解析到 scenefx 的扩展实现, 否则会因
+# 两个库的 struct 布局不一致导致堆损坏。
 target_link_libraries(monodywm PRIVATE
+	PkgConfig::SCENEFX
 	PkgConfig::WLROOTS
 	PkgConfig::WAYLAND_SERVER
 	PkgConfig::XKBCOMMON
 	PkgConfig::CJSON
 	PkgConfig::LIBINPUT
 	PkgConfig::PIXMAN
-	PkgConfig::EGL
-	PkgConfig::GLESV2
 	m
 )
 install(TARGETS monodywm RUNTIME DESTINATION bin)

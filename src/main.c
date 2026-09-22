@@ -33,6 +33,8 @@
 
 #include <wayland-server-core.h>
 
+#include <scenefx/render/fx_renderer/fx_renderer.h>
+
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
@@ -52,7 +54,6 @@
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
 
-#include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_virtual_keyboard_v1.h>
@@ -315,7 +316,7 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create backend");
 		return EXIT_FAILURE;
 	}
-	server.renderer = wlr_renderer_autocreate(server.backend);
+	server.renderer = fx_renderer_create(server.backend);
 	if (server.renderer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create renderer");
 		return EXIT_FAILURE;
@@ -331,6 +332,10 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create scene");
 		return EXIT_FAILURE;
 	}
+	// 背景模糊强度: 只覆盖 radius / passes, 其余 (noise/亮度/对比度/饱和度)
+	// 保持 scenefx 默认值, 这样玻璃颜色仍由窗口自身背景决定.
+	wlr_scene_set_blur_radius(server.scene, CONFIG_BLUR_RADIUS);
+	wlr_scene_set_blur_num_passes(server.scene, CONFIG_BLUR_PASSES);
 	server.output_layout = wlr_output_layout_create(server.display);
 	server.output_manager = wlr_output_manager_v1_create(server.display);
 	// xdg-output-unstable-v1: 告诉客户端 (grim、xwayland 等) 每个输出的

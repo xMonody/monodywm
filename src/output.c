@@ -13,7 +13,6 @@
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_output_management_v1.h>
-#include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
 struct monitor {
@@ -25,7 +24,11 @@ struct monitor {
 	uint32_t fps_frames;
 	uint32_t fps_start_ms;
 
+	// 上次 commit 的输出 scale (用于检测缩放变化)
+	float scale;
+
 	struct wl_listener frame;
+	struct wl_listener commit;
 	struct wl_listener destroy;
 };
 
@@ -35,12 +38,6 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	uint32_t now_ms = (uint32_t)now.tv_sec * 1000u +
 		(uint32_t)(now.tv_nsec / 1000000u);
-	// 在场景采样之前, 把所有运行中的窗口动画推进到本帧自己的时刻,
-	// 这样每个渲染帧显示的都是它自己 vblank 对应的缓动状态
-	// (见 animate.c: 不存在更新定时器与 vblank 的节拍错位, 高刷输出会插值出更多状态)
-	anim_frame_tick(mon->server, now_ms);
-	// 场景采样前, 先渲染所有脏的离屏圆角 FBO
-	rounded_render_all(mon->server);
 	if (!wlr_scene_output_commit(mon->scene_output, NULL)) {
 		return;
 	}
@@ -62,9 +59,29 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	}
 }
 
+// 输出 scale 变化: 阴影的 blur_sigma 由 decor.c 按输出 scale 补偿 (scenefx
+// 不缩放它), 所以缩放改变后必须重刷该输出上窗口的装饰. 节点位置/尺寸与圆角
+// 由 scenefx 自行缩放, 不需要在这里处理.
+static void monitor_commit(struct wl_listener *listener, void *data) {
+	struct monitor *mon = wl_container_of(listener, mon, commit);
+	struct wlr_output *output = mon->output;
+	if (output->scale == mon->scale) {
+		return;
+	}
+	mon->scale = output->scale;
+	wlr_xcursor_manager_load(mon->server->xcursor_manager, output->scale);
+	struct toplevel *tl;
+	wl_list_for_each(tl, &mon->server->toplevels, link) {
+		if (toplevel_output(mon->server, tl) == output) {
+			decor_update(tl);
+		}
+	}
+}
+
 static void monitor_destroy(struct wl_listener *listener, void *data) {
 	struct monitor *mon = wl_container_of(listener, mon, destroy);
 	wl_list_remove(&mon->frame.link);
+	wl_list_remove(&mon->commit.link);
 	wl_list_remove(&mon->destroy.link);
 	free(mon);
 }
@@ -154,8 +171,11 @@ void server_new_output(struct wl_listener *listener, void *data) {
 	mon->server = server;
 	mon->output = output;
 	mon->scene_output = scene_output;
+	mon->scale = output->scale;
 	mon->frame.notify = monitor_frame;
 	wl_signal_add(&output->events.frame, &mon->frame);
+	mon->commit.notify = monitor_commit;
+	wl_signal_add(&output->events.commit, &mon->commit);
 	mon->destroy.notify = monitor_destroy;
 	wl_signal_add(&output->events.destroy, &mon->destroy);
 

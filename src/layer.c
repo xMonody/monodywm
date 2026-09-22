@@ -8,7 +8,6 @@
 #include <stdlib.h>
 
 #include <wlr/types/wlr_output_layout.h>
-#include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
 static int scene_layer_index(enum zwlr_layer_shell_v1_layer layer) {
@@ -51,6 +50,61 @@ static void layer_surface_exclusive_zone(struct wlr_layer_surface_v1_state *stat
 	}
 }
 
+// 状态栏实际绘制的矩形 (scene 树位置 + surface 尺寸). 如果它比 exclusive_zone
+// 更高/更宽 (自绘了额外边框/阴影, 或独占区设小了), 就按实际矩形再收紧作区,
+// 这样最大化窗口的边框不会被状态栏盖住.
+static void layer_surface_visual_zone(struct layer_surface *ls,
+		struct wlr_box *area) {
+	struct wlr_layer_surface_v1_state *state = &ls->layer_surface->current;
+	if (state->exclusive_zone <= 0) {
+		return;
+	}
+	int w = ls->layer_surface->surface->current.width;
+	int h = ls->layer_surface->surface->current.height;
+	if (w <= 0 || h <= 0) {
+		return;
+	}
+	int bx = ls->scene_layer->tree->node.x;
+	int by = ls->scene_layer->tree->node.y;
+	// 与 wlroots/本文件一致的独占边判定 (只看该边, 不牵扯其他边)
+	switch (wlr_layer_surface_v1_get_exclusive_edge(ls->layer_surface)) {
+	case WLR_EDGE_TOP: {
+		int edge = by + h;
+		if (edge > area->y) {
+			area->height -= edge - area->y;
+			area->y = edge;
+		}
+		break;
+	}
+	case WLR_EDGE_BOTTOM:
+		if (by < area->y + area->height) {
+			area->height = by - area->y;
+		}
+		break;
+	case WLR_EDGE_LEFT: {
+		int edge = bx + w;
+		if (edge > area->x) {
+			area->width -= edge - area->x;
+			area->x = edge;
+		}
+		break;
+	}
+	case WLR_EDGE_RIGHT:
+		if (bx < area->x + area->width) {
+			area->width = bx - area->x;
+		}
+		break;
+	default:
+		return;
+	}
+	if (area->width < 0) {
+		area->width = 0;
+	}
+	if (area->height < 0) {
+		area->height = 0;
+	}
+}
+
 void get_work_area(struct server *server, struct wlr_output *output,
 		struct wlr_box *area) {
 	wlr_output_layout_get_box(server->output_layout, output, area);
@@ -67,6 +121,8 @@ void get_work_area(struct server *server, struct wlr_output *output,
 		}
 		if (layer->surface->mapped) {
 			layer_surface_exclusive_zone(&layer->current, area);
+			// 再用实际绘制矩形收紧一次, 防止独占区小于视觉高度
+			layer_surface_visual_zone(ls, area);
 		}
 	}
 }
@@ -88,6 +144,19 @@ static void configure_layer_surface(struct layer_surface *ls) {
 	struct wlr_box usable_area = full_area;
 	wlr_scene_layer_surface_v1_configure(ls->scene_layer, &full_area,
 		&usable_area);
+
+	// 面板/状态栏模糊: 节点已被 configure 定位到 box.x/box.y, surface 填满整棵树,
+	// 所以 blur 放在 (0,0) 并取 surface 尺寸即可与面板对齐.
+	if (ls->blur != NULL) {
+		int w = layer_surface->surface->current.width;
+		int h = layer_surface->surface->current.height;
+		if (CONFIG_BLUR && w > 0 && h > 0) {
+			wlr_scene_node_set_enabled(&ls->blur->node, true);
+			wlr_scene_blur_set_size(ls->blur, w, h);
+		} else {
+			wlr_scene_node_set_enabled(&ls->blur->node, false);
+		}
+	}
 }
 
 // 跟踪 layer surface 的独占区几何自上次提交以来是否变化
@@ -417,6 +486,19 @@ void server_new_layer_surface(struct wl_listener *listener, void *data) {
 		return;
 	}
 	xdg_surface_tag(ls->scene_layer->tree, TAG_LAYER, ls);
+
+	// 只为状态栏/面板 (非 overlay 层) 建背景模糊节点, 落到底部 (内容之下).
+	// overlay 层是启动器/覆盖菜单 (rofi/wofi/fuzzel 等), 往往全屏, 给它们
+	// 模糊会把整个桌面都糊掉 - 点击状态栏弹出的通常正是这类窗口.
+	// 不设透明掩码: 整块面板区域都模糊, 面板自身的半透明背景色决定最终观感.
+    if (CONFIG_BLUR && CONFIG_BLUR_LAYER && layer_surface->pending.layer
+            != ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY) {
+        ls->blur = wlr_scene_blur_create(ls->scene_layer->tree, 0, 0);
+        if (ls->blur != NULL) {
+            wlr_scene_node_lower_to_bottom(&ls->blur->node);
+            wlr_scene_node_set_enabled(&ls->blur->node, false);
+        }
+    }
 
 	ls->destroy.notify = layer_surface_destroy;
 	wl_signal_add(&layer_surface->events.destroy, &ls->destroy);

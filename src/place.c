@@ -19,7 +19,6 @@
 #include "server.h"
 
 #include <wlr/types/wlr_output_layout.h>
-#include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_xdg_shell.h>
 
 // 把 toplevel 居中到光标所在的输出 (光标不在任何输出上时退回中心输出).

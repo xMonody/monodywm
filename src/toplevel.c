@@ -9,6 +9,7 @@
 
 #include "ipc.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,9 +17,7 @@
 #include <strings.h>
 
 #include <wlr/types/wlr_output_layout.h>
-#include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
-#include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <wlr/util/box.h>
@@ -75,13 +74,27 @@ static struct toplevel *window_ancestor(struct server *server, pid_t pid) {
 }
 // 客户端上报的 xdg window geometry 框 (按 xdg-shell 的窗口边界, 不含 CSD
 // 边距/投影). xdg 场景树锚定在该框的左上角. 仅用于定位/约束/保存浮动几何 -
-// 渲染、动画、命中一律用 toplevel_frame_box() (见下).
+// 渲染、命中一律用 toplevel_frame_box() (见下).
 void toplevel_box(struct toplevel *tl, struct wlr_box *box) {
 	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 	box->x = tl->scene_tree->node.x;
 	box->y = tl->scene_tree->node.y;
 	box->width = base != NULL ? base->geometry.width : 0;
 	box->height = base != NULL ? base->geometry.height : 0;
+}
+
+// 合成器显示外框 = 客户端 window geometry 向外扩一个边框宽. 边框画在内容外侧
+// (decor.c), 所以命中/约束一律用外框, 交互内边界从边框外缘算起.
+// 宽度不写死: 取 decor_border_width(), 全屏/未聚焦策略变化时自动跟随.
+static void expand_frame_box(struct toplevel *tl, struct wlr_box *box) {
+	int bw = (int)roundf(decor_border_width(tl));
+	if (bw <= 0) {
+		return;
+	}
+	box->x -= bw;
+	box->y -= bw;
+	box->width += 2 * bw;
+	box->height += 2 * bw;
 }
 
 // 对话框/瞬态窗口: set_parent 声明了父 toplevel, 或 xdg-dialog-v1 显式标记.
@@ -257,28 +270,44 @@ static void fullscreen_box(struct server *server, struct wlr_output *output,
 	wlr_output_layout_get_box(server->output_layout, output, box);
 }
 
-// 合成器为窗口安排的显示框 (渲染/命中用):
-//   最大化 -> 作区矩形; 全屏 -> 整个输出; 浮动 -> 客户端 window geometry.
+// 合成器为窗口安排的显示外框 (渲染/命中用):
+//   最大化 -> 作区矩形; 全屏 -> 整个输出 (客户端内容已在其内缩一个边框宽);
+//   浮动 -> 客户端 window geometry 向外扩一个边框宽 (边框画在内容外侧).
 // 用客户端 ack 后的 current.* 状态, 不用 set_* 立即置位的标志.
 void toplevel_frame_box(struct server *server, struct toplevel *tl,
 		struct wlr_box *box) {
+	// 还原过程中客户端还没 ack: current.maximized/fullscreen 仍为 true,
+	// 若直接返回作区/输出框, 边框会以旧尺寸挂在新位置上. 用保存的还原尺寸
+	// 占位 (位置取当前节点, 拖动还原时也能跟随), 直到 commit 清掉该标志.
+	if (tl->restore_frame_pending) {
+		box->x = tl->scene_tree->node.x;
+		box->y = tl->scene_tree->node.y;
+		box->width = tl->restore_frame_w;
+		box->height = tl->restore_frame_h;
+		expand_frame_box(tl, box);
+		return;
+	}
 	// 目标尺寸还没落框: 保持浮动框, 免得旧 buffer 先跳到作区/输出左上角
 	if (tl->pending_frame) {
 		toplevel_box(tl, box);
+		expand_frame_box(tl, box);
 		return;
 	}
 	struct wlr_output *output = toplevel_output(server, tl);
 	if (output != NULL) {
 		if (tl->xdg_toplevel->current.fullscreen) {
+			// 全屏外框就是整个输出 (客户端内容已在其内缩)
 			fullscreen_box(server, output, box);
 			return;
 		}
 		if (tl->xdg_toplevel->current.maximized) {
+			// 最大化外框就是作区 (客户端内容已在其内缩)
 			maximized_box(server, output, box);
 			return;
 		}
 	}
 	toplevel_box(tl, box);
+	expand_frame_box(tl, box);
 }
 
 // 客户端 buffer 是否已重排到目标尺寸 (落框等待的门控).
@@ -302,7 +331,7 @@ void arrange_toplevels_work_area(struct server *server,
 	wl_list_for_each(tl, &server->toplevels, link) {
 		struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 		if (base == NULL || !base->surface->mapped || tl->minimized ||
-				tl->closing || tl->fullscreen) {
+				tl->fullscreen) {
 			// 全屏窗口有意覆盖整个输出 (含状态栏)
 			continue;
 		}
@@ -320,16 +349,28 @@ void arrange_toplevels_work_area(struct server *server,
 			// 把最大化窗口重新适配到 (可能已缩小的) 作区
 			struct wlr_box mbox;
 			maximized_box(server, output, &mbox);
+			int bw = (int)roundf(decor_border_width(tl));
+			int cw = mbox.width - 2 * bw;
+			int ch = mbox.height - 2 * bw;
+			if (cw < 1) {
+				cw = 1;
+			}
+			if (ch < 1) {
+				ch = 1;
+			}
+			int cx = mbox.x + bw;
+			int cy = mbox.y + bw;
 			if (tl->pending_frame) {
-				tl->pending_frame_box = mbox; // 只更新等待目标, 不动节点
+				// 只更新等待目标 (内容框), 不动节点
+				tl->pending_frame_box = (struct wlr_box){
+					.x = cx, .y = cy, .width = cw, .height = ch,
+				};
 				continue;
 			}
-			if (box.x != mbox.x || box.y != mbox.y ||
-					box.width != mbox.width || box.height != mbox.height) {
-				wlr_xdg_toplevel_set_size(tl->xdg_toplevel, mbox.width,
-					mbox.height);
-				wlr_scene_node_set_position(&tl->scene_tree->node, mbox.x,
-					mbox.y);
+			if (box.x != cx || box.y != cy ||
+					box.width != cw || box.height != ch) {
+				wlr_xdg_toplevel_set_size(tl->xdg_toplevel, cw, ch);
+				wlr_scene_node_set_position(&tl->scene_tree->node, cx, cy);
 			}
 			continue;
 		}
@@ -358,7 +399,6 @@ struct toplevel *neighbor_toplevel(struct server *server,
 		struct toplevel *candidate = wl_container_of(iter, candidate, link);
 		if (candidate->xdg_toplevel->base != NULL &&
 				candidate->xdg_toplevel->base->surface->mapped &&
-				!candidate->closing &&
 				(include_minimized || !candidate->minimized)) {
 			return candidate;
 		}
@@ -423,7 +463,7 @@ static void focus_toplevel_state_only(struct server *server,
 		if (next->fthandle != NULL) {
 			wlr_foreign_toplevel_handle_v1_set_activated(next->fthandle, true);
 		}
-		border_focus_changed(next, prev);
+		decor_focus_changed(next, prev);
 	}
 	ipc_send_focus(server, next);
 }
@@ -436,46 +476,6 @@ void close_toplevel(struct toplevel *tl) {
 	if (tl->xdg_toplevel->base == NULL) {
 		return;
 	}
-	if (tl->closing) {
-		return; // 关闭已在等待中; 淡出接管该请求
-	}
-	if (animate_toplevel_close(tl)) {
-		// 淡出正在运行, 窗口不可见后再发送关闭请求 (animate.c).
-		// 关闭现在是粘性的: 窗口在真正消失前都是惰性的 - 不可重新聚焦、
-		// 最小化、最大化或还原, 所以之后的用户操作无法悄悄取消关闭 -
-		// 淡出结束时 animate.c 会禁用其场景节点, 不理会关闭请求的客户端
-		// 也绝不会留下不可见却阻塞输入的窗口.
-		struct server *server = tl->server;
-		tl->closing = true;
-		if (server->focused == tl) {
-			// 立即把键盘焦点交给本窗口死亡时会接收它的窗口 (类似最小化):
-			// 输入绝不能继续指向正在淡出的窗口
-			struct toplevel *prev = focus_fallback(server, tl);
-			server->focused = NULL;
-			if (tl->xdg_toplevel->base != NULL) {
-				wlr_xdg_toplevel_set_activated(tl->xdg_toplevel, false);
-			}
-			if (server->layer_focused != NULL) {
-				// 覆盖层持有键盘: 保留, 只移动逻辑焦点
-				focus_toplevel_state_only(server, tl, prev);
-			} else {
-				wlr_seat_keyboard_clear_focus(server->seat);
-				if (prev != NULL) {
-					focus_toplevel(server, prev);
-				} else {
-					ipc_send_window_event(server, "window_focus", NULL);
-					ime_set_focus(server, NULL);
-				}
-			}
-			// 淡出必须保持在新聚焦窗口之上可见
-			// (对应最小化掉落: 焦点移走后把掉落窗口提升到顶部)
-			if (tl->scene_tree != NULL) {
-				wlr_scene_node_raise_to_top(&tl->scene_tree->node);
-			}
-		}
-		return;
-	}
-	// 没有运行淡出 (动画被禁用, 或窗口已隐藏): 立即关闭
 	wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
 }
 
@@ -488,61 +488,97 @@ static void apply_saved_box(struct server *server, struct toplevel *tl,
 	restore_box_position(server, box, &x, &y);
 	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box->width, box->height);
 	wlr_scene_node_set_position(&tl->scene_tree->node, x, y);
+	// 节点已经移到还原后的位置, 但客户端 ack 前 current.maximized/fullscreen
+	// 还没翻转; 用保存的框占位并立刻重排边框/阴影, 避免旧尺寸挂在新位置.
+	tl->restore_frame_pending = true;
+	tl->restore_frame_w = box->width;
+	tl->restore_frame_h = box->height;
+	decor_update(tl);
 }
 
 // 适配到输出的作区框; 没有输出时返回 false (调用方决定是否退回 0x0)
 static bool apply_maximized_box(struct server *server, struct toplevel *tl) {
+	tl->restore_frame_pending = false;
 	struct wlr_output *output = toplevel_output(server, tl);
 	if (output == NULL) {
 		return false;
 	}
 	struct wlr_box box;
 	maximized_box(server, output, &box);
-	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box.width, box.height);
-	if (toplevel_content_at_size(tl, box.width, box.height)) {
-		wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
+	// 外框 = 作区; 客户端内容内缩一个边框宽, 边框画在内容之外
+	int bw = (int)roundf(decor_border_width(tl));
+	int cw = box.width - 2 * bw;
+	int ch = box.height - 2 * bw;
+	if (cw < 1) {
+		cw = 1;
+	}
+	if (ch < 1) {
+		ch = 1;
+	}
+	int cx = box.x + bw;
+	int cy = box.y + bw;
+	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, cw, ch);
+	if (toplevel_content_at_size(tl, cw, ch)) {
+		wlr_scene_node_set_position(&tl->scene_tree->node, cx, cy);
 		tl->pending_frame = false;
 	} else {
 		// buffer 未就绪: 停在原位, 等提交到目标尺寸再落框
 		tl->pending_frame = true;
-		tl->pending_frame_box = box;
+		tl->pending_frame_box = (struct wlr_box){
+			.x = cx, .y = cy, .width = cw, .height = ch,
+		};
 	}
 	return true;
 }
 
 void set_fullscreen(struct server *server, struct toplevel *tl,
 		bool fullscreen) {
-	if (tl->closing || tl->xdg_toplevel->base == NULL ||
+	if (tl->xdg_toplevel->base == NULL ||
 			tl->xdg_toplevel->current.fullscreen == fullscreen) {
 		return;
 	}
 	tl->user_moved = true; // 全屏状态: 停止自动居中
 	tl->pending_frame = false;
-	// 在改动 tl->fullscreen 前取当前显示框, 作为进入全屏时的还原框
+	tl->restore_frame_pending = false;
+	// 在改动 tl->fullscreen 前取当前内容框 (scene_tree 位置 + geometry),
+	// 作为进入全屏时的还原框. 必须是内容框: apply_saved_box 用它 set_size/定位.
 	struct wlr_box from_box;
-	toplevel_frame_box(server, tl, &from_box);
+	toplevel_box(tl, &from_box);
 	if (fullscreen) {
 		// 与 restore_box 分开保存, 免得从最大化进全屏覆盖浮动几何
 		tl->fullscreen_restore_box = from_box;
 		tl->has_fullscreen_restore_box = true;
 	}
 	tl->fullscreen = fullscreen;
-	// 边框宽度/颜色依赖全屏状态
-	rounded_cache_dirty(tl);
+	// 边框宽度/颜色依赖全屏状态; 全屏时内容圆角也要重设
+	decor_update(tl);
 	if (fullscreen) {
 		struct wlr_output *output = toplevel_output(server, tl);
 		if (output != NULL) {
 			struct wlr_box fbox;
 			fullscreen_box(server, output, &fbox);
-			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, fbox.width,
-				fbox.height);
+			// 外框 = 整个输出; 客户端内容内缩一个边框宽
+			int bw = (int)roundf(decor_border_width(tl));
+			int cw = fbox.width - 2 * bw;
+			int ch = fbox.height - 2 * bw;
+			if (cw < 1) {
+				cw = 1;
+			}
+			if (ch < 1) {
+				ch = 1;
+			}
+			int cx = fbox.x + bw;
+			int cy = fbox.y + bw;
+			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, cw, ch);
 			// buffer 未就绪时停在原位, 等提交到全屏尺寸再落框
-			if (toplevel_content_at_size(tl, fbox.width, fbox.height)) {
-				wlr_scene_node_set_position(&tl->scene_tree->node, fbox.x,
-					fbox.y);
+			if (toplevel_content_at_size(tl, cw, ch)) {
+				wlr_scene_node_set_position(&tl->scene_tree->node, cx,
+					cy);
 			} else {
 				tl->pending_frame = true;
-				tl->pending_frame_box = fbox;
+				tl->pending_frame_box = (struct wlr_box){
+					.x = cx, .y = cy, .width = cw, .height = ch,
+				};
 			}
 		} else {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, 0, 0);
@@ -566,7 +602,7 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 
 void set_maximized(struct server *server, struct toplevel *tl,
 		bool maximized) {
-	if (tl->closing || tl->xdg_toplevel->base == NULL) {
+	if (tl->xdg_toplevel->base == NULL) {
 		return;
 	}
 	if (!maximized) {
@@ -632,7 +668,7 @@ void set_maximized(struct server *server, struct toplevel *tl,
 
 // 取消最大化回到之前保存的几何 (拖动最大化窗口的标题栏, 键盘/按钮切换).
 void restore_maximized_toplevel(struct toplevel *tl) {
-	if (tl->closing || tl->xdg_toplevel->base == NULL ||
+	if (tl->xdg_toplevel->base == NULL ||
 			!tl->xdg_toplevel->current.maximized || tl->fullscreen) {
 		return;
 	}
@@ -650,10 +686,6 @@ void restore_maximized_toplevel(struct toplevel *tl) {
 
 void set_minimized(struct server *server, struct toplevel *tl,
 		bool minimized) {
-	if (tl->closing) {
-		// 关闭已在等待中: 绝不最小化/还原垂死的窗口
-		return;
-	}
 	if (toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
 		// 对话框和固定尺寸窗口没有最小化按钮
 		return;
@@ -687,13 +719,12 @@ void set_minimized(struct server *server, struct toplevel *tl,
 			}
 		}
 	}
-	// 淡出后隐藏 / 显示后淡入; 动画不可用时直接隐藏/显示节点
-	if (minimized) {
-		if (!animate_toplevel_minimize(server, tl)) {
-			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
-		}
-	} else if (!animate_toplevel_restore(server, tl)) {
-		wlr_scene_node_set_enabled(&tl->scene_tree->node, true);
+	// 最小化/还原: 直接隐藏/显示节点
+	wlr_scene_node_set_enabled(&tl->scene_tree->node, !minimized);
+	if (!minimized) {
+		// 最小化期间 decor_update 被跳过, 还原时补齐圆角/边框/阴影
+		// (期间若提交过新 buffer, 其圆角也在这里补上)
+		decor_update(tl);
 	}
 	// 隐藏/显示窗口都可能让光标下露出/盖上不同的 surface:
 	// 重做命中测试, 让指针焦点和光标样式立刻跟上
@@ -718,7 +749,7 @@ static void toplevel_raise(struct server *server, struct toplevel *tl) {
 }
 
 void focus_toplevel(struct server *server, struct toplevel *tl) {
-	if (tl->closing || tl->minimized || tl->xdg_toplevel->base == NULL ||
+	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
 			!tl->xdg_toplevel->base->surface->mapped) {
 		return;
 	}
@@ -735,9 +766,8 @@ void focus_toplevel(struct server *server, struct toplevel *tl) {
 		}
 	}
 	server->focused = tl;
-	// 边框颜色依赖焦点: 重绘新聚焦窗口和先前聚焦窗口,
-	// 让它们的圆角 FBO 取到新的聚焦/未聚焦边框色 (见 border.c)
-	border_focus_changed(tl, prev);
+	// 边框颜色/阴影依赖焦点: 重绘新聚焦窗口和先前聚焦窗口
+	decor_focus_changed(tl, prev);
 	wlr_xdg_toplevel_set_activated(tl->xdg_toplevel, true);
 	if (tl->fthandle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_activated(tl->fthandle, true);
@@ -794,6 +824,8 @@ void update_toplevel_output(struct server *server, struct toplevel *tl) {
 	if (output != NULL) {
 		wlr_foreign_toplevel_handle_v1_output_enter(tl->fthandle, output);
 	}
+	// 输出的 scale 可能不同: 阴影的 blur_sigma 需要按新输出重算
+	decor_update(tl);
 }
 
 // ------------------------------------------------------------------
@@ -834,105 +866,8 @@ static void toplevel_unfocus(struct server *server, struct toplevel *tl) {
 }
 
 // ------------------------------------------------------------------
-// subsurface: 它们的 commit 把圆角 FBO 缓存标记为脏,
-// 内容变化时重绘离屏副本
+// 任务栏可见性与对话框归属
 // ------------------------------------------------------------------
-
-static void toplevel_subsurface_commit(struct wl_listener *listener,
-		void *data) {
-	struct toplevel_subsurface *ts = wl_container_of(listener, ts, commit);
-	(void)data;
-	// wlroots 在提交后会把 subsuface 的透明度重新应用为 1.0; 重新隐藏它
-	// (仅当已经发布了有效的圆角 FBO), 并重绘 FBO 缓存.
-	// 提交附带的 damage 会被收集用于局部重绘 (rounded.c).
-	rounded_cache_subsurface_commit(ts->tl, ts);
-}
-
-static void toplevel_subsurface_add(struct toplevel *tl,
-		struct wlr_subsurface *subsurface);
-
-static void toplevel_subsurface_destroy(struct wl_listener *listener,
-		void *data) {
-	struct toplevel_subsurface *ts = wl_container_of(listener, ts, destroy);
-	(void)data;
-	wl_list_remove(&ts->commit.link);
-	wl_list_remove(&ts->new_subsurface.link);
-	wl_list_remove(&ts->destroy.link);
-	wl_list_remove(&ts->link);
-	// subsurface 的旧内容必须从缓存 FBO 中消失:
-	// 一次整幅重绘 (伴随其 damage 记账已清除) 会覆盖
-	if (ts->tl->rounded != NULL) {
-		rounded_cache_dirty(ts->tl);
-	}
-	pixman_region32_fini(&ts->damage);
-	free(ts);
-}
-
-static void toplevel_subsurface_new_subsurface(struct wl_listener *listener,
-		void *data) {
-	struct toplevel_subsurface *ts = wl_container_of(listener, ts,
-		new_subsurface);
-	// 嵌套 subsurface (subsurface 的 subsurface): 与直接 subsurface 一样跟踪,
-	// 使其 commit 也失效 FBO
-	toplevel_subsurface_add(ts->tl, data);
-}
-
-static void toplevel_subsurface_add(struct toplevel *tl,
-		struct wlr_subsurface *subsurface) {
-	struct toplevel_subsurface *ts = calloc(1, sizeof(*ts));
-	if (ts == NULL) {
-		return;
-	}
-	ts->tl = tl;
-	ts->subsurface = subsurface;
-	pixman_region32_init(&ts->damage);
-	ts->prev_x = subsurface->current.x;
-	ts->prev_y = subsurface->current.y;
-	ts->prev_w = subsurface->surface->current.width;
-	ts->prev_h = subsurface->surface->current.height;
-	ts->commit.notify = toplevel_subsurface_commit;
-	wl_signal_add(&subsurface->surface->events.commit, &ts->commit);
-	ts->new_subsurface.notify = toplevel_subsurface_new_subsurface;
-	wl_signal_add(&subsurface->surface->events.new_subsurface,
-		&ts->new_subsurface);
-	ts->destroy.notify = toplevel_subsurface_destroy;
-	wl_signal_add(&subsurface->events.destroy, &ts->destroy);
-	wl_list_insert(tl->subsurfaces.prev, &ts->link);
-	// 新加入的 subsurface 必须从场景中隐藏, 并并入下一次 FBO 渲染
-	rounded_cache_hide_content(tl);
-	rounded_cache_dirty(tl);
-
-	// 已存在于它下面的 subsurface 只能靠遍历场景图找到;
-	// 上面的 new_subsurface 监听器只捕获将来的, 所以也要递归已有的子节点
-	struct wlr_subsurface *child;
-	wl_list_for_each(child, &subsurface->surface->current.subsurfaces_below,
-			current.link) {
-		toplevel_subsurface_add(tl, child);
-	}
-	wl_list_for_each(child, &subsurface->surface->current.subsurfaces_above,
-			current.link) {
-		toplevel_subsurface_add(tl, child);
-	}
-}
-
-static void xdg_toplevel_new_subsurface(struct wl_listener *listener,
-		void *data) {
-	struct toplevel *tl = wl_container_of(listener, tl, new_subsurface);
-	toplevel_subsurface_add(tl, data);
-}
-
-// toplevel 释放前移除所有 subsurface 记账
-static void toplevel_destroy_subsurfaces(struct toplevel *tl) {
-	struct toplevel_subsurface *ts, *tmp;
-	wl_list_for_each_safe(ts, tmp, &tl->subsurfaces, link) {
-		wl_list_remove(&ts->commit.link);
-		wl_list_remove(&ts->new_subsurface.link);
-		wl_list_remove(&ts->destroy.link);
-		wl_list_remove(&ts->link);
-		pixman_region32_fini(&ts->damage);
-		free(ts);
-	}
-}
 
 // 让任务栏条目与当前对话框判定保持一致 (map 或 set_parent / xdg-dialog 变化后
 // 调用). 对话框通过 set_parent 声明父窗口或经 xdg-dialog-v1 标记识别;
@@ -956,16 +891,6 @@ static void toplevel_sync_taskbar(struct server *server, struct toplevel *tl) {
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, map);
 	struct server *server = tl->server;
-
-	if (tl->closing) {
-		// 客户端重新显示了被要求关闭的 surface (如用 unmap/remap 花样回应关闭请求):
-		// 保持窗口隐藏并重新发送关闭 - 关闭请求在 surface 销毁前都是粘性的
-		if (tl->scene_tree != NULL) {
-			wlr_scene_node_set_enabled(&tl->scene_tree->node, false);
-		}
-		wlr_xdg_toplevel_send_close(tl->xdg_toplevel);
-		return;
-	}
 
 	if (!tl->positioned) {
 		tl->positioned = true;
@@ -1007,12 +932,7 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 			wlr_xdg_toplevel_set_size(tl->xdg_toplevel, ww, wh);
 		}
 	}
-	rounded_cache_hide_content(tl);
-	rounded_cache_dirty(tl);
-	// 刚映射的窗口淡入 (animate.c)
-	if (!tl->minimized) {
-		animate_toplevel_fade_in(server, tl);
-	}
+	decor_update(tl);
 	// 在静止光标下映射的窗口必须立即显示正确光标 (标题区/resize 边缘),
 	// 而不用等待 motion
 	update_cursor_style(server);
@@ -1020,9 +940,8 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, unmap);
-	// 窗口在动画中途自行隐藏: 停止动画并让窗口处于干净状态
-	// (等待中的最小化完成, 等待中的还原落定)
-	animate_toplevel_cancel(tl);
+	// 内容子树会被 wlroots 禁用, 但边框/阴影/模糊不会: 显式隐藏, 避免残留
+	decor_hide(tl);
 	toplevel_unfocus(tl->server, tl);
 	refresh_pointer_focus(tl->server);
 }
@@ -1052,12 +971,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	// (tl->destroy、tl->new_popup) 保持挂接, 直到 xdg surface 自身销毁.
 	// popup 无需在此清理: 它们的场景树是 tl->scene_tree 的子节点,
 	// 各自在自己的树销毁时自行释放 (树随 popup 的 xdg surface 或 tl->scene_tree 销毁).
-	toplevel_destroy_subsurfaces(tl);
-	wl_list_remove(&tl->new_subsurface.link);
-	if (tl->rounded != NULL) {
-		rounded_cache_destroy(tl->rounded);
-		tl->rounded = NULL;
-	}
+	// 边框/阴影是 scene_tree 的子节点, 随树一并销毁.
 	wl_list_remove(&tl->toplevel_destroy.link);
 	wl_list_remove(&tl->map.link);
 	wl_list_remove(&tl->unmap.link);
@@ -1185,8 +1099,19 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 			}
 		}
 	}
-	// 几何 (以及光标下的 resize/标题区) 可能变化; 圆角 FBO 缓存必须跟随任何
-	// 内容/几何变化. 提交附带的 damage 会被收集用于局部重绘 (rounded.c).
+	// 几何 (以及光标下的 resize/标题区) 可能变化, 边框/圆角要重新刷新.
+	// 还原 configure 已被 ack (current.* 已翻转) 且客户端已把 window geometry
+	// 缩回到还原尺寸: 丢掉占位尺寸, 改用真实几何. 只看 current.* 会在客户端
+	// ack 但 buffer 仍旧尺寸时提前清掉占位, 又变回"旧尺寸挂在新位置"的闪动;
+	// 而 surface >= geometry, 用 toplevel_content_at_size 的 >= 区分不了旧尺寸.
+	if (tl->restore_frame_pending && base != NULL &&
+			!tl->xdg_toplevel->current.maximized &&
+			!tl->xdg_toplevel->current.fullscreen &&
+			base->geometry.width > 0 && base->geometry.height > 0 &&
+			base->geometry.width <= tl->restore_frame_w &&
+			base->geometry.height <= tl->restore_frame_h) {
+		tl->restore_frame_pending = false;
+	}
 	// 客户端 buffer 到位后, 把等待中的目标框落下
 	if (tl->pending_frame && base != NULL &&
 			toplevel_content_at_size(tl, tl->pending_frame_box.width,
@@ -1195,7 +1120,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 			tl->pending_frame_box.x, tl->pending_frame_box.y);
 		tl->pending_frame = false;
 	}
-	rounded_cache_content_commit(tl);
+	decor_update(tl);
 	update_cursor_style(tl->server);
 }
 
@@ -1577,8 +1502,18 @@ void server_new_toplevel(struct wl_listener *listener, void *data) {
 		return;
 	}
 	xdg_surface_tag(tl->scene_tree, TAG_TOPLEVEL, tl);
-	wl_list_init(&tl->subsurfaces);
-	tl->rounded = rounded_cache_create(server, tl);
+	// wlr_scene_xdg_surface_create 返回的树里, 第一个子节点是 toplevel 自身的
+	// subsurface 树 (各 popup 树此后再作为兄弟挂上). 圆角与内容裁切只作用在它
+	// 上面: wlr_scene_subsurface_tree_set_clip 会递归整棵子树, 若从 scene_tree
+	// 开始会把 popup 也一起裁掉.
+	if (!wl_list_empty(&tl->scene_tree->children)) {
+		struct wlr_scene_node *first = wl_container_of(
+			tl->scene_tree->children.next, first, link);
+		if (first->type == WLR_SCENE_NODE_TREE) {
+			tl->surface_tree = wlr_scene_tree_from_node(first);
+		}
+	}
+	decor_attach(tl);
 
 	tl->fthandle = wlr_foreign_toplevel_handle_v1_create(
 		server->foreign_toplevel_manager);
@@ -1636,18 +1571,6 @@ void server_new_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_toplevel->events.set_parent, &tl->set_parent);
 	tl->new_popup.notify = xdg_toplevel_new_popup;
 	wl_signal_add(&base->events.new_popup, &tl->new_popup);
-	tl->new_subsurface.notify = xdg_toplevel_new_subsurface;
-	wl_signal_add(&base->surface->events.new_subsurface, &tl->new_subsurface);
-	// 该监听器加入之前就已存在的 subsurface
-	struct wlr_subsurface *subsurface;
-	wl_list_for_each(subsurface, &base->surface->current.subsurfaces_below,
-			current.link) {
-		toplevel_subsurface_add(tl, subsurface);
-	}
-	wl_list_for_each(subsurface, &base->surface->current.subsurfaces_above,
-			current.link) {
-		toplevel_subsurface_add(tl, subsurface);
-	}
 
 	// toplevel destroy 处理器 (释放 foreign toplevel 句柄并摘掉上面的监听器)
 	// 必须在 wlroots 断言 toplevel 信号为空之前运行, 即在 xdg_toplevel->events.destroy 上

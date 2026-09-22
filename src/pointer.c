@@ -15,14 +15,14 @@
 
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_pointer.h>
-#include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
 #include <wlr/util/region.h>
 
-// 光标是否位于无装饰窗口可见的标题条上? 该条横跨窗口宽度:
-// 内容顶部 CONFIG_TITLEBAR_HEIGHT 像素, 分成三个手势段 (最小化/最大化/关闭).
+// 光标是否位于无装饰窗口可见的标题条上? 该条横跨合成器外框 (含边框) 宽度,
+// 从边框外缘往里 CONFIG_TITLEBAR_HEIGHT 像素, 分成三个手势段
+// (最小化/最大化/关闭). 边框宽取自 decor_border_width(), 不写死.
 static bool is_in_titlebar_zone(struct server *server, struct toplevel *tl) {
 	// 浮在标题条上的 popup (菜单/下拉框) 赢得指针:
 	// 光标在其上时不进行移动/最小化/最大化/关闭抓取
@@ -155,7 +155,7 @@ void end_move(struct server *server) {
 static void clamp_drag_position(struct server *server, struct toplevel *tl,
 		double *x, double *y) {
 	struct wlr_box box;
-	toplevel_frame_box(server, tl, &box);
+	toplevel_box(tl, &box); // 内容尺寸; 外框位置必须从候选坐标重算
 	if (box.width <= 0 || box.height <= 0) {
 		return;
 	}
@@ -168,19 +168,26 @@ static void clamp_drag_position(struct server *server, struct toplevel *tl,
 	struct wlr_box area;
 	get_work_area(server, output, &area);
 
-	if (area.x > out.x) {           // 左侧有栏
-		if (*x < area.x) {
-			*x = area.x;
-		}
+	// *x/*y 是内容坐标, 外框是内容向外扩一个边框宽. 必须用候选坐标算外框:
+	// 若拿窗口当前 (旧) 位置的外框去修正, 每次修正只是相对上一帧的偏移,
+	// 拖动到状态栏下方时会与光标钳制互相追打, 窗口持续抖动.
+	double bw = decor_border_width(tl);
+	if (bw < 0) {
+		bw = 0;
 	}
-	if (area.y > out.y) {           // 顶部有栏
-		if (*y < area.y) {
-			*y = area.y;
-		}
+	double left = *x - bw;
+	double top = *y - bw;
+	double right = left + box.width + 2 * bw;
+	if (area.x > out.x && left < area.x) { // 左侧有栏
+		*x += area.x - left;
+	}
+	if (area.y > out.y && top < area.y) { // 顶部有栏
+		*y += area.y - top;
 	}
 	if (area.x + area.width < out.x + out.width) { // 右侧有栏
-		if (*x + box.width > area.x + area.width) {
-			*x = area.x + area.width - box.width;
+		double ar = area.x + area.width;
+		if (right > ar) {
+			*x -= right - ar;
 		}
 	}
 }
@@ -237,10 +244,17 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 		// (绝不相对于还原后的原点重锚: 那会让抓取变负并把窗口推开)
 		if (server->move_deferred_restore && tl->has_restore_box &&
 				tl->restore_box.width > 0 && server->move_max_w > 0) {
-			server->grab_x = server->grab_x * tl->restore_box.width /
-				server->move_max_w;
-			server->grab_y = server->grab_y * tl->restore_box.height /
-				server->move_max_h;
+			// 按比例把抓取点从最大化外框映射进还原外框 (都含边框)
+			int bw = (int)roundf(decor_border_width(tl));
+			if (bw < 0) {
+				bw = 0;
+			}
+			server->grab_x = (server->grab_x + bw) *
+				(tl->restore_box.width + 2 * bw) /
+				server->move_max_w - bw;
+			server->grab_y = (server->grab_y + bw) *
+				(tl->restore_box.height + 2 * bw) /
+				server->move_max_h - bw;
 			// 只映射一次: 在客户端提交取消最大化 configure 之前
 			// current.maximized 一直为 true, 否则每次移动都会重入此分支
 			// 并让抓取指数收缩, 每个事件都把光标往左上漂
@@ -271,6 +285,15 @@ static void restore_for_drag(struct toplevel *tl, double *ref_x, double *ref_y) 
 	// 所以按窗口实际框 (而不是过期保存的框) 抓住光标
 	rb.x = tl->scene_tree->node.x;
 	rb.y = tl->scene_tree->node.y;
+	// 抓住的是合成器外框 (含边框): 允许按压落在边框那一圈上 (如标题条)
+	int bw = (int)roundf(decor_border_width(tl));
+	if (bw < 0) {
+		bw = 0;
+	}
+	rb.x -= bw;
+	rb.y -= bw;
+	rb.width += 2 * bw;
+	rb.height += 2 * bw;
 	if (tl->has_restore_box && rb.width > 0) {
 		if (*ref_x < rb.x) {
 			*ref_x = rb.x;
@@ -362,8 +385,9 @@ static uint32_t toplevel_resize_edges(struct server *server,
 		// 所以它们的边缘也不会出现缩放光标
 		return 0;
 	}
+	// 命中判定从合成器外框 (含边框) 算起: 边框那一圈也算缩放手柄
 	struct wlr_box box;
-	toplevel_box(tl, &box);
+	toplevel_frame_box(server, tl, &box);
 	if (box.width <= 0 || box.height <= 0) {
 		return 0;
 	}
@@ -531,13 +555,13 @@ static void clear_cursor_override(struct server *server) {
 // 标题条在框上方 2 像素的悬出 (环的顶边) 同样可达, 所以整条彩色条都可拖动.
 static struct toplevel *toplevel_nearby(struct server *server) {
 	struct toplevel *tl = toplevel_at(server);
-	if (tl != NULL && !tl->minimized && !tl->closing) {
+	if (tl != NULL && !tl->minimized) {
 		return tl;
 	}
 	struct toplevel *candidate;
 	wl_list_for_each(candidate, &server->toplevels, link) {
 		if (toplevel_resize_edges(server, candidate) != 0 ||
-				(!candidate->minimized && !candidate->closing &&
+				(!candidate->minimized &&
 				 is_in_titlebar_zone(server, candidate))) {
 			return candidate;
 		}
@@ -552,7 +576,7 @@ static struct toplevel *toplevel_nearby(struct server *server) {
 // (如 clash-verge 的 ew_resize) 存在抓取区外一点, 光标离开边缘后又被过期地恢复.
 static bool cursor_in_cursor_band(struct server *server,
 		struct toplevel *tl) {
-	if (tl->closing || tl->minimized || tl->xdg_toplevel->base == NULL ||
+	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
 			tl->decoration_mode ==
 				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
 			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
@@ -588,7 +612,7 @@ bool pointer_over_frame_zone(struct server *server) {
 		return false;
 	}
 	struct toplevel *tl = toplevel_at(server);
-	if (tl != NULL && !tl->minimized && !tl->closing) {
+	if (tl != NULL && !tl->minimized) {
 		return cursor_in_cursor_band(server, tl) ||
 			is_in_titlebar_zone(server, tl);
 	}
@@ -675,20 +699,31 @@ static void resize_outline_ensure(struct server *server) {
 	}
 }
 
-static void resize_outline_show(struct server *server, struct wlr_box *box) {
+static void resize_outline_show(struct server *server, struct wlr_box *box_in) {
 	resize_outline_ensure(server);
+	// 轮廓画在合成器外框上 (与拖动的手柄所在框一致)
+	struct wlr_box box = *box_in;
+	if (server->resize_toplevel != NULL) {
+		int bw = (int)roundf(decor_border_width(server->resize_toplevel));
+		if (bw > 0) {
+			box.x -= bw;
+			box.y -= bw;
+			box.width += 2 * bw;
+			box.height += 2 * bw;
+		}
+	}
 	int t = 2;
 	struct wlr_scene_rect **e = server->resize_outline_edges;
-	wlr_scene_rect_set_size(e[0], box->width, t);
-	wlr_scene_node_set_position(&e[0]->node, box->x, box->y);
-	wlr_scene_rect_set_size(e[1], box->width, t);
-	wlr_scene_node_set_position(&e[1]->node, box->x,
-		box->y + box->height - t);
-	wlr_scene_rect_set_size(e[2], t, box->height);
-	wlr_scene_node_set_position(&e[2]->node, box->x, box->y);
-	wlr_scene_rect_set_size(e[3], t, box->height);
-	wlr_scene_node_set_position(&e[3]->node, box->x + box->width - t,
-		box->y);
+	wlr_scene_rect_set_size(e[0], box.width, t);
+	wlr_scene_node_set_position(&e[0]->node, box.x, box.y);
+	wlr_scene_rect_set_size(e[1], box.width, t);
+	wlr_scene_node_set_position(&e[1]->node, box.x,
+		box.y + box.height - t);
+	wlr_scene_rect_set_size(e[2], t, box.height);
+	wlr_scene_node_set_position(&e[2]->node, box.x, box.y);
+	wlr_scene_rect_set_size(e[3], t, box.height);
+	wlr_scene_node_set_position(&e[3]->node, box.x + box.width - t,
+		box.y);
 	wlr_scene_node_set_enabled(&server->resize_outline->node, true);
 }
 
@@ -1538,7 +1573,7 @@ static bool wheel_action_allowed(struct server *server) {
 // 位置时 - 那个窗口, 使下滚可以还原它
 static struct toplevel *toplevel_at_or_minimized(struct server *server) {
 	struct toplevel *tl = toplevel_at(server);
-	if (tl != NULL && !tl->minimized && !tl->closing) {
+	if (tl != NULL && !tl->minimized) {
 		return tl;
 	}
 	struct toplevel *candidate;
