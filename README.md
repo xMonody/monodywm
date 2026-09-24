@@ -301,9 +301,10 @@ options:
 | `CONFIG_BORDER_UNFOCUSED_DRAW` | draw a border on unfocused windows too (0/1) | `1` |
 | `CONFIG_BORDER_TOP_LEFT` / `_MID` / `_RIGHT` | top-strip third colors (minimize / maximize / close) | see `config.h` |
 | `CONFIG_BORDER_GRADIENT_WIDTH` / `CONFIG_BORDER_GRADIENT_STEPS` | width (px) and approximation steps of the color gradient between the three top segments | `15` / `8` |
-| `CONFIG_FULLSCREEN_BORDER*` | draw/color/radius of the border on fullscreen windows | on / `0xb87898` / `8` |
+| `CONFIG_FULLSCREEN_BORDER*` | draw/color/radius of the border on fullscreen windows (radius only applies when the border is drawn; otherwise corners stay square) | off / `0xb87898` / `8` |
 | `CONFIG_BLUR` / `CONFIG_BLUR_LAYER` | background blur for windows / for non-overlay, non-background layer surfaces | `1` / `1` |
 | `CONFIG_BLUR_RADIUS` / `CONFIG_BLUR_PASSES` | blur sample radius / downsample passes | `5` / `2` |
+| `CONFIG_BLUR_OPTIMIZE_FULLSCREEN` | fullscreen/maximized blur source: `1` = cached background/bottom layers only (cheap); `0` = real-time blur of everything behind, including other windows | `1` |
 | `CONFIG_SHADOW_BLUR_SIGMA` / `_COLOR` / `_ALPHA` | drop-shadow softness / color / opacity | `15.0` / `0x000000` / `0.5` |
 | `CONFIG_TITLEBAR_HEIGHT` | title strip grab zone at the window top (px) | `6` |
 | `CONFIG_EDGE_THICKNESS` | grab zone on window edges/corners for move+resize (px) | `6` |

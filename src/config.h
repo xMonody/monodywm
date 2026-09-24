@@ -30,7 +30,8 @@
 
 #define CONFIG_FULLSCREEN_BORDER 0              // 全屏窗口是否显示边框 0/1
 #define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 // 全屏边框颜色 0xRRGGBB
-#define CONFIG_FULLSCREEN_ROUNDED_RADIUS 8      // 全屏窗口圆角半径 (px, 0 = 直角)
+#define CONFIG_FULLSCREEN_ROUNDED_RADIUS 8      // 全屏圆角半径 (px, 仅当上面边框为 1 时生效;
+                                                // 边框为 0 时按直角, 不裁剪圆角)
 
 // 背景模糊: 和 swayfx 一样, 模糊整块窗口内容区, 不额外叠任何颜色层.
 // 毛玻璃的颜色完全由窗口自身的半透明背景色决定 (所以不需要指定颜色).
@@ -43,6 +44,13 @@
 #define CONFIG_BLUR_LAYER  1
 #define CONFIG_BLUR_RADIUS 5    // 模糊半径 (scenefx 默认 5)
 #define CONFIG_BLUR_PASSES 2    // 降采样遍数 (scenefx 默认 3)
+
+// 全屏 / 最大化窗口的模糊方式 (只影响这两类铺满屏幕的窗口):
+//   1 = 采样底部预模糊缓存: 只模糊 desktop 的 background/bottom 层,
+//       不包含它下方的其他应用窗口; GPU 开销最小 (默认).
+//   0 = 实时模糊窗口下方的所有内容, 包括其他应用窗口; 更耗 GPU.
+// 两者视觉差异只在窗口后面还摞着别的应用时才能看出来.
+#define CONFIG_BLUR_OPTIMIZE_FULLSCREEN 0
 
 // 窗口阴影 高斯柔影 颜色独立于边框色
 #define CONFIG_SHADOW_BLUR_SIGMA 15.0f

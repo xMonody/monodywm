@@ -33,7 +33,9 @@ static void color_from_hex(uint32_t hex, float alpha, float out[4]) {
 // 窗口外角半径: 全屏窗口单独配置 (0 = 直角)
 static int decor_radius(struct toplevel *tl) {
 	if (tl->fullscreen) {
-		return CONFIG_FULLSCREEN_ROUNDED_RADIUS;
+		// 不画全屏边框时没有边框内孔需要对齐, 也不再裁剪圆角 (0 = 直角)
+		return CONFIG_FULLSCREEN_BORDER
+			? CONFIG_FULLSCREEN_ROUNDED_RADIUS : 0;
 	}
 	return CONFIG_ROUNDED_RADIUS;
 }
@@ -549,13 +551,16 @@ void decor_update(struct toplevel *tl) {
 			wlr_scene_node_set_position(&tl->blur->node, 0, 0);
 			wlr_scene_blur_set_size(tl->blur, w, h);
 			wlr_scene_blur_set_corner_radii(tl->blur, content_corners);
-			// 采样背景预模糊缓存 (只模糊 background/bottom 层): 全屏/最大化
-			// 铺满屏幕, 实时模糊代价最高, 缓存收益最大. 缓存由 output.c 维护,
-			// layer.c 在背景变化时置脏 (见 output_blur_layer_mark_dirty).
-			bool optimize = tl->fullscreen ||
+			// 全屏/最大化铺满屏幕, 是否改用底部预模糊缓存由
+			// CONFIG_BLUR_OPTIMIZE_FULLSCREEN 决定:
+			//   1 = 只模糊 background/bottom 层 (采样 output.c 维护的缓存,
+			//       layer.c 在背景变化时置脏, 见 output_blur_layer_mark_dirty);
+			//   0 = 实时模糊窗口下方的一切, 包括其他应用窗口.
+			bool zoomed = tl->fullscreen ||
 				(tl->xdg_toplevel != NULL &&
 				 tl->xdg_toplevel->current.maximized &&
 				 !tl->restore_frame_pending);
+			bool optimize = CONFIG_BLUR_OPTIMIZE_FULLSCREEN && zoomed;
 			wlr_scene_blur_set_should_only_blur_bottom_layer(tl->blur,
 				optimize);
 		} else {
