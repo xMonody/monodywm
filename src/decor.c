@@ -80,7 +80,7 @@ static void decor_mix_color(const float a[4], const float b[4], float t,
 	}
 }
 
-// 顶部三段的颜色策略 (与旧 border.c 一致):
+// 顶部三段的颜色策略:
 //   - 全屏: 全部用全屏边框色;
 //   - 对话框 / 固定尺寸窗口: 只有关闭条, 全部用基础(焦点)色;
 //   - 其余: 左/中/右分别取 CONFIG_BORDER_TOP_*.
@@ -549,6 +549,15 @@ void decor_update(struct toplevel *tl) {
 			wlr_scene_node_set_position(&tl->blur->node, 0, 0);
 			wlr_scene_blur_set_size(tl->blur, w, h);
 			wlr_scene_blur_set_corner_radii(tl->blur, content_corners);
+			// 采样背景预模糊缓存 (只模糊 background/bottom 层): 全屏/最大化
+			// 铺满屏幕, 实时模糊代价最高, 缓存收益最大. 缓存由 output.c 维护,
+			// layer.c 在背景变化时置脏 (见 output_blur_layer_mark_dirty).
+			bool optimize = tl->fullscreen ||
+				(tl->xdg_toplevel != NULL &&
+				 tl->xdg_toplevel->current.maximized &&
+				 !tl->restore_frame_pending);
+			wlr_scene_blur_set_should_only_blur_bottom_layer(tl->blur,
+				optimize);
 		} else {
 			wlr_scene_node_set_enabled(&tl->blur->node, false);
 		}

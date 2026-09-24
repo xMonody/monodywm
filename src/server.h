@@ -1,10 +1,10 @@
-// server.h - xmonodywm 的共享类型与跨模块声明
+// server.h - monodywm 的共享类型与跨模块声明
 //
-// 合成器拆成多个小模块 (main、ipc、scene、decor、toplevel、layer、
-// output、input、pointer); 它们需要共享的东西都放在这里.
+// 合成器拆成多个小模块 (main、ipc、scene、toplevel、decor、place、layer、
+// output、input、ime、pointer); 它们需要共享的东西都放在这里.
 
-#ifndef XMONODYWM_SERVER_H
-#define XMONODYWM_SERVER_H
+#ifndef MONODYWM_SERVER_H
+#define MONODYWM_SERVER_H
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -245,12 +245,15 @@ struct layer_surface {
 
 	struct wl_list link; // server.layer_surfaces
 
-	// 上次的独占区签名: 它变化时 (状态栏出现、改尺寸或消失) 作区变化,
-	// 已有窗口必须重新排布出独占区
+	// 上次提交的布局签名 (独占区 + 客户端期望尺寸): 它变化时 (状态栏出现、
+	// 改尺寸或消失) 作区变化, 已有窗口必须重新排布, 并且需要给客户端发新的
+	// configure. 普通重绘提交签名不变, 不能重复 configure, 否则客户端
+	// (swaybg 等) 收到 configure 后会 resize 再 commit, 形成 configure 风暴.
 	uint32_t last_anchor;
 	int32_t last_zone;
 	int32_t last_margin_top, last_margin_bottom;
 	int32_t last_margin_left, last_margin_right;
+	uint32_t last_desired_width, last_desired_height;
 	bool last_mapped;
 	bool has_last_state;
 
@@ -299,6 +302,12 @@ struct server {
 
 	struct wlr_scene *scene;
 	struct wlr_scene_tree *layers[LAYER_COUNT];
+	// 背景预模糊缓存树: 放在 bottom 层与窗口层之间. 每个输出一个
+	// wlr_scene_optimized_blur 子节点 (见 output.c), 窗口/面板的 blur 可以
+	// 直接采样它 (should_only_blur_bottom_layer), 不必每帧实时全量模糊.
+	struct wlr_scene_tree *blur_layer;
+	// output.c 里的 struct monitor 列表 (含各自的 optimized_blur 节点)
+	struct wl_list monitors;
 	struct wlr_output_layout *output_layout;
 	struct wlr_output_manager_v1 *output_manager;
 	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_manager;
@@ -561,6 +570,8 @@ void layer_keyboard_clear(struct server *server, struct wlr_surface *surface);
 // ---- output.c: 显示器 + 输出管理 ----
 void server_new_output(struct wl_listener *listener, void *data);
 void server_layout_change(struct wl_listener *listener, void *data);
+// 背景/底部层变化时让所有输出的预模糊缓存失效 (layer.c 调用)
+void output_blur_layer_mark_dirty(struct server *server);
 void output_manager_apply(struct wl_listener *listener, void *data);
 void output_manager_test(struct wl_listener *listener, void *data);
 
@@ -650,4 +661,4 @@ void pointer_focus_change(struct wl_listener *listener, void *data);
 bool pointer_constraint_active(struct server *server);
 void cursor_frame(struct wl_listener *listener, void *data);
 
-#endif // XMONODYWM_SERVER_H
+#endif // MONODYWM_SERVER_H

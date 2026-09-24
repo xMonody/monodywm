@@ -1,7 +1,7 @@
 // ipc.h - 状态栏 IPC 套接字 (Unix 域套接字上的 JSON)
 
-#ifndef XMONODYWM_IPC_H
-#define XMONODYWM_IPC_H
+#ifndef MONODYWM_IPC_H
+#define MONODYWM_IPC_H
 
 #include "server.h"
 
@@ -14,4 +14,4 @@ void ipc_server_destroy(struct server *server);
 void ipc_send_window_event(struct server *server, const char *event,
 	struct toplevel *tl);
 
-#endif // XMONODYWM_IPC_H
+#endif // MONODYWM_IPC_H

@@ -144,24 +144,33 @@ static void configure_layer_surface(struct layer_surface *ls) {
 	struct wlr_box usable_area = full_area;
 	wlr_scene_layer_surface_v1_configure(ls->scene_layer, &full_area,
 		&usable_area);
+}
 
-	// 面板/状态栏模糊: 节点已被 configure 定位到 box.x/box.y, surface 填满整棵树,
-	// 所以 blur 放在 (0,0) 并取 surface 尺寸即可与面板对齐.
-	if (ls->blur != NULL) {
-		int w = layer_surface->surface->current.width;
-		int h = layer_surface->surface->current.height;
-		if (CONFIG_BLUR && w > 0 && h > 0) {
-			wlr_scene_node_set_enabled(&ls->blur->node, true);
-			wlr_scene_blur_set_size(ls->blur, w, h);
-		} else {
-			wlr_scene_node_set_enabled(&ls->blur->node, false);
-		}
+// 面板/状态栏模糊: 节点被 configure 定位到 box.x/box.y, surface 填满整棵树,
+// 所以 blur 放在 (0,0) 并取 surface 尺寸即可与面板对齐. 每次提交都同步,
+// 因为它取决于客户端 buffer 尺寸, 而尺寸变化不一定改变布局签名 (见下);
+// set_size / set_enabled 本身幂等, 重复调用无开销.
+static void layer_surface_sync_blur(struct layer_surface *ls) {
+	if (ls->blur == NULL) {
+		return;
+	}
+	int w = ls->layer_surface->surface->current.width;
+	int h = ls->layer_surface->surface->current.height;
+	if (CONFIG_BLUR && CONFIG_BLUR_LAYER && w > 0 && h > 0) {
+		wlr_scene_node_set_enabled(&ls->blur->node, true);
+		wlr_scene_blur_set_size(ls->blur, w, h);
+	} else {
+		wlr_scene_node_set_enabled(&ls->blur->node, false);
 	}
 }
 
-// 跟踪 layer surface 的独占区几何自上次提交以来是否变化
-// (首次提交总视为变化, 这样在窗口已存在后才出现的状态栏也能把窗口挤出其区域)
-static bool layer_exclusive_zone_changed(struct layer_surface *ls) {
+// 跟踪 layer surface 的布局状态 (独占区几何 + 客户端期望尺寸) 自上次提交
+// 以来是否变化. 它既决定要不要给客户端发 configure, 也决定要不要重排已有窗口:
+//   - 首次提交总视为变化, 这样在窗口已存在后才出现的状态栏也能把窗口挤出其区域;
+//   - 客户端只重绘 (状态栏每秒刷新) 时签名不变, 绝不能重复 configure -
+//     否则客户端每收到一个 configure 就 resize + commit, 合成器又在 commit
+//     里 configure, 形成 configure ↔ commit 风暴 (CPU 打满, 队列/缓冲暴涨).
+static bool layer_surface_layout_changed(struct layer_surface *ls) {
 	struct wlr_layer_surface_v1_state *st = &ls->layer_surface->current;
 	bool mapped = ls->layer_surface->surface->mapped;
 	bool changed = !ls->has_last_state || ls->last_anchor != st->anchor ||
@@ -170,6 +179,8 @@ static bool layer_exclusive_zone_changed(struct layer_surface *ls) {
 		ls->last_margin_bottom != st->margin.bottom ||
 		ls->last_margin_left != st->margin.left ||
 		ls->last_margin_right != st->margin.right ||
+		ls->last_desired_width != st->desired_width ||
+		ls->last_desired_height != st->desired_height ||
 		ls->last_mapped != mapped;
 	ls->has_last_state = true;
 	ls->last_anchor = st->anchor;
@@ -178,6 +189,8 @@ static bool layer_exclusive_zone_changed(struct layer_surface *ls) {
 	ls->last_margin_bottom = st->margin.bottom;
 	ls->last_margin_left = st->margin.left;
 	ls->last_margin_right = st->margin.right;
+	ls->last_desired_width = st->desired_width;
+	ls->last_desired_height = st->desired_height;
 	ls->last_mapped = mapped;
 	return changed;
 }
@@ -269,7 +282,22 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 		 ls->last_keyboard_interactive ==
 			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
 
-	configure_layer_surface(ls);
+	// 只在布局状态变化时 configure. 无条件 configure 会与客户端形成
+	// configure ↔ commit 风暴 (见 layer_surface_layout_changed 注释).
+	bool layout_changed = layer_surface_layout_changed(ls);
+	if (layout_changed) {
+		configure_layer_surface(ls);
+	}
+	// blur 尺寸跟随客户端 buffer, 必须每次提交同步, 不能只依赖上面的
+	// configure (尺寸变化时布局签名可能不变)
+	layer_surface_sync_blur(ls);
+
+	// background/bottom 层的画面是背景预模糊缓存的输入: 内容变化时让它失效,
+	// 下一帧重算. 只有这两层位于缓存节点之下 (top/overlay 在窗口之上).
+	if (st->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND ||
+			st->layer == ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
+		output_blur_layer_mark_dirty(ls->server);
+	}
 
 	if (became_interactive) {
 		layer_surface_keyboard_focus(ls->server, ls);
@@ -279,7 +307,7 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	ls->last_keyboard_interactive = st->keyboard_interactive;
 
 	// 状态栏出现/改变尺寸会缩小作区: 把已有窗口移出独占区, 而不是让它盖住窗口
-	if (layer_exclusive_zone_changed(ls)) {
+	if (layout_changed) {
 		arrange_for_layer_surface(ls);
 	}
 }
@@ -289,6 +317,12 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	// 持有键盘的启动器覆盖层正在消失: 交还给先前聚焦的 toplevel
 	if (ls->keyboard_focused) {
 		layer_surface_keyboard_unfocus(ls->server, ls);
+	}
+	// 背景/底部层消失: 预模糊缓存的输入变了, 让它失效
+	enum zwlr_layer_shell_v1_layer layer = ls->layer_surface->current.layer;
+	if (layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND ||
+			layer == ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
+		output_blur_layer_mark_dirty(ls->server);
 	}
 	wl_list_remove(&ls->destroy.link);
 	wl_list_remove(&ls->commit.link);
@@ -487,18 +521,22 @@ void server_new_layer_surface(struct wl_listener *listener, void *data) {
 	}
 	xdg_surface_tag(ls->scene_layer->tree, TAG_LAYER, ls);
 
-	// 只为状态栏/面板 (非 overlay 层) 建背景模糊节点, 落到底部 (内容之下).
-	// overlay 层是启动器/覆盖菜单 (rofi/wofi/fuzzel 等), 往往全屏, 给它们
-	// 模糊会把整个桌面都糊掉 - 点击状态栏弹出的通常正是这类窗口.
+	// 只为状态栏/面板建背景模糊节点, 落到底部 (内容之下). 排掉:
+	//   - overlay 层: 启动器/覆盖菜单 (rofi/wofi/fuzzel) 往往全屏, 给它们
+	//     模糊会把整个桌面都糊掉 - 点击状态栏弹出的通常正是这类窗口;
+	//   - background 层: 它是最底层, blur 节点下面只有场景 clear color,
+	//     模糊结果恒为一块纯色, 永远不会有可见效果 - 纯属无用节点.
 	// 不设透明掩码: 整块面板区域都模糊, 面板自身的半透明背景色决定最终观感.
-    if (CONFIG_BLUR && CONFIG_BLUR_LAYER && layer_surface->pending.layer
-            != ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY) {
-        ls->blur = wlr_scene_blur_create(ls->scene_layer->tree, 0, 0);
-        if (ls->blur != NULL) {
-            wlr_scene_node_lower_to_bottom(&ls->blur->node);
-            wlr_scene_node_set_enabled(&ls->blur->node, false);
-        }
-    }
+	if (CONFIG_BLUR && CONFIG_BLUR_LAYER &&
+			layer_surface->pending.layer != ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY &&
+			layer_surface->pending.layer !=
+				ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+		ls->blur = wlr_scene_blur_create(ls->scene_layer->tree, 0, 0);
+		if (ls->blur != NULL) {
+			wlr_scene_node_lower_to_bottom(&ls->blur->node);
+			wlr_scene_node_set_enabled(&ls->blur->node, false);
+		}
+	}
 
 	ls->destroy.notify = layer_surface_destroy;
 	wl_signal_add(&layer_surface->events.destroy, &ls->destroy);

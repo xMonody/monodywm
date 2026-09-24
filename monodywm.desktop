@@ -1,5 +1,6 @@
 [Desktop Entry]
-Name=xmonodywm
-Comment=My xMonody WM
-Exec=~/aiwm/xmonodywm/build/xmonodywm
+Name=monodywm
+Comment=Minimal floating Wayland compositor
+Exec=monodywm
 Type=Application
+Terminal=false

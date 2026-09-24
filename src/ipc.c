@@ -1,6 +1,6 @@
 // ipc.c - 通过 Unix 域套接字与状态栏通信
 //
-// 合成器监听 $XDG_RUNTIME_DIR/xmonodywm.sock (回退 /tmp/xmonodywm.sock).
+// 合成器监听 $XDG_RUNTIME_DIR/monodywm.sock (回退 /tmp/monodywm.sock).
 // 状态栏连接后接收以换行分隔的 JSON 消息; 每个窗口用稳定的 id 标识.
 //
 // 广播给所有客户端的事件: window_added, window_removed, window_focus
@@ -362,6 +362,11 @@ static void ipc_send_window_list(struct server *server,
 
 // 创建 Unix 套接字; 失败返回 false (合成器仍会运行, 只是没有状态栏)
 bool ipc_server_init(struct server *server, const char *path) {
+	// 先初始化客户端链表: 之后任何提前 return (套接字/绑定失败) 都会让
+	// ipc_send_window_event()/ipc_server_destroy() 仍能安全遍历它,
+	// 而不是在未初始化的头结点上解引用 NULL.
+	wl_list_init(&server->ipc_clients);
+
 	unlink(path);
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0) {
@@ -391,7 +396,6 @@ bool ipc_server_init(struct server *server, const char *path) {
 		server->ipc_fd = -1;
 		return false;
 	}
-	wl_list_init(&server->ipc_clients);
 	wlr_log(WLR_INFO, "IPC socket listening on %s", path);
 	return true;
 }

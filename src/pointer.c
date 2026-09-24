@@ -882,6 +882,16 @@ static void update_resize(struct server *server) {
 }
 
 void resize_grab_clear(struct server *server) {
+	struct toplevel *tl = server->resize_toplevel;
+	// live 模式 (begin_resize 调过 set_resizing(true)): 无论正常释放还是被
+	// pointer-constraint 打断 (cancel_compositor_gestures), 都必须清掉客户端的
+	// resizing 提示, 否则它会永久停在"交互缩放"状态. 轮廓模式从未设置过,
+	// 这里跳过以免多发一次 configure.
+	if (CONFIG_RESIZE_DRAW_CONTENTS && tl != NULL &&
+			tl->xdg_toplevel != NULL &&
+			tl->xdg_toplevel->base != NULL) {
+		wlr_xdg_toplevel_set_resizing(tl->xdg_toplevel, false);
+	}
 	server->resizing = false;
 	server->input_mode = INPUT_MODE_PASSTHROUGH;
 	server->resize_toplevel = NULL;
@@ -901,7 +911,7 @@ void end_resize(struct server *server) {
 
 	if (tl != NULL && tl->xdg_toplevel->base != NULL) {
 		if (CONFIG_RESIZE_DRAW_CONTENTS) {
-			wlr_xdg_toplevel_set_resizing(tl->xdg_toplevel, false);
+			// set_resizing(false) 由 resize_grab_clear() 统一处理
 			resize_grab_clear(server);
 			return;
 		}

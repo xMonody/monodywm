@@ -1,16 +1,19 @@
-// monodywm - 基于 wlroots 0.19 的极简浮动 Wayland 合成器
+// monodywm - 基于 wlroots 0.20 的极简浮动 Wayland 合成器
 //
 // 入口: 创建 display、backend、renderer 和 scene, 创建所有协议 global
-// (由 wlroots 在服务端实现; XML 描述在 Protocol/ 目录, 构建时由
+// (由 wlroots 在服务端实现; XML 描述在 protocol/ 目录, 构建时由
 // wayland-scanner 生成 .h/.c), 注册各模块监听器并运行事件循环.
 //
 // 模块:
 //   ipc.c      - 状态栏套接字 (JSON 事件)
 //   scene.c    - 场景图打标签 / 命中测试
 //   toplevel.c - xdg-shell 窗口与窗口状态
+//   decor.c    - scenefx 圆角 / 边框 / 阴影 / 模糊
+//   place.c    - 新窗口放置 (自动居中)
 //   layer.c    - wlr-layer-shell surface + 作区
 //   output.c   - 显示器 + wlr-output-management
 //   input.c    - seat、键盘、快捷键
+//   ime.c      - 输入法中继 (fcitx5 / ibus)
 //   pointer.c  - 光标交互 (移动 / 缩放 / 手势)
 
 #include "server.h"
@@ -221,7 +224,8 @@ static void run_startup_file(void) {
 // 默认: INFO 及以上写 stderr. WLR_DEBUG=1 时额外打开一个日志文件并把所有行
 // (含 DEBUG) 也写进去 - 自带测试会 grep `WLR_DEBUG=1 monodywm` 的标准输出,
 // 所以 stderr 流必须保留; 文件只是方便你自己离线看.
-// 若显式指定 MONODYWWM_LOG=<路径>, 则只写该文件, stderr 保持干净.
+// 若显式指定 MONODYWM_LOG=<路径>, 则只写该文件, stderr 保持干净
+// (旧拼写 MONODYWWM_LOG 仍兼容).
 // 未指定时 WLR_DEBUG=1 的日志文件为 $XDG_RUNTIME_DIR/monodywm.log (否则 /tmp).
 static FILE *log_file = NULL;
 static bool log_to_stderr = true;
@@ -262,7 +266,11 @@ static void log_callback(enum wlr_log_importance importance,
 static void init_logging(void) {
 	const char *dbg = getenv("WLR_DEBUG");
 	bool debug = dbg != NULL && dbg[0] != '\0';
-	const char *path = getenv("MONODYWWM_LOG");
+	const char *path = getenv("MONODYWM_LOG");
+	if (path == NULL || path[0] == '\0') {
+		// 兼容旧拼写 (多一个 w), 老脚本仍可用
+		path = getenv("MONODYWWM_LOG");
+	}
 	if (path != NULL && path[0] != '\0') {
 		log_file = fopen(path, "w");
 		if (log_file == NULL) {
@@ -286,7 +294,7 @@ static void init_logging(void) {
 
 int main(int argc, char *argv[]) {
 	// 正常输出只到 stderr; WLR_DEBUG=1 时额外写 $XDG_RUNTIME_DIR/monodywm.log,
-	// 显式 MONODYWWM_LOG=<path> 则只写该文件
+	// 显式 MONODYWM_LOG=<path> 则只写该文件
 	init_logging();
 	// 不要让生成的后台进程变成僵尸
 	init_reaper();
@@ -370,12 +378,23 @@ int main(int argc, char *argv[]) {
 			wlr_log(WLR_ERROR, "failed to create scene tree");
 			return EXIT_FAILURE;
 		}
+		// 预模糊缓存树夹在 bottom 层和窗口层之间: 它只能看到 background/bottom,
+		// 正好是窗口/面板毛玻璃需要的背景层
+		if (i == LAYER_BOTTOM) {
+			server.blur_layer = wlr_scene_tree_create(&server.scene->tree);
+			if (server.blur_layer == NULL) {
+				wlr_log(WLR_ERROR, "failed to create blur tree");
+				return EXIT_FAILURE;
+			}
+		}
 	}
 	wl_list_init(&server.toplevels);
 	wl_list_init(&server.layer_surfaces);
+	wl_list_init(&server.monitors);
 	wl_list_init(&server.imes);
 	wl_list_init(&server.text_inputs);
 	wl_list_init(&server.keyboards);
+	wl_list_init(&server.ipc_clients);
 
 	// ---- 核心与稳定协议 ----
 	// 不显式创建 wl_shm: 上面的 wlr_renderer_init_wl_display() 已经注册了
@@ -662,14 +681,10 @@ int main(int argc, char *argv[]) {
 	}
 
 	setenv("WAYLAND_DISPLAY", socket, true);
-	// Wayland 套接字已就绪: WM 起来了, 现在启动用户的守护进程
-	// (来自 ~/.config/monodywm/run, 外加任何 -s 命令)
-	run_startup_file();
-	if (startup_cmd != NULL) {
-		spawn_command(startup_cmd);
-	}
 
-	// 状态栏用的 IPC 套接字 (Unix 域套接字上的 JSON)
+	// 状态栏用的 IPC 套接字 (Unix 域套接字上的 JSON).
+	// 必须在启动用户守护进程之前建立: 状态栏/notifier 启动后会立刻连接,
+	// 若此时 socket 尚未创建, 连接就失败, 表现为状态栏偶尔起不来.
 	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
 	char ipc_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	if (runtime_dir != NULL && runtime_dir[0] != '\0') {
@@ -681,6 +696,13 @@ int main(int argc, char *argv[]) {
 	server.ipc_fd = -1;
 	if (!ipc_server_init(&server, ipc_path)) {
 		wlr_log(WLR_ERROR, "failed to start IPC socket at %s", ipc_path);
+	}
+
+	// Wayland 套接字和 IPC 套接字都已就绪: WM 起来了, 现在启动用户的守护进程
+	// (来自 ~/.config/monodywm/run, 外加任何 -s 命令)
+	run_startup_file();
+	if (startup_cmd != NULL) {
+		spawn_command(startup_cmd);
 	}
 
 	wlr_log(WLR_INFO, "Running Wayland compositor on WAYLAND_DISPLAY=%s",

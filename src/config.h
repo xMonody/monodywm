@@ -1,10 +1,10 @@
-// config.h - xmonodywm 编译期配置
+// config.h - monodywm 编译期配置
 //
 // 所有可调项都在这里: 移动/缩放抓取区、窗口装饰、合成器快捷键等.
 // 改完数值重新编译即可.
 
-#ifndef XMONODYWM_CONFIG_H
-#define XMONODYWM_CONFIG_H
+#ifndef MONODYWM_CONFIG_H
+#define MONODYWM_CONFIG_H
 
 #include <xkbcommon/xkbcommon.h>
 
@@ -40,7 +40,7 @@
 // 状态栏/面板 (layer-shell 非 overlay 层) 是否也加背景模糊.
 // overlay 层是 rofi/wofi/fuzzel 这类全屏启动器, 始终不加模糊 (否则整块
 // 桌面都会被糊住 - 点击状态栏弹出的通常正是这类窗口).
-#define CONFIG_BLUR_LAYER 1
+#define CONFIG_BLUR_LAYER  1
 #define CONFIG_BLUR_RADIUS 5    // 模糊半径 (scenefx 默认 5)
 #define CONFIG_BLUR_PASSES 2    // 降采样遍数 (scenefx 默认 3)
 
@@ -95,14 +95,14 @@ struct config_action_shortcut {
 };
 
 static const struct config_action_shortcut config_action_shortcuts[] = {
-	{ CONFIG_ACTION_MAXIMIZE,    MODKEY1, XKB_KEY_Return },  // alt+Enter 最大化还原
-	{ CONFIG_ACTION_MAXIMIZE,    MODKEY2, XKB_KEY_Return },  // win+Enter 最大化还原
+	{ CONFIG_ACTION_MAXIMIZE,    MODKEY1, XKB_KEY_Return },  // win+Enter 最大化还原
+	{ CONFIG_ACTION_MAXIMIZE,    MODKEY2, XKB_KEY_Return },  // shift+alt+Enter 最大化还原
 	{ CONFIG_ACTION_QUIT,        MODKEY3, XKB_KEY_q },       // shift+ctrl+q 退出合成器
 	{ CONFIG_ACTION_NEXT_WINDOW, MODKEY4, XKB_KEY_n },       // ctrl+alt+n 下一个窗口
 	{ CONFIG_ACTION_PREV_WINDOW, MODKEY4, XKB_KEY_p },       // ctrl+alt+p 上一个窗口
 	{ CONFIG_ACTION_CLOSE,       MODKEY4, XKB_KEY_c },       // ctrl+alt+c 关闭当前窗口
 	{ CONFIG_ACTION_MINIMIZE,    MODKEY2, XKB_KEY_m },       // shift+alt+m 最小化窗口
-	{ CONFIG_ACTION_CLOSE_OTHER, MODKEY4, XKB_KEY_q },       // ctrl+alt+q 退出合成器
+	{ CONFIG_ACTION_CLOSE_OTHER, MODKEY3, XKB_KEY_q },       // ctrl+alt+q 关闭其他窗口
 
 	{ CONFIG_ACTION_TASK,        MODKEY1, XKB_KEY_1 },       // win+1..9 切换窗口
 	{ CONFIG_ACTION_TASK,        MODKEY1, XKB_KEY_2 },
@@ -154,4 +154,4 @@ static const char *const config_force_undecorated[] = {
 	NULL,
 };
 
-#endif // XMONODYWM_CONFIG_H
+#endif // MONODYWM_CONFIG_H

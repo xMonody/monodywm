@@ -20,12 +20,18 @@ struct monitor {
 	struct wlr_output *output;
 	struct wlr_scene_output *scene_output;
 
+	// 本输出的背景预模糊缓存 (挂在 server->blur_layer 下, 位置/尺寸随输出)
+	struct wlr_scene_optimized_blur *optimized_blur;
+	struct wl_list link; // server->monitors
+
 	// 渲染帧率统计: 每秒把实际提交的帧数记一条 INFO 日志
 	uint32_t fps_frames;
 	uint32_t fps_start_ms;
 
 	// 上次 commit 的输出 scale (用于检测缩放变化)
 	float scale;
+	// 上次 commit 的输出 transform (用于让预模糊缓存转向)
+	enum wl_output_transform transform;
 
 	struct wl_listener frame;
 	struct wl_listener commit;
@@ -59,12 +65,49 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	}
 }
 
+// 同步本输出预模糊缓存的位置与尺寸. set_position / set_size 幂等; set_size
+// 在尺寸变化时会自动 mark_dirty. 输出 mode/scale/transform 或布局变化后调用.
+static void monitor_update_blur_layer(struct monitor *mon) {
+	if (mon->optimized_blur == NULL) {
+		return;
+	}
+	struct wlr_output_layout_output *lo =
+		wlr_output_layout_get(mon->server->output_layout, mon->output);
+	if (lo == NULL) {
+		return;
+	}
+	wlr_scene_node_set_position(&mon->optimized_blur->node, lo->x, lo->y);
+	int w = 0, h = 0;
+	wlr_output_effective_resolution(mon->output, &w, &h);
+	wlr_scene_optimized_blur_set_size(mon->optimized_blur, w, h);
+}
+
+// background/bottom 层变化时让所有输出的预模糊缓存失效, 下一帧会重算.
+void output_blur_layer_mark_dirty(struct server *server) {
+	struct monitor *mon;
+	wl_list_for_each(mon, &server->monitors, link) {
+		if (mon->optimized_blur != NULL) {
+			wlr_scene_optimized_blur_mark_dirty(mon->optimized_blur);
+		}
+	}
+}
+
 // 输出 scale 变化: 阴影的 blur_sigma 由 decor.c 按输出 scale 补偿 (scenefx
 // 不缩放它), 所以缩放改变后必须重刷该输出上窗口的装饰. 节点位置/尺寸与圆角
 // 由 scenefx 自行缩放, 不需要在这里处理.
 static void monitor_commit(struct wl_listener *listener, void *data) {
 	struct monitor *mon = wl_container_of(listener, mon, commit);
 	struct wlr_output *output = mon->output;
+	// mode/scale/transform 可能变了: 预模糊缓存的位置/尺寸要跟上 (幂等)
+	monitor_update_blur_layer(mon);
+	// transform 改变时缓存内容方向会变 (旋转 180° 时有效分辨率不变, set_size
+	// 不会置脏), 必须显式重算
+	if (output->transform != mon->transform) {
+		mon->transform = output->transform;
+		if (mon->optimized_blur != NULL) {
+			wlr_scene_optimized_blur_mark_dirty(mon->optimized_blur);
+		}
+	}
 	if (output->scale == mon->scale) {
 		return;
 	}
@@ -83,6 +126,10 @@ static void monitor_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&mon->frame.link);
 	wl_list_remove(&mon->commit.link);
 	wl_list_remove(&mon->destroy.link);
+	wl_list_remove(&mon->link);
+	if (mon->optimized_blur != NULL) {
+		wlr_scene_node_destroy(&mon->optimized_blur->node);
+	}
 	free(mon);
 }
 
@@ -172,6 +219,13 @@ void server_new_output(struct wl_listener *listener, void *data) {
 	mon->output = output;
 	mon->scene_output = scene_output;
 	mon->scale = output->scale;
+	mon->transform = output->transform;
+	// 背景预模糊缓存: 每个输出一个, 挂在共享的 blur_layer 下, 随输出定位
+	if (CONFIG_BLUR && server->blur_layer != NULL) {
+		mon->optimized_blur = wlr_scene_optimized_blur_create(
+			server->blur_layer, 0, 0);
+	}
+	wl_list_insert(&server->monitors, &mon->link);
 	mon->frame.notify = monitor_frame;
 	wl_signal_add(&output->events.frame, &mon->frame);
 	mon->commit.notify = monitor_commit;
@@ -181,6 +235,7 @@ void server_new_output(struct wl_listener *listener, void *data) {
 
 	wlr_xcursor_manager_load(server->xcursor_manager, output->scale);
 
+	monitor_update_blur_layer(mon);
 	update_output_manager_config(server);
 	arrange_layer_surfaces(server);
 }
@@ -188,6 +243,10 @@ void server_new_output(struct wl_listener *listener, void *data) {
 void server_layout_change(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server, layout_change);
 	update_scene_output_positions(server);
+	struct monitor *mon;
+	wl_list_for_each(mon, &server->monitors, link) {
+		monitor_update_blur_layer(mon);
+	}
 	arrange_layer_surfaces(server);
 	update_output_manager_config(server);
 	struct toplevel *tl;

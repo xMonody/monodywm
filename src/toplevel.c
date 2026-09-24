@@ -361,10 +361,18 @@ void arrange_toplevels_work_area(struct server *server,
 			int cx = mbox.x + bw;
 			int cy = mbox.y + bw;
 			if (tl->pending_frame) {
-				// 只更新等待目标 (内容框), 不动节点
-				tl->pending_frame_box = (struct wlr_box){
-					.x = cx, .y = cy, .width = cw, .height = ch,
-				};
+				// 等待目标变化时必须重新发 configure: 否则客户端仍在按旧
+				// (可能更小) 的尺寸提交, 新目标永远等不到 (surface >= 目标),
+				// pending_frame 会一直卡住, 窗口停在旧尺寸.
+				if (tl->pending_frame_box.x != cx ||
+						tl->pending_frame_box.y != cy ||
+						tl->pending_frame_box.width != cw ||
+						tl->pending_frame_box.height != ch) {
+					tl->pending_frame_box = (struct wlr_box){
+						.x = cx, .y = cy, .width = cw, .height = ch,
+					};
+					wlr_xdg_toplevel_set_size(tl->xdg_toplevel, cw, ch);
+				}
 				continue;
 			}
 			if (box.x != cx || box.y != cy ||
