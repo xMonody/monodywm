@@ -273,6 +273,7 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	struct wlr_layer_surface_v1_state *st = &layer_surface->current;
 
 	bool mapped = layer_surface->surface->mapped;
+	bool was_mapped = ls->has_last_state && ls->last_mapped;
 	bool interactive = st->keyboard_interactive !=
 		ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
 	// 只在映射/交互状态变化时抓取焦点, 这样持续提交的 layer surface
@@ -306,6 +307,13 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	}
 	ls->last_keyboard_interactive = st->keyboard_interactive;
 
+	// layer surface 出现/消失会改变光标下方的 surface: 立即重算指针焦点.
+	// 否则弹框映射/隐藏后的第一次点击仍会发给旧 surface (被隐藏的弹框
+	// 吞掉, 或误触发状态栏按钮), 表现为"点一下没反应".
+	if (was_mapped != mapped) {
+		refresh_pointer_focus(ls->server);
+	}
+
 	// 状态栏出现/改变尺寸会缩小作区: 把已有窗口移出独占区, 而不是让它盖住窗口
 	if (layout_changed) {
 		arrange_for_layer_surface(ls);
@@ -330,6 +338,9 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&ls->link);
 	// 独占区消失: 让最大化窗口重新铺开
 	arrange_for_layer_surface(ls);
+	// 弹框在光标下被销毁 (未经过 unmap commit): 同样要重算指针焦点,
+	// 否则焦点会停留在已失效的 surface 上
+	refresh_pointer_focus(ls->server);
 	free(ls);
 }
 

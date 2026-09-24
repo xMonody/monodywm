@@ -28,7 +28,7 @@
 #define CONFIG_BORDER_GRADIENT_WIDTH 15      // 顶部边框三段颜色拼接处渐变宽度 (px)
 #define CONFIG_BORDER_GRADIENT_STEPS 8 // 分段越多越平滑, 每窗节点数 = 3 + 2*该值)
 
-#define CONFIG_FULLSCREEN_BORDER 1              // 全屏窗口是否显示边框 0/1
+#define CONFIG_FULLSCREEN_BORDER 0              // 全屏窗口是否显示边框 0/1
 #define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 // 全屏边框颜色 0xRRGGBB
 #define CONFIG_FULLSCREEN_ROUNDED_RADIUS 8      // 全屏窗口圆角半径 (px, 0 = 直角)
 
