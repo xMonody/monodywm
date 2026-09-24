@@ -75,6 +75,10 @@
 // (屏幕减去 layer-shell 状态栏的独占区), 保证新窗口不被状态栏盖住.
 #define CONFIG_CENTER_AVOID_BARS 0
 
+// 为 true 时: Caps Lock 变成左 Ctrl, 右 Alt 变成 Caps Lock (Caps 功能
+// 挪到右 Alt). false = 两者都保持原样. keymap 会随 wl_keyboard 下发到客户端.
+#define CONFIG_CAPS_LOCK_AS_CTRL false // 把 Caps Lock 映射成 Ctrl
+
 // 组合键修饰符, 按需组合使用
 #define MODKEY0 (WLR_MODIFIER_ALT)                         // alt (单独按 Alt)
 #define MODKEY1 (WLR_MODIFIER_LOGO)                        // win

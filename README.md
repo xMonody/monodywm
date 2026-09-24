@@ -314,6 +314,7 @@ options:
 | `CONFIG_DRAG_THRESHOLD` | pointer travel (px) before a press counts as a drag | `4.0` |
 | `CONFIG_WHEEL_DEBOUNCE_ENABLED` / `_BURST_NS` / `_TICK_GAP_NS` | right-hold + wheel: coalesce rapid ticks (bool) / one continuous scroll = one action for at most this long / two ticks this far apart = next action | `true` / `800 ms` / `300 ms` |
 | `CONFIG_CENTER_AVOID_BARS` | center new windows on the work area instead of the whole output (0/1) | `0` |
+| `CONFIG_CAPS_LOCK_AS_CTRL` | remap Caps Lock to left Ctrl and Right Alt to Caps Lock via a generated keymap | `false` |
 | `CONFIG_MODKEY0..4` | modifier combinations (`Alt`, `Win`, `Shift+Alt`, `Shift+Ctrl`, `Ctrl+Alt`) | — |
 | `config_action_shortcuts[]` | compositor key bindings (see below) | — |
 | `config_app_shortcuts[]` | launch-app key bindings | — |

@@ -643,6 +643,79 @@ void server_new_virtual_pointer(struct wl_listener *listener, void *data) {
 		&event->new_pointer->pointer.base);
 }
 
+// 在 [start, from) 内反向查找子串 needle (用于定位生成的 keymap 文本末尾)
+static char *strrstr_range(char *start, char *from, const char *needle) {
+	size_t n = strlen(needle);
+	size_t len = (size_t)(from - start);
+	if (len < n) {
+		return NULL;
+	}
+	for (size_t i = len - n + 1; i-- > 0;) {
+		if (memcmp(start + i, needle, n) == 0) {
+			return start + i;
+		}
+	}
+	return NULL;
+}
+
+// 编译键盘 keymap. CONFIG_CAPS_LOCK_AS_CTRL 开启时:
+//   Caps Lock -> 左 Ctrl (xkb 的 ctrl:nocaps 选项)
+//   右 Alt -> Caps Lock (把 Caps 功能挪到右 Alt)
+// 标准 xkb 没有 "右 Alt 当 Caps Lock" 的选项, 所以先在默认 RMLVO 上编译,
+// 再在生成的 keymap 文本的 xkb_symbols 段末尾注入右 Alt 覆盖定义后重新编译.
+// keymap 会随 wl_keyboard 下发给客户端, 所以客户端行为与合成器一致.
+static struct xkb_keymap *keyboard_build_keymap(struct xkb_context *context) {
+	const struct xkb_rule_names names = {
+		.options = CONFIG_CAPS_LOCK_AS_CTRL ? "ctrl:nocaps" : NULL,
+	};
+	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, &names,
+		XKB_KEYMAP_COMPILE_NO_FLAGS);
+	if (keymap == NULL || !CONFIG_CAPS_LOCK_AS_CTRL) {
+		return keymap;
+	}
+	char *text = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
+	xkb_keymap_unref(keymap);
+	if (text == NULL) {
+		return NULL;
+	}
+	// xkb_symbols 是最后一段: 文本末尾依次是 symbols 段与 keymap 的 "};".
+	// 找倒数第二个 "};" (symbols 段收尾), 在它前面插入定义.
+	// 必须用显式 action=LockMods: 仅把 keysym 换成 Caps_Lock 时 (ctrl:nocaps
+	// 下没有别的键在用 Lock 修饰键) compat 的 interpret 不会生成 lock 动作.
+	char *end = text + strlen(text);
+	char *keymap_close = strrstr_range(text, end, "};");
+	char *symbols_close = keymap_close != NULL
+		? strrstr_range(text, keymap_close, "};") : NULL;
+	static const char inject[] =
+		"\n\treplace key <RALT> {\n"
+		"\t\ttype[group1] = \"ONE_LEVEL\",\n"
+		"\t\tsymbols[group1] = [ Caps_Lock ],\n"
+		"\t\tactions[group1] = [ LockMods(modifiers=Lock) ]\n"
+		"\t};\n"
+		"\tmodifier_map Lock { <RALT> };\n";
+	struct xkb_keymap *result = NULL;
+	if (symbols_close != NULL) {
+		size_t head = (size_t)(symbols_close - text);
+		char *merged = malloc(strlen(text) + sizeof(inject));
+		if (merged != NULL) {
+			memcpy(merged, text, head);
+			memcpy(merged + head, inject, sizeof(inject));
+			strcpy(merged + head + sizeof(inject) - 1, symbols_close);
+			result = xkb_keymap_new_from_string(context, merged,
+				XKB_KEYMAP_FORMAT_TEXT_V1,
+				XKB_KEYMAP_COMPILE_NO_FLAGS);
+			free(merged);
+		}
+	}
+	if (result == NULL) {
+		// 注入失败 (文本结构意外): 退回只有 ctrl:nocaps 的 keymap
+		result = xkb_keymap_new_from_string(context, text,
+			XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	}
+	free(text);
+	return result;
+}
+
 // 挂接一个 (真实或虚拟) 键盘: 给它自己的 key/modifiers 监听器,
 // 这样每个设备的按键都能被看到; 若还没有 seat 键盘就让它成为 seat 键盘
 // (第一个键盘胜出, 输入法的辅助虚拟键盘永远不会劫持 seat)
@@ -668,11 +741,11 @@ static void keyboard_attach(struct server *server,
 	wl_list_insert(server->keyboards.prev, &kb->link);
 
 	// 每个键盘都需要 xkb keymap: keyboard_shortcut() 在按键时解引用 xkb_state,
-	// 没有 keymap 的键盘会崩溃
+	// 没有 keymap 的键盘会崩溃. keymap 由 keyboard_build_keymap() 生成
+	// (可含 Caps Lock -> Ctrl / 右 Alt -> Caps Lock).
 	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	if (context != NULL) {
-		struct xkb_keymap *keymap = xkb_keymap_new_from_names(context,
-			NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+		struct xkb_keymap *keymap = keyboard_build_keymap(context);
 		if (keymap != NULL) {
 			wlr_keyboard_set_keymap(keyboard, keymap);
 			wlr_keyboard_set_repeat_info(keyboard, 25, 600);
