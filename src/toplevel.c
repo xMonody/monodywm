@@ -258,10 +258,39 @@ static void restore_box_position(struct server *server,
 	}
 }
 
-// 最大化窗口的几何: 恰好是作区 (窗口填满作区, 紧贴 layer-shell 状态栏的独占区)
+// 最大化窗口的几何: 作区再向有状态栏的一侧缩进 CONFIG_MAXIMIZE_BAR_GAP.
+// 作区本身已经贴合 layer-shell 状态栏的独占区, 缩进是为了避免分数缩放下
+// 边框最后一个物理像素和状态栏首行落在同一设备行而被盖住.
 void maximized_box(struct server *server, struct wlr_output *output,
 		struct wlr_box *box) {
 	get_work_area(server, output, box);
+	int gap = CONFIG_MAXIMIZE_BAR_GAP;
+	if (gap <= 0) {
+		return;
+	}
+	struct wlr_box full;
+	wlr_output_layout_get_box(server->output_layout, output, &full);
+	// 只在被状态栏缩小的那一侧留间隙 (与输出框比较)
+	if (box->x > full.x) {
+		box->x += gap;
+		box->width -= gap;
+	}
+	if (box->y > full.y) {
+		box->y += gap;
+		box->height -= gap;
+	}
+	if (box->x + box->width < full.x + full.width) {
+		box->width -= gap;
+	}
+	if (box->y + box->height < full.y + full.height) {
+		box->height -= gap;
+	}
+	if (box->width < 1) {
+		box->width = 1;
+	}
+	if (box->height < 1) {
+		box->height = 1;
+	}
 }
 
 // 全屏窗口的几何: 整个输出框 (全屏会盖住 layer-shell 状态栏)

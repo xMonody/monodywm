@@ -75,6 +75,12 @@
 // (屏幕减去 layer-shell 状态栏的独占区), 保证新窗口不被状态栏盖住.
 #define CONFIG_CENTER_AVOID_BARS 0
 
+// 最大化窗口与 layer-shell 状态栏之间的额外间隙 (px).
+// 作区已经贴合状态栏的独占区, 但在分数缩放下, 边框最后一个物理像素
+// 可能和状态栏第一行落在同一设备行而被状态栏盖住. 这里让最大化窗口
+// 相对作区再缩进这么多像素, 保证整条边框可见; 设为 0 可关闭.
+#define CONFIG_MAXIMIZE_BAR_GAP 1
+
 // 为 true 时: Caps Lock 变成左 Ctrl, 右 Alt 变成 Caps Lock (Caps 功能
 // 挪到右 Alt). false = 两者都保持原样. keymap 会随 wl_keyboard 下发到客户端.
 #define CONFIG_CAPS_LOCK_AS_CTRL false // 把 Caps Lock 映射成 Ctrl
