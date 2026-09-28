@@ -12,9 +12,9 @@
 # (WLR_DEBUG); exactly 3 renders must appear.  Fewer means the undamaged
 # restack was skipped (stale FBO).
 #
-# Usage: ./test-restack.sh   (from the repo root, after cmake --build build)
+# Usage: ./test/test-restack.sh   (from the repo root, after cmake --build build)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 RUNDIR=$(mktemp -d /tmp/wmrs.XXXXXX)
 trap 'rm -rf "$RUNDIR"' EXIT

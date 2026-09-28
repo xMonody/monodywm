@@ -417,63 +417,63 @@ compositor; CMake builds them from the client headers generated out of the
 protocol XMLs (no dependency on a wlroots build tree).  They are opt-in:
 configure with `-DTEST=ON`.
 
-* `test-client.c` — xdg-shell configure/maximize/minimize/move and
+* `test/test-client.c` — xdg-shell configure/maximize/minimize/move and
   xdg-decoration mode negotiation.
-* `test-interaction.c` — drives a virtual pointer to exercise the whole
+* `test/test-interaction.c` — drives a virtual pointer to exercise the whole
   gesture set: drag-move and long-press-move, wheel maximize/minimize,
   double-click title-strip segments (left = minimize, middle =
   maximize/restore, right = close), client-side-decoration pass-through,
   edge resize, Windows-style restore-from-maximize, and the chord gestures
   (hold right + double-click left to toggle maximize, hold left +
   double-click right to close, hold the other button to move).
-* `test-cursor.c` — terminal-like client (SSD + I-beam cursor request)
+* `test/test-cursor.c` — terminal-like client (SSD + I-beam cursor request)
   driven by a virtual pointer; checks the cursor decisions through the
   compositor's `WLR_DEBUG` "cursor: ..." log.
-* `test-cursor-shape.c` — cursor-shape-v1 negotiation: binds the
+* `test/test-cursor-shape.c` — cursor-shape-v1 negotiation: binds the
   cursor-shape global, sets a shape on the pointer and drives the pointer
   into a window to check the compositor renders it and restores it after an
   override.
-* `test-select-drag.c` + `test-select-drag.sh` — regression test for the
+* `test/test-select-drag.c` + `test/test-select-drag.sh` — regression test for the
   implicit pointer grab: a terminal-like client sets the text cursor, then
   the RIGHT button is held and the virtual pointer is dragged to the left /
   top / bottom edges (and LEFT is pressed at an edge while RIGHT is held).
   While any button is held the compositor must keep the client's cursor
   (never the edge-resize / title-strip hover cursors) and must freeze the
-  client's mid-drag cursor-shape requests.  Run with `./test-select-drag.sh`
+  client's mid-drag cursor-shape requests.  Run with `./test/test-select-drag.sh`
   (auto-asserts PASS/FAIL against the compositor's `WLR_DEBUG` log).
-* `test-resize-cursor.c` + `test-resize-cursor.sh` — cursor stability
+* `test/test-resize-cursor.c` + `test/test-resize-cursor.sh` — cursor stability
   during edge-resize drags: an SSD client honors configure sizes (real
   resize behavior) and re-requests its text cursor on every commit, while
   a virtual pointer presses the LEFT button at the right / bottom / left
   edges and drags.  The compositor must keep the resize cursor for the
   whole drag — the only cursor decisions allowed are the hover
-  transitions between drags.  Run with `./test-resize-cursor.sh`
+  transitions between drags.  Run with `./test/test-resize-cursor.sh`
   (auto-asserts the exact cursor sequence from the `WLR_DEBUG` log).
-* `test-fractional-scale.c` + `test-fractional-scale.sh` — attaches a
+* `test/test-fractional-scale.c` + `test/test-fractional-scale.sh` — attaches a
   physical-size checkerboard to a `wp_fractional_scale_v1` +
   `wp_viewporter` surface so a screen capture can tell 1:1 sampling apart
   from resampling at a fractional output scale.
-* `test-mask-guard.c` — (obsolete) exercised the removed custom
+* `test/test-mask-guard.c` — (obsolete) exercised the removed custom
   rounded-corner mask re-render path; kept only as a client commit
   smoke test.
-* `test-restack.c` — subsurface restack test: `place_below`/`place_above`
+* `test/test-restack.c` — subsurface restack test: `place_below`/`place_above`
   carry no damage and are applied on the parent commit, so the FBO cache
   has to detect the order change.
-* `test-bar-clamp.c` — layer-shell bars (top/bottom, NULL-output and
+* `test/test-bar-clamp.c` — layer-shell bars (top/bottom, NULL-output and
   per-output) + a virtual pointer: verifies a dragged window can never
   slide underneath a status bar, and that its top never goes closer than
   `CONFIG_EDGE_THICKNESS` px to the screen top on a bar-less edge.
-* `test-border.c` — two toplevels + focus switches (border color follows focus).
-* `test-quit.c` — a virtual keyboard presses `Shift+Ctrl+Q`; verifies the
+* `test/test-border.c` — two toplevels + focus switches (border color follows focus).
+* `test/test-quit.c` — a virtual keyboard presses `Shift+Ctrl+Q`; verifies the
   compositor shuts down cleanly (no wlroots teardown assertions).
-* `test-ime-relay.c` — drives the input method relay end to end: a fake
+* `test/test-ime-relay.c` — drives the input method relay end to end: a fake
   app (text-input-v3) plus a fake input method (input-method-v2) verify
   that focus activates the IM, that the IM receives the keymap and key
   events through the keyboard grab, and that its preedit/commit string
   reaches the app.
-* `test-grab-shortcut.c` — while the IM holds the keyboard grab, a global
+* `test/test-grab-shortcut.c` — while the IM holds the keyboard grab, a global
   shortcut must still fire and the consumed key must not reach the IM.
-* `test-ime-app.c` — real-app side of the fcitx5 test: opens a toplevel
+* `test/test-ime-app.c` — real-app side of the fcitx5 test: opens a toplevel
   with text input enabled, drives a virtual keyboard (so it also needs the
   `virtual-keyboard-unstable-v1` protocol) and prints whatever the input
   method commits; run it with a real fcitx5 to type Chinese.

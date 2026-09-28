@@ -17,10 +17,10 @@
 #      to set the E_RESIZE shape near the top edge - it must be ignored).
 # After the release, normal hover behavior resumes.
 #
-# Usage: ./test-select-drag.sh   (from the repo root, after
+# Usage: ./test/test-select-drag.sh   (from the repo root, after
 #        cmake --build build)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 RUNDIR=$(mktemp -d /tmp/wmsel.XXXXXX)
 trap 'rm -rf "$RUNDIR"' EXIT

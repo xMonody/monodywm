@@ -12,9 +12,9 @@
 # exactly 3 renders must appear.  A 4th line means the state-only commit
 # re-rendered; fewer means a damaged/new-buffer commit was skipped.
 #
-# Usage: ./test-mask-guard.sh   (from the repo root, after cmake --build build)
+# Usage: ./test/test-mask-guard.sh   (from the repo root, after cmake --build build)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 RUNDIR=$(mktemp -d /tmp/wmmg.XXXXXX)
 trap 'rm -rf "$RUNDIR"' EXIT

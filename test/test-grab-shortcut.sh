@@ -4,9 +4,9 @@
 # (Ctrl+Alt+P -> rofi) must still fire and the consumed key must not be
 # forwarded to the IM grab.
 #
-# Usage: ./test-grab-shortcut.sh   (from the repo root, after cmake --build build)
+# Usage: ./test/test-grab-shortcut.sh   (from the repo root, after cmake --build build)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 RUNDIR=$(mktemp -d /tmp/wmgrab.XXXXXX)
 trap 'kill "$WM" 2>/dev/null; rm -rf "$RUNDIR"' EXIT
