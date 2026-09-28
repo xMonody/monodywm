@@ -43,14 +43,14 @@
 // 桌面都会被糊住 - 点击状态栏弹出的通常正是这类窗口).
 #define CONFIG_BLUR_LAYER  1
 #define CONFIG_BLUR_RADIUS 5    // 模糊半径 (scenefx 默认 5)
-#define CONFIG_BLUR_PASSES 2    // 降采样遍数 (scenefx 默认 3)
+#define CONFIG_BLUR_PASSES 3    // 降采样遍数 (scenefx 默认 3)
 
 // 全屏 / 最大化窗口的模糊方式 (只影响这两类铺满屏幕的窗口):
 //   1 = 采样底部预模糊缓存: 只模糊 desktop 的 background/bottom 层,
 //       不包含它下方的其他应用窗口; GPU 开销最小 (默认).
 //   0 = 实时模糊窗口下方的所有内容, 包括其他应用窗口; 更耗 GPU.
 // 两者视觉差异只在窗口后面还摞着别的应用时才能看出来.
-#define CONFIG_BLUR_OPTIMIZE_FULLSCREEN 1
+#define CONFIG_BLUR_OPTIMIZE_FULLSCREEN 0
 
 // 窗口阴影 高斯柔影 颜色独立于边框色
 #define CONFIG_SHADOW_BLUR_SIGMA 15.0f
@@ -79,7 +79,7 @@
 // 作区已经贴合状态栏的独占区, 但在分数缩放下, 边框最后一个物理像素
 // 可能和状态栏第一行落在同一设备行而被状态栏盖住. 这里让最大化窗口
 // 相对作区再缩进这么多像素, 保证整条边框可见; 设为 0 可关闭.
-#define CONFIG_MAXIMIZE_BAR_GAP 1
+#define CONFIG_MAXIMIZE_BAR_GAP 0
 
 // 为 true 时: Caps Lock 变成左 Ctrl, 右 Alt 变成 Caps Lock (Caps 功能
 // 挪到右 Alt). false = 两者都保持原样. keymap 会随 wl_keyboard 下发到客户端.
@@ -149,8 +149,8 @@ static const struct config_app_shortcut config_app_shortcuts[] = {
 	{ MODKEY1, XKB_KEY_k, "kitty",   NULL },
 	{ MODKEY1, XKB_KEY_q, "qq",      NULL },
 
-	{ MODKEY1, XKB_KEY_s, "rofi -show drun", NULL },
-	{ MODKEY1, XKB_KEY_p, "rofi -show drun", NULL },
+	{ MODKEY1, XKB_KEY_s, "fuzzel ", NULL },
+	{ MODKEY1, XKB_KEY_p, "fuzzel ", NULL },
 };
 
 // 强制「无装饰」窗口 (合成器接管边框): 这些客户端自己画 CSD, 但它们的

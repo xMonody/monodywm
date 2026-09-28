@@ -14,10 +14,10 @@
 #   (release below the window) -> ew-resize (left edge)
 # Any extra "cursor:" line means the cursor image changed mid-drag.
 #
-# Usage: ./test-resize-cursor.sh   (from the repo root, after
+# Usage: ./test/test-resize-cursor.sh   (from the repo root, after
 #        cmake --build build)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 RUNDIR=$(mktemp -d /tmp/wmrc.XXXXXX)
 trap 'rm -rf "$RUNDIR"' EXIT

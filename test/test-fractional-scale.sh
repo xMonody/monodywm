@@ -7,11 +7,11 @@
 # captures the output through wlr-screencopy (raw physical pixels) and checks
 # that the checkerboard is sampled 1:1 (no blended pixels).
 #
-# Usage: ./test-fractional-scale.sh [scale]      (default 1.75)
+# Usage: ./test/test-fractional-scale.sh [scale]      (default 1.75)
 #   From the repo root after `cmake -S . -B build-test -DTEST=ON &&
 #   cmake --build build-test`.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 BUILD=${BUILD:-build-test}
 SCALE=${1:-1.75}

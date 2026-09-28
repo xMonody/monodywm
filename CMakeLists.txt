@@ -258,86 +258,86 @@ if(TEST)
 	target_include_directories(protocol_stubs PUBLIC ${PROTOCOL_GEN_DIR})
 	target_link_libraries(protocol_stubs PUBLIC PkgConfig::WAYLAND_CLIENT)
 
-	add_executable(test-client test-client.c)
+	add_executable(test-client test/test-client.c)
 	target_include_directories(test-client PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-client PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# fractional-scale test client: wp_fractional_scale_v1 + wp_viewporter,
 	# attaches a physical-size checkerboard for a logical size so a capture can
 	# tell 1:1 sampling apart from resampling at fractional output scale
-	add_executable(test-fractional-scale test-fractional-scale.c)
+	add_executable(test-fractional-scale test/test-fractional-scale.c)
 	target_include_directories(test-fractional-scale PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-fractional-scale PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
-	add_executable(test-interaction test-interaction.c)
+	add_executable(test-interaction test/test-interaction.c)
 	target_include_directories(test-interaction PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-interaction PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# cursor-style test: terminal-like client (SSD + I-beam cursor) driven by a
 	# virtual pointer; verify cursor decisions via the compositor's WLR_DEBUG log
-	add_executable(test-cursor test-cursor.c)
+	add_executable(test-cursor test/test-cursor.c)
 	target_include_directories(test-cursor PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-cursor PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# cursor-shape-v1 negotiation test: binds the cursor-shape global, sets a
 	# shape on the pointer and drives a virtual pointer into a window to check
 	# the compositor renders it and restores it after an override
-	add_executable(test-cursor-shape test-cursor-shape.c)
+	add_executable(test-cursor-shape test/test-cursor-shape.c)
 	target_include_directories(test-cursor-shape PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-cursor-shape PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
-	add_executable(test-select-drag test-select-drag.c)
+	add_executable(test-select-drag test/test-select-drag.c)
 	target_include_directories(test-select-drag PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-select-drag PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# resize-cursor test: edge-resize drag with a client that honors configure
 	# sizes and re-requests its cursor mid-drag; verifies the resize cursor
 	# stays put for the whole drag (no flicker)
-	add_executable(test-resize-cursor test-resize-cursor.c)
+	add_executable(test-resize-cursor test/test-resize-cursor.c)
 	target_include_directories(test-resize-cursor PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-resize-cursor PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# mask-guard test: (obsolete) the custom rounded-mask pass was removed;
 	# kept as a plain client commit smoke test
-	add_executable(test-mask-guard test-mask-guard.c)
+	add_executable(test-mask-guard test/test-mask-guard.c)
 	target_include_directories(test-mask-guard PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-mask-guard PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# subsurface restack test: place_below/place_above carry no damage and are
 	# applied on the parent commit; the FBO cache must detect the order change
-	add_executable(test-restack test-restack.c)
+	add_executable(test-restack test/test-restack.c)
 	target_include_directories(test-restack PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-restack PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# border test: two toplevels + focus switches
-	add_executable(test-bar-clamp test-bar-clamp.c)
+	add_executable(test-bar-clamp test/test-bar-clamp.c)
 	target_include_directories(test-bar-clamp PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-bar-clamp PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
-	add_executable(test-border test-border.c)
+	add_executable(test-border test/test-border.c)
 	target_include_directories(test-border PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-border PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT)
 
 	# quit test: virtual keyboard presses Shift+Alt+q; verifies the compositor
 	# shuts down cleanly (no wlroots teardown assertions)
-	add_executable(test-quit test-quit.c)
+	add_executable(test-quit test/test-quit.c)
 	target_include_directories(test-quit PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-quit PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT PkgConfig::XKBCOMMON)
 
 	# input-method relay test: app (text-input-v3) <-> IM (input-method-v2)
-	add_executable(test-ime-relay test-ime-relay.c)
+	add_executable(test-ime-relay test/test-ime-relay.c)
 	target_include_directories(test-ime-relay PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-ime-relay PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT PkgConfig::XKBCOMMON)
 
 	# grab-shortcut test: while the IM holds the keyboard grab (cursor in a
 	# text field, fcitx5 composing), a global shortcut (Ctrl+Alt+P -> rofi)
 	# must still fire and the consumed key must not reach the IM grab
-	add_executable(test-grab-shortcut test-grab-shortcut.c)
+	add_executable(test-grab-shortcut test/test-grab-shortcut.c)
 	target_include_directories(test-grab-shortcut PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-grab-shortcut PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT PkgConfig::XKBCOMMON)
 
 	# fcitx5 end-to-end: app + virtual keyboard driver (needs a real fcitx5)
-	add_executable(test-ime-app test-ime-app.c)
+	add_executable(test-ime-app test/test-ime-app.c)
 	target_include_directories(test-ime-app PRIVATE ${PROTOCOL_GEN_DIR})
 	target_link_libraries(test-ime-app PRIVATE protocol_stubs PkgConfig::WAYLAND_CLIENT PkgConfig::XKBCOMMON)
 
