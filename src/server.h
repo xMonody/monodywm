@@ -143,6 +143,23 @@ struct toplevel_popup {
 // 顶部三段边框 (最小化/最大化/关闭手势区) 用 3 个段 rect + 2*STEPS 个渐变 rect 拼成
 #define DECOR_BORDER_TOP_RECTS (3 + 2 * CONFIG_BORDER_GRADIENT_STEPS)
 
+// decor_update() 的几何/状态缓存签名: 除客户端 buffer 内容之外, 所有影响
+// 边框 / 阴影 / 模糊几何与颜色的输入都在这里. 签名不变时整块重排可以跳过;
+// 圆角仍每次提交重放 (客户端可能新建覆盖窗口四角的 subsurface buffer).
+struct decor_signature {
+	bool valid;
+	int fw, fh;         // 外框尺寸
+	int bw;             // 边框宽
+	int radius;         // 内容圆角半径
+	int geom_x, geom_y; // 客户端 window geometry 原点 (surface clip 用)
+	float scale;        // 主输出 scale (阴影 blur_sigma 用)
+	bool focused;
+	bool fullscreen;
+	bool dialog;        // 对话框/固定尺寸: 顶部三段用基础色
+	bool maximized;
+	bool restore_pending;
+};
+
 struct toplevel {
 	struct server *server;
 	struct wlr_xdg_toplevel *xdg_toplevel;
@@ -159,6 +176,8 @@ struct toplevel {
 	struct wlr_scene_rect *border_top[DECOR_BORDER_TOP_RECTS];
 	struct wlr_scene_shadow *shadow;
 	struct wlr_scene_blur *blur;    // 背景模糊 (整块窗口内容区)
+	// 上次 decor_update() 应用过的几何/状态签名 (decor.c)
+	struct decor_signature decor_sig;
 
 	// popup 是 scene_tree 的子场景树, 其树销毁时自行清理, 无需显式列表
 

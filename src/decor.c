@@ -418,6 +418,42 @@ static bool decor_blur_enabled(struct toplevel *tl) {
 	return CONFIG_BLUR;
 }
 
+// 组装 decor_update() 的几何/状态签名. 只包含客户端 buffer 内容之外的输入:
+// buffer 本身只影响圆角重放 (见 decor_update), 不影响这里缓存的几何.
+static void decor_signature_build(struct toplevel *tl, int fw, int fh, int bw,
+		int radius, float scale, struct decor_signature *sig) {
+	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
+	*sig = (struct decor_signature){
+		.valid = true,
+		.fw = fw,
+		.fh = fh,
+		.bw = bw,
+		.radius = radius,
+		.geom_x = base->geometry.x,
+		.geom_y = base->geometry.y,
+		.scale = scale,
+		.focused = tl->server->focused == tl,
+		.fullscreen = tl->fullscreen,
+		.dialog = toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl),
+		.maximized = tl->xdg_toplevel->current.maximized,
+		.restore_pending = tl->restore_frame_pending,
+	};
+}
+
+static bool decor_signature_eq(const struct decor_signature *a,
+		const struct decor_signature *b) {
+	return a->valid == b->valid &&
+		a->fw == b->fw && a->fh == b->fh &&
+		a->bw == b->bw && a->radius == b->radius &&
+		a->geom_x == b->geom_x && a->geom_y == b->geom_y &&
+		a->scale == b->scale &&
+		a->focused == b->focused &&
+		a->fullscreen == b->fullscreen &&
+		a->dialog == b->dialog &&
+		a->maximized == b->maximized &&
+		a->restore_pending == b->restore_pending;
+}
+
 // 根据窗口状态刷新圆角 / 边框 / 阴影几何与颜色
 void decor_update(struct toplevel *tl) {
 	if (tl->scene_tree == NULL) {
@@ -459,123 +495,145 @@ void decor_update(struct toplevel *tl) {
 			wlr_scene_node_set_enabled(&tl->blur->node, false);
 		}
 		decor_border_top_update(tl);
+		// 几何无效: 装饰节点已被关闭, 缓存作废, 下次有效几何必须完整重建
+		tl->decor_sig.valid = false;
 		return;
 	}
 
 	int radius = decor_radius(tl);      // 内容圆角 (也是边框内孔半径)
-	int outer_radius = radius + bw;     // 边框外圆角 (与内孔同心)
 	struct fx_corner_radii content_corners = corner_radii_all(radius);
-	struct fx_corner_radii outer_corners = corner_radii_all(outer_radius);
 
-	// 内容裁切到窗口几何, 去掉 CSD 边距/投影 (surface > geometry 时).
-	// clip 的坐标空间是根 surface: scene_tree 把 surface 放在树内 -geometry 处,
-	// 所以要加上 geometry 偏移, 否则 CSD 窗口的内容会偏出左上角. 只裁 toplevel
-	// 自身的 surface 树 (与 dwl 的 c->scene_surface 对应), 不递归到 popup.
-	struct wlr_box clip = {
-		.x = base->geometry.x,
-		.y = base->geometry.y,
-		.width = w,
-		.height = h,
-	};
-	struct wlr_scene_node *content = tl->surface_tree != NULL
-		? &tl->surface_tree->node : &tl->scene_tree->node;
-	wlr_scene_subsurface_tree_set_clip(content, &clip);
+	struct wlr_output *output = toplevel_output(tl->server, tl);
+	float output_scale = output != NULL ? output->scale : 1.0f;
 
-	// 裁切/位置更新后再重放圆角 (首个 map 提交的几何可能是 0x0/无效,
-	// 那时 surface 树/buffer 还没就绪; commit 时场景已重配好). 幂等.
+	// 几何/状态签名不变时跳过裁切、边框、阴影、模糊与顶部三段重排:
+	// 这些只依赖窗口几何与状态, 与客户端每帧提交的 buffer 内容无关.
+	// 焦点/全屏/最大化/scale 变化都会改变签名, 所以不会漏掉重绘.
+	struct decor_signature sig;
+	decor_signature_build(tl, fw, fh, bw, radius, output_scale, &sig);
+	bool geometry_changed = !decor_signature_eq(&tl->decor_sig, &sig);
+	if (geometry_changed) {
+		tl->decor_sig = sig;
+
+		int outer_radius = radius + bw; // 边框外圆角 (与内孔同心)
+		struct fx_corner_radii outer_corners = corner_radii_all(outer_radius);
+
+		// 内容裁切到窗口几何, 去掉 CSD 边距/投影 (surface > geometry 时).
+		// clip 的坐标空间是根 surface: scene_tree 把 surface 放在树内 -geometry 处,
+		// 所以要加上 geometry 偏移, 否则 CSD 窗口的内容会偏出左上角. 只裁 toplevel
+		// 自身的 surface 树 (与 dwl 的 c->scene_surface 对应), 不递归到 popup.
+		struct wlr_box clip = {
+			.x = base->geometry.x,
+			.y = base->geometry.y,
+			.width = w,
+			.height = h,
+		};
+		struct wlr_scene_node *content = tl->surface_tree != NULL
+			? &tl->surface_tree->node : &tl->scene_tree->node;
+		wlr_scene_subsurface_tree_set_clip(content, &clip);
+
+		// 边框环: 外框大小 rect, 挖掉内容区, 画在内容之外 (内容不再被盖住)
+		if (tl->border != NULL) {
+			if (bw > 0) {
+				float color[4];
+				decor_border_color(tl, color);
+				wlr_scene_node_set_enabled(&tl->border->node, true);
+				wlr_scene_node_set_position(&tl->border->node, -bw, -bw);
+				wlr_scene_rect_set_size(tl->border, fw, fh);
+				wlr_scene_rect_set_corner_radii(tl->border,
+					outer_corners);
+				wlr_scene_rect_set_clipped_region(tl->border,
+					(struct clipped_region){
+						.area = { bw, bw, w, h },
+						.corners = content_corners,
+					});
+				wlr_scene_rect_set_color(tl->border, color);
+			} else {
+				wlr_scene_node_set_enabled(&tl->border->node, false);
+			}
+		}
+
+		// 投影: 挖孔取外框 (边框外缘), 阴影落在整个窗口之外
+		if (tl->shadow != NULL) {
+			if (decor_shadow_enabled(tl)) {
+				float color[4];
+				decor_shadow_color(tl, color);
+				int pad = decor_shadow_padding();
+				int sw = fw + 2 * pad;
+				int sh = fh + 2 * pad;
+				wlr_scene_node_set_enabled(&tl->shadow->node, true);
+				wlr_scene_node_set_position(&tl->shadow->node,
+					-bw - pad, -bw - pad);
+				wlr_scene_shadow_set_size(tl->shadow, sw, sh);
+				// 实心矩形 = 节点内缩 blur_sigma, 比窗口外框向外多扩 overshoot.
+				// 圆角矩形向外偏移时圆心不动、半径增大, 所以要同步 +overshoot
+				// 才能与窗口外框同心; 直接用 outer_radius 会让四角阴影偏胖.
+				int solid_radius = outer_radius +
+					(int)lroundf(decor_shadow_overshoot());
+				wlr_scene_shadow_set_corner_radius(tl->shadow,
+					solid_radius);
+				// scenefx 会把阴影节点的位置/尺寸/圆角按输出 scale 放大, 却不缩放
+				// blur_sigma. 实心矩形在输出像素里的内缩必须等于 blur * scale, 才能真正
+				// 落在窗口外框之外 overshoot 处; 传入逻辑 blur 会让缩放输出上的实心
+				// 矩形偏小, 阴影会挤进窗口内部 (被 clipped_region 挖掉). (跨多个不同
+				// scale 输出的窗口只能取主输出.)
+				wlr_scene_shadow_set_blur_sigma(tl->shadow,
+					decor_shadow_blur() * output_scale);
+				wlr_scene_shadow_set_clipped_region(tl->shadow,
+					(struct clipped_region){
+						.area = { pad, pad, fw, fh },
+						.corners = corner_radii_all(outer_radius),
+					});
+				wlr_scene_shadow_set_color(tl->shadow, color);
+			} else {
+				wlr_scene_node_set_enabled(&tl->shadow->node, false);
+			}
+		}
+
+		// 背景模糊: 覆盖整块窗口内容区, 圆角与窗口一致. 和 swayfx 一样不设透明掩码:
+		// 模糊整块背景, 由窗口自身的半透明内容去混合, 所以不需要指定任何颜色.
+		if (tl->blur != NULL) {
+			if (decor_blur_enabled(tl)) {
+				wlr_scene_node_set_enabled(&tl->blur->node, true);
+				wlr_scene_node_set_position(&tl->blur->node, 0, 0);
+				wlr_scene_blur_set_size(tl->blur, w, h);
+				wlr_scene_blur_set_corner_radii(tl->blur,
+					content_corners);
+				// 全屏/最大化铺满屏幕, 是否改用底部预模糊缓存由
+				// CONFIG_BLUR_OPTIMIZE_FULLSCREEN 决定:
+				//   1 = 只模糊 background/bottom 层 (采样 output.c 维护的缓存,
+				//       layer.c 在背景变化时置脏, 见 output_blur_layer_mark_dirty);
+				//   0 = 实时模糊窗口下方的一切, 包括其他应用窗口.
+				bool zoomed = tl->fullscreen ||
+					(tl->xdg_toplevel != NULL &&
+					 tl->xdg_toplevel->current.maximized &&
+					 !tl->restore_frame_pending);
+				bool optimize =
+					CONFIG_BLUR_OPTIMIZE_FULLSCREEN && zoomed;
+				wlr_scene_blur_set_should_only_blur_bottom_layer(
+					tl->blur, optimize);
+			} else {
+				wlr_scene_node_set_enabled(&tl->blur->node, false);
+			}
+		}
+
+		// 顶部三段边框 (随窗口几何/焦点/全屏变化重排)
+		decor_border_top_update(tl);
+	}
+
+	// 圆角必须在每次提交重放: 客户端可能新建覆盖窗口四角的 subsurface buffer,
+	// 其场景节点默认没有圆角, 只有遍历重放才能补上. 值未变时 scenefx 直接返回,
+	// 所以未变化的提交只付一次场景遍历. 放在裁切之后 (裁切改变 buffer 布局).
 	decor_apply_rounding(tl, w, h, content_corners);
-
-	// 边框环: 外框大小 rect, 挖掉内容区, 画在内容之外 (内容不再被盖住)
-	if (tl->border != NULL) {
-		if (bw > 0) {
-			float color[4];
-			decor_border_color(tl, color);
-			wlr_scene_node_set_enabled(&tl->border->node, true);
-			wlr_scene_node_set_position(&tl->border->node, -bw, -bw);
-			wlr_scene_rect_set_size(tl->border, fw, fh);
-			wlr_scene_rect_set_corner_radii(tl->border, outer_corners);
-			wlr_scene_rect_set_clipped_region(tl->border,
-				(struct clipped_region){
-					.area = { bw, bw, w, h },
-					.corners = content_corners,
-				});
-			wlr_scene_rect_set_color(tl->border, color);
-		} else {
-			wlr_scene_node_set_enabled(&tl->border->node, false);
-		}
-	}
-
-	// 投影: 挖孔取外框 (边框外缘), 阴影落在整个窗口之外
-	if (tl->shadow != NULL) {
-		if (decor_shadow_enabled(tl)) {
-			float color[4];
-			decor_shadow_color(tl, color);
-			int pad = decor_shadow_padding();
-			int sw = fw + 2 * pad;
-			int sh = fh + 2 * pad;
-			wlr_scene_node_set_enabled(&tl->shadow->node, true);
-			wlr_scene_node_set_position(&tl->shadow->node, -bw - pad,
-				-bw - pad);
-			wlr_scene_shadow_set_size(tl->shadow, sw, sh);
-			// 实心矩形 = 节点内缩 blur_sigma, 比窗口外框向外多扩 overshoot.
-			// 圆角矩形向外偏移时圆心不动、半径增大, 所以要同步 +overshoot
-			// 才能与窗口外框同心; 直接用 outer_radius 会让四角阴影偏胖.
-			int solid_radius = outer_radius +
-				(int)lroundf(decor_shadow_overshoot());
-			wlr_scene_shadow_set_corner_radius(tl->shadow, solid_radius);
-			// scenefx 会把阴影节点的位置/尺寸/圆角按输出 scale 放大, 却不缩放
-			// blur_sigma. 实心矩形在输出像素里的内缩必须等于 blur * scale, 才能真正
-			// 落在窗口外框之外 overshoot 处; 传入逻辑 blur 会让缩放输出上的实心
-			// 矩形偏小, 阴影会挤进窗口内部 (被 clipped_region 挖掉). (跨多个不同
-			// scale 输出的窗口只能取主输出.)
-			struct wlr_output *output = toplevel_output(tl->server, tl);
-			float output_scale = output != NULL ? output->scale : 1.0f;
-			wlr_scene_shadow_set_blur_sigma(tl->shadow,
-				decor_shadow_blur() * output_scale);
-			wlr_scene_shadow_set_clipped_region(tl->shadow,
-				(struct clipped_region){
-					.area = { pad, pad, fw, fh },
-					.corners = corner_radii_all(outer_radius),
-				});
-			wlr_scene_shadow_set_color(tl->shadow, color);
-		} else {
-			wlr_scene_node_set_enabled(&tl->shadow->node, false);
-		}
-	}
-
-	// 背景模糊: 覆盖整块窗口内容区, 圆角与窗口一致. 和 swayfx 一样不设透明掩码:
-	// 模糊整块背景, 由窗口自身的半透明内容去混合, 所以不需要指定任何颜色.
-	if (tl->blur != NULL) {
-		if (decor_blur_enabled(tl)) {
-			wlr_scene_node_set_enabled(&tl->blur->node, true);
-			wlr_scene_node_set_position(&tl->blur->node, 0, 0);
-			wlr_scene_blur_set_size(tl->blur, w, h);
-			wlr_scene_blur_set_corner_radii(tl->blur, content_corners);
-			// 全屏/最大化铺满屏幕, 是否改用底部预模糊缓存由
-			// CONFIG_BLUR_OPTIMIZE_FULLSCREEN 决定:
-			//   1 = 只模糊 background/bottom 层 (采样 output.c 维护的缓存,
-			//       layer.c 在背景变化时置脏, 见 output_blur_layer_mark_dirty);
-			//   0 = 实时模糊窗口下方的一切, 包括其他应用窗口.
-			bool zoomed = tl->fullscreen ||
-				(tl->xdg_toplevel != NULL &&
-				 tl->xdg_toplevel->current.maximized &&
-				 !tl->restore_frame_pending);
-			bool optimize = CONFIG_BLUR_OPTIMIZE_FULLSCREEN && zoomed;
-			wlr_scene_blur_set_should_only_blur_bottom_layer(tl->blur,
-				optimize);
-		} else {
-			wlr_scene_node_set_enabled(&tl->blur->node, false);
-		}
-	}
-
-	// 顶部三段边框 (随窗口几何/焦点/全屏变化重排)
-	decor_border_top_update(tl);
 }
 
 // 窗口 unmap 后, 内容子树由 wlroots 自身禁用, 但边框/阴影/模糊是 scene_tree
 // 的兄弟节点, 不会随之隐藏, 会留下"幽灵"装饰. 这里显式关闭; map 时
 // decor_update() 会按当前状态重新启用并补齐几何.
 void decor_hide(struct toplevel *tl) {
+	// 装饰节点被显式关闭: 作废几何缓存, map 时 decor_update() 才会完整重建
+	// (否则若签名未变会跳过, 边框/阴影/模糊会一直停在关闭状态)
+	tl->decor_sig.valid = false;
 	if (tl->border != NULL) {
 		wlr_scene_node_set_enabled(&tl->border->node, false);
 	}

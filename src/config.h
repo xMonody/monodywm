@@ -22,14 +22,14 @@
 #define CONFIG_BORDER_FOCUSED    0x7c73b0    // 有焦点边框颜色 0xRRGGBB
 #define CONFIG_BORDER_UNFOCUSED  0x7c73b0    // 无焦点边框颜色 0xRRGGBB
 
-#define CONFIG_BORDER_TOP_LEFT   0x7c73b0    // 顶部边框左1/3颜色 (最小化)
-#define CONFIG_BORDER_TOP_MID    0xb87898    // 顶部边框中1/3颜色 (最大化)
-#define CONFIG_BORDER_TOP_RIGHT  0x7c73b0    // 顶部边框右1/3颜色 (关闭)
+#define CONFIG_BORDER_TOP_LEFT   0x749395    // 顶部边框左1/3颜色 (最小化)
+#define CONFIG_BORDER_TOP_MID    0x9f6686    // 顶部边框中1/3颜色 (最大化)
+#define CONFIG_BORDER_TOP_RIGHT  0xae5c5e    // 顶部边框右1/3颜色 (关闭)
 #define CONFIG_BORDER_GRADIENT_WIDTH 15      // 顶部边框三段颜色拼接处渐变宽度 (px)
-#define CONFIG_BORDER_GRADIENT_STEPS 8 // 分段越多越平滑, 每窗节点数 = 3 + 2*该值)
+#define CONFIG_BORDER_GRADIENT_STEPS 4 // 分段越多越平滑, 渐变节点数 = 2*该值 (现为 8), 顶部总节点 = 3 + 2*该值
 
 #define CONFIG_FULLSCREEN_BORDER 0              // 全屏窗口是否显示边框 0/1
-#define CONFIG_FULLSCREEN_BORDER_COLOR 0xb87898 // 全屏边框颜色 0xRRGGBB
+#define CONFIG_FULLSCREEN_BORDER_COLOR 0x9f6686 // 全屏边框颜色 0xRRGGBB
 #define CONFIG_FULLSCREEN_ROUNDED_RADIUS 8      // 全屏圆角半径 (px, 仅当上面边框为 1 时生效;
                                                 // 边框为 0 时按直角, 不裁剪圆角)
 
@@ -50,7 +50,7 @@
 //       不包含它下方的其他应用窗口; GPU 开销最小 (默认).
 //   0 = 实时模糊窗口下方的所有内容, 包括其他应用窗口; 更耗 GPU.
 // 两者视觉差异只在窗口后面还摞着别的应用时才能看出来.
-#define CONFIG_BLUR_OPTIMIZE_FULLSCREEN 0
+#define CONFIG_BLUR_OPTIMIZE_FULLSCREEN 1
 
 // 窗口阴影 高斯柔影 颜色独立于边框色
 #define CONFIG_SHADOW_BLUR_SIGMA 15.0f

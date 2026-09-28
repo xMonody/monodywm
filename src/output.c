@@ -56,7 +56,7 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	mon->fps_frames++;
 	uint32_t elapsed = now_ms - mon->fps_start_ms;
 	if (elapsed >= 1000u) {
-		wlr_log(WLR_INFO, "output %s: %.1f fps (%u frames in %u ms)",
+		wlr_log(WLR_DEBUG, "output %s: %.1f fps (%u frames in %u ms)",
 			mon->output->name,
 			(double)mon->fps_frames * 1000.0 / (double)elapsed,
 			mon->fps_frames, elapsed);
