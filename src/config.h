@@ -16,7 +16,7 @@
 #define CONFIG_MOVE_CURSOR     "all-scroll"  // 拖动(移动)窗口时显示的光标
 
 #define CONFIG_ROUNDED_RADIUS        8       // 窗口圆角半径 (px)
-#define CONFIG_BORDER_WIDTH          2.0     // 窗口边框宽度 (px)
+#define CONFIG_BORDER_WIDTH          1.0     // 窗口边框宽度 (px)
 #define CONFIG_BORDER_UNFOCUSED_DRAW 1       // 未聚焦窗口是否边框
 
 #define CONFIG_BORDER_FOCUSED    0x7c73b0    // 有焦点边框颜色 0xRRGGBB

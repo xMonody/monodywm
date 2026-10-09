@@ -754,6 +754,11 @@ int main(int argc, char *argv[]) {
 	wl_list_remove(&server.seat_request_set_primary_selection.link);
 	wl_list_remove(&server.seat_request_start_drag.link);
 	wl_list_remove(&server.seat_start_drag.link);
+	// 进行中的拖拽: 摘掉销毁监听器, 避免稍后销毁 client 时在已拆解的
+	// server 上回调 refresh_pointer_focus
+	if (server.drag_destroy.link.prev != NULL) {
+		wl_list_remove(&server.drag_destroy.link);
+	}
 
 	ipc_server_destroy(&server);
 	wl_display_destroy_clients(server.display);

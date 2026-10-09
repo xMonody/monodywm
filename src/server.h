@@ -48,6 +48,7 @@ enum scene_layer {
 	LAYER_BOTTOM,         // wlr-layer-shell bottom
 	LAYER_TOPLEVELS,      // 普通窗口
 	LAYER_TOP,            // wlr-layer-shell top
+	LAYER_FULLSCREEN,     // 全屏窗口: 盖住状态栏等 top/bottom 层, 但在 overlay 之下
 	LAYER_OVERLAY,        // wlr-layer-shell overlay + 拖拽图标
 	LAYER_COUNT,
 };
@@ -416,6 +417,8 @@ struct server {
 	// 拖拽图标的场景树被 wlroots 在其图标销毁时一并销毁; 监听它以便
 	// 及时把 drag_tree 置空, 避免指针移动访问已释放的节点
 	struct wl_listener drag_tree_destroy;
+	// 拖拽对象 (wlr_drag) 销毁时刷新指针焦点; 见 input.c: drag_destroy_notify
+	struct wl_listener drag_destroy;
 
 	// 指针交互状态
 	struct toplevel *zone_toplevel; // 活动标题栏按压下的 toplevel
@@ -488,6 +491,11 @@ struct server {
 	struct wlr_seat_client *client_cursor_shape_client;
 	struct wl_listener client_cursor_shape_client_destroy;
 	struct wl_listener client_cursor_destroy;
+	// 合成器移动/缩放或有指针按钮按住期间收到的客户端光标请求被延后:
+	// 抓取结束后由 update_cursor_style() 重新应用. 不这样做的话请求会丢失,
+	// 而客户端认为已生效不会重发, 光标就会卡在抓取开始时的样式,
+	// 直到重新 enter 或下一次点击
+	bool client_cursor_pending;
 
 	struct wl_listener new_output;
 	struct wl_listener new_input;

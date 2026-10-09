@@ -498,6 +498,7 @@ static void set_cursor_override(struct server *server, const char *name) {
 // 而客户端自绘 surface 可能由不使用 wp_fractional_scale_v1 的客户端决定尺寸.
 // 若合成器光标覆盖 (标题条/resize 边缘) 处于活动状态, 它优先于一切.
 void reapply_client_cursor(struct server *server) {
+	server->client_cursor_pending = false;
 	if (server->cursor_override != NULL) {
 		wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
 			server->cursor_override);
@@ -678,6 +679,10 @@ void update_cursor_style(struct server *server) {
 		// 让指针停在客户端自己的光标上 (或默认光标, motion 处理器在 surface
 		// 变化时会重置它)
 		clear_cursor_override(server);
+	} else if (server->client_cursor_pending) {
+		// 抓取期间收到并被延后的客户端光标请求: 此时按钮已全部释放
+		// (上面的 button_count 分支已放行), 补上它, 避免光标卡在旧样式
+		reapply_client_cursor(server);
 	}
 }
 
@@ -1262,6 +1267,20 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 				n = n->parent != NULL ? &n->parent->node : NULL;
 			}
 		}
+	}
+
+	// 进行中的 wl_data_device 拖拽: 指针抓取属于 wlroots 的 drag grab,
+	// 必须把 enter/motion 喂给它, 否则 drag focus 不会更新, 目标收不到
+	// data_device.enter/drop, 而下面的隐式抓取分支会因为 button_count > 0
+	// 把 motion 全部吞掉. 这里不做隐式抓取处理.
+	if (server->seat->drag != NULL) {
+		if (surface != NULL) {
+			wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+			wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+		} else {
+			wlr_seat_pointer_notify_clear_focus(server->seat);
+		}
+		return;
 	}
 
 	// 隐式抓取: 客户端按住一个指针按钮 (如文本选择).
