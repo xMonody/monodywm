@@ -568,6 +568,54 @@ static bool apply_maximized_box(struct server *server, struct toplevel *tl) {
 	return true;
 }
 
+// toplevel 应处的场景层: 全屏窗口放进 LAYER_FULLSCREEN (盖住状态栏等面板);
+// 其对话框子窗口也必须跟到同一层, 否则独立对话框 (set_parent 的 xdg_toplevel,
+// 其 scene_tree 默认建在 LAYER_TOPLEVELS) 会被压在父窗口之下.
+// 沿 xdg parent 链上溯, 任一祖先全屏即算全屏层.
+static int toplevel_layer(struct toplevel *tl) {
+	if (tl->fullscreen) {
+		return LAYER_FULLSCREEN;
+	}
+	struct wlr_xdg_toplevel *parent =
+		tl->xdg_toplevel != NULL ? tl->xdg_toplevel->parent : NULL;
+	while (parent != NULL) {
+		struct toplevel *p = parent->base != NULL ? parent->base->data : NULL;
+		if (p == NULL) {
+			break;
+		}
+		if (p->fullscreen) {
+			return LAYER_FULLSCREEN;
+		}
+		parent = p->xdg_toplevel != NULL ? p->xdg_toplevel->parent : NULL;
+	}
+	return LAYER_TOPLEVELS;
+}
+
+// 把 tl 的 scene_tree 挪到应有的层; 已在目标层则不动 (保留层内堆叠顺序)
+static void toplevel_reparent_layer(struct server *server, struct toplevel *tl) {
+	if (tl->scene_tree == NULL) {
+		return;
+	}
+	int layer = toplevel_layer(tl);
+	if (tl->scene_tree->node.parent != server->layers[layer]) {
+		wlr_scene_node_reparent(&tl->scene_tree->node,
+			server->layers[layer]);
+	}
+}
+
+// tl 及其所有对话框子窗口同步换层 (进入/退出全屏时用)
+static void toplevel_reparent_subtree(struct server *server,
+		struct toplevel *tl) {
+	toplevel_reparent_layer(server, tl);
+	struct toplevel *child;
+	wl_list_for_each(child, &server->toplevels, link) {
+		if (child != tl && child->xdg_toplevel != NULL &&
+				child->xdg_toplevel->parent == tl->xdg_toplevel) {
+			toplevel_reparent_subtree(server, child);
+		}
+	}
+}
+
 void set_fullscreen(struct server *server, struct toplevel *tl,
 		bool fullscreen) {
 	if (tl->xdg_toplevel->base == NULL ||
@@ -587,6 +635,11 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 		tl->has_fullscreen_restore_box = true;
 	}
 	tl->fullscreen = fullscreen;
+	// 全屏窗口移到 top 层之上 (遮盖状态栏等面板), 但仍低于 overlay 层,
+	// 所以启动器/覆盖菜单依旧显示在最前. 退出全屏时放回普通窗口层.
+	// 对话框子窗口一起换层: 它们跟随父窗口所在层, 否则全屏父窗口弹出的
+	// 独立对话框会被压在下面.
+	toplevel_reparent_subtree(server, tl);
 	// 边框宽度/颜色依赖全屏状态; 全屏时内容圆角也要重设
 	decor_update(tl);
 	if (fullscreen) {
@@ -775,6 +828,9 @@ static void toplevel_raise(struct server *server, struct toplevel *tl) {
 	if (tl->scene_tree == NULL) {
 		return;
 	}
+	// 父窗口全屏状态可能在本窗口映射之后才变化 (如全屏窗口的对话框),
+	// 提升前先归位到应有层
+	toplevel_reparent_layer(server, tl);
 	wlr_scene_node_raise_to_top(&tl->scene_tree->node);
 	struct toplevel *child;
 	wl_list_for_each(child, &server->toplevels, link) {
@@ -1230,12 +1286,16 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener,
 // 客户端在 map 之后才声明/清除父窗口 (transient): 任务栏归属需要跟着变.
 // 注意 wlroots 只保留 mapped 父窗口; 完全不用 set_parent / xdg-dialog 的
 // 客户端 (如 QQ 弹窗) 在这里没有任何信号可用.
+// 同时重算所在场景层: 父窗口进入/退出全屏或父窗口被销毁 (wlroots 在父 surface
+// unmap 时把本窗口的 parent 改为祖父/NULL 并发此信号) 都会改变全屏归属,
+// 不重算的话子窗口会永远卡在 LAYER_FULLSCREEN.
 static void xdg_toplevel_set_parent(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, set_parent);
 	// 先记日志: 多数客户端在 map 前就设好父窗口, 不能因未映射而漏掉
 	wlr_log(WLR_DEBUG, "xdg_toplevel: set_parent app_id \"%s\" -> %s",
 		tl->app_id != NULL ? tl->app_id : "?",
 		toplevel_is_dialog(tl) ? "dialog" : "none");
+	toplevel_reparent_layer(tl->server, tl);
 	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 	if (base == NULL || !base->surface->mapped) {
 		return; // 还没映射: map 处理器会用最新父窗口关系决定

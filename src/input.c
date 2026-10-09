@@ -70,19 +70,19 @@ void seat_request_set_cursor(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		seat_request_set_cursor);
 	struct wlr_seat_pointer_request_set_cursor_event *event = data;
-	// 合成器交互式移动/缩放期间接管光标: 抓取结束前忽略所有客户端光标请求
-	// (labwc 的 input_mode 门控)
-	if (server->input_mode != INPUT_MODE_PASSTHROUGH) {
-		return;
-	}
-	// 隐式抓取: 客户端按住指针按钮时 (如文本选择), 光标冻结在抓取开始的状态;
-	// 忽略拖动中途客户端的光标变更 (如 CSD 客户端靠近边缘时切换自己的 resize 光标)
-	if (server->seat->pointer_state.button_count > 0) {
-		return;
-	}
 	// 只接受当前聚焦客户端的请求: 其余直接丢弃, 避免记住别的客户端的光标
 	if (event->seat_client != server->seat->pointer_state.focused_client) {
 		return;
+	}
+	// 合成器交互式移动/缩放或隐式抓取 (按钮按住) 期间, 可见光标由抓取方决定:
+	// 记住客户端最新的偏好但延后应用, 抓取结束后由 update_cursor_style() 恢复.
+	// 必须在存储前记下 pending, 因为下面的边框区分支可能直接 return.
+	// 若直接丢弃请求, 它会永远丢失, 而客户端认为已生效不会重发,
+	// 光标便卡在抓取开始时的样式, 直到重新 enter 或下一次点击.
+	bool defer = server->input_mode != INPUT_MODE_PASSTHROUGH ||
+		server->seat->pointer_state.button_count > 0;
+	if (defer) {
+		server->client_cursor_pending = true;
 	}
 	// 光标 surface 覆盖此前设置的任何光标形状
 	// (混用两种协议的客户端: 最后一次请求生效)
@@ -125,6 +125,9 @@ void seat_request_set_cursor(struct wl_listener *listener, void *data) {
 		}
 		return;
 	}
+	if (defer) {
+		return;
+	}
 	wlr_cursor_set_surface(server->cursor, event->surface,
 		event->hotspot_x, event->hotspot_y);
 }
@@ -155,24 +158,21 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		cursor_shape_set_shape);
 	struct wlr_cursor_shape_manager_v1_request_set_shape_event *event = data;
-	// 合成器交互式移动/缩放期间接管光标: 抓取结束前忽略所有客户端光标请求
-	// (labwc 的 input_mode 门控)
-	if (server->input_mode != INPUT_MODE_PASSTHROUGH) {
-		return;
-	}
 	if (event->device_type !=
 			WLR_CURSOR_SHAPE_MANAGER_V1_DEVICE_TYPE_POINTER) {
 		return; // 本合成器不支持数位板
-	}
-	// 隐式抓取: 客户端按住指针按钮时 (如文本选择), 光标冻结在抓取开始的状态;
-	// 忽略拖动中途客户端的光标变更 (如 CSD 客户端靠近边缘时切换自己的 resize 光标)
-	if (server->seat->pointer_state.button_count > 0) {
-		return;
 	}
 	// 只接受当前聚焦客户端发的形状: 非聚焦客户端的请求直接丢弃,
 	// 避免把别的窗口的形状记成当前窗口的
 	if (event->seat_client != server->seat->pointer_state.focused_client) {
 		return;
+	}
+	// 合成器交互式移动/缩放或隐式抓取 (按钮按住) 期间, 可见光标由抓取方
+	// 决定: 记住最新形状并延后应用 (原因见 seat_request_set_cursor).
+	bool defer = server->input_mode != INPUT_MODE_PASSTHROUGH ||
+		server->seat->pointer_state.button_count > 0;
+	if (defer) {
+		server->client_cursor_pending = true;
 	}
 	// 自己画装饰但从不协商 xdg-decoration 的客户端 (Firefox、无 CSD 的 Chromium 等)
 	// 被视为无装饰窗口: 合成器接管其边框并负责 resize 边缘和光标.
@@ -226,6 +226,9 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 		}
 		return;
 	}
+	if (defer) {
+		return;
+	}
 	// 自己渲染形状: 图像来自合成器 xcursor 主题并按当前输出缩放,
 	// 所以光标大小总能匹配合成器自己的光标 - 客户端无需猜测
 	wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
@@ -251,7 +254,31 @@ void seat_request_start_drag(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		seat_request_start_drag);
 	struct wlr_seat_request_start_drag_event *event = data;
-	wlr_seat_start_drag(server->seat, event->drag, event->serial);
+
+	// wlr_seat_start_drag() 只装键盘抓取, 不装 pointer/touch 抓取.
+	// 那样按钮释放到不了 drag grab, 拖拽永不结束 —— 图标会一直粘在光标上.
+	// 与 wlroots 参考实现一致: 先用 serial 判断来源是 pointer 还是 touch,
+	// 再启动对应的抓取.
+	if (wlr_seat_validate_pointer_grab_serial(server->seat, event->origin,
+			event->serial)) {
+		wlr_seat_start_pointer_drag(server->seat, event->drag,
+			event->serial);
+		return;
+	}
+
+	struct wlr_touch_point *point = NULL;
+	if (wlr_seat_validate_touch_grab_serial(server->seat, event->origin,
+			event->serial, &point)) {
+		wlr_seat_start_touch_drag(server->seat, event->drag,
+			event->serial, point);
+		return;
+	}
+
+	// 两个 serial 都无效: 释放数据源, 让客户端收到 cancelled 并清理,
+	// 而不是永远等一个不会开始的拖拽.
+	if (event->drag->source != NULL) {
+		wlr_data_source_destroy(event->drag->source);
+	}
 }
 
 static void drag_tree_destroy(struct wl_listener *listener, void *data) {
@@ -262,9 +289,26 @@ static void drag_tree_destroy(struct wl_listener *listener, void *data) {
 	server->drag_tree = NULL;
 }
 
+// 拖拽结束 (drop / 取消都经 wlroots 的 drag_destroy): wlroots 先清掉 drag focus
+// 再发这个信号, 正是补发 wl_pointer.enter 的时机. 否则合成器的指针焦点会一直
+// 停在拖拽开始时的 NULL, 直到下一次 motion 才恢复, 期间 hover 与光标样式滞后.
+static void drag_destroy_notify(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server, drag_destroy);
+	(void)data;
+	listener_remove_if_attached(&server->drag_destroy);
+	refresh_pointer_focus(server);
+}
+
 void seat_start_drag(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server, seat_start_drag);
 	struct wlr_drag *drag = data;
+
+	// 监听拖拽对象本身的销毁, 拖拽结束时恢复指针焦点.
+	// 防御性: 上一个拖拽的监听器尚未摘除时先摘掉, 避免破坏链表.
+	listener_remove_if_attached(&server->drag_destroy);
+	server->drag_destroy.notify = drag_destroy_notify;
+	wl_signal_add(&drag->events.destroy, &server->drag_destroy);
+
 	if (drag->icon == NULL) {
 		return;
 	}
