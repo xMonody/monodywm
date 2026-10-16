@@ -455,9 +455,18 @@ struct toplevel *toplevel_by_id(struct server *server, int id) {
 	return NULL;
 }
 
+// 窗口现在能否安全接管焦点: 存活、已映射且未最小化
+static bool toplevel_focusable(struct toplevel *tl) {
+	return tl != NULL && tl->xdg_toplevel != NULL &&
+		tl->xdg_toplevel->base != NULL &&
+		tl->xdg_toplevel->base->surface->mapped && !tl->minimized;
+}
+
 // 聚焦的 toplevel `tl` 消失时, 应接收焦点的窗口:
-// 对话框把焦点交回其 xdg 父窗口 (它所属的主窗口), 否则优先启动它的窗口
-// (after_id, 优先同进程的兄弟窗口而非终端), 再退回创建顺序中的上一个可见窗口.
+// 对话框把焦点交回其 xdg 父窗口 (它所属的主窗口); 否则优先回到刚失去焦点的
+// 窗口 (从终端 B 启动 C 并聚焦 C 后, 最小化/关闭 B 应回到 C 而不是启动 B 的 A);
+// 再优先启动它的窗口 (after_id, 优先同进程的兄弟窗口而非终端),
+// 最后退回创建顺序中的上一个可见窗口.
 static struct toplevel *focus_fallback(struct server *server,
 		struct toplevel *tl) {
 	// 通过 xdg_toplevel.set_parent 声明父窗口的瞬态/对话框:
@@ -477,6 +486,12 @@ static struct toplevel *focus_fallback(struct server *server,
 			}
 		}
 	}
+	// 刚失去焦点的窗口: 关闭/最小化常由点标题栏/任务栏触发, 那会先聚焦
+	// 被点的窗口; 回到点击前的窗口才是用户预期, 而不是按创建顺序退回
+	if (server->last_focused != tl &&
+			toplevel_focusable(server->last_focused)) {
+		return server->last_focused;
+	}
 	if (tl->after_id > 0) {
 		struct toplevel *launcher = toplevel_by_id(server, tl->after_id);
 		if (launcher != NULL && launcher != tl &&
@@ -488,6 +503,8 @@ static struct toplevel *focus_fallback(struct server *server,
 	return neighbor_toplevel(server, tl, false, false);
 }
 
+static void toplevel_reparent_all(struct server *server);
+
 // 只移动逻辑焦点 (激活状态/边框/IPC), 不碰 seat 键盘和输入法焦点.
 // 当 layer-shell 覆盖层 (rofi/wofi) 持有键盘时窗口关闭/最小化, 覆盖层要保留
 // 键盘直到 unmaps (那时 layer_surface_keyboard_unfocus 再交给 server->focused),
@@ -495,6 +512,9 @@ static struct toplevel *focus_fallback(struct server *server,
 static void focus_toplevel_state_only(struct server *server,
 		struct toplevel *prev, struct toplevel *next) {
 	server->focused = next;
+	// 场景层由 server->focused 决定 (见 toplevel_layer): 逻辑焦点变了就得
+	// 重算, 否则覆盖层持有键盘期间消失的全屏窗口会让层状态永远对不上
+	toplevel_reparent_all(server);
 	if (next != NULL) {
 		wlr_xdg_toplevel_set_activated(next->xdg_toplevel, true);
 		if (next->fthandle != NULL) {
@@ -568,13 +588,11 @@ static bool apply_maximized_box(struct server *server, struct toplevel *tl) {
 	return true;
 }
 
-// toplevel 应处的场景层: 全屏窗口放进 LAYER_FULLSCREEN (盖住状态栏等面板);
-// 其对话框子窗口也必须跟到同一层, 否则独立对话框 (set_parent 的 xdg_toplevel,
-// 其 scene_tree 默认建在 LAYER_TOPLEVELS) 会被压在父窗口之下.
-// 沿 xdg parent 链上溯, 任一祖先全屏即算全屏层.
-static int toplevel_layer(struct toplevel *tl) {
+// 沿 xdg parent 链上溯, 找到 tl 所属的全屏根: tl 自身全屏, 或任一祖先全屏.
+// 都不满足则返回 NULL.
+static struct toplevel *toplevel_fullscreen_root(struct toplevel *tl) {
 	if (tl->fullscreen) {
-		return LAYER_FULLSCREEN;
+		return tl;
 	}
 	struct wlr_xdg_toplevel *parent =
 		tl->xdg_toplevel != NULL ? tl->xdg_toplevel->parent : NULL;
@@ -584,11 +602,46 @@ static int toplevel_layer(struct toplevel *tl) {
 			break;
 		}
 		if (p->fullscreen) {
-			return LAYER_FULLSCREEN;
+			return p;
 		}
 		parent = p->xdg_toplevel != NULL ? p->xdg_toplevel->parent : NULL;
 	}
-	return LAYER_TOPLEVELS;
+	return NULL;
+}
+
+// tl 是否位于 root 的对话框子树里 (tl == root 或 root 是其 xdg 祖先)
+static bool toplevel_in_subtree(struct toplevel *tl,
+		struct toplevel *root) {
+	while (tl != NULL) {
+		if (tl == root) {
+			return true;
+		}
+		struct wlr_xdg_toplevel *parent =
+			tl->xdg_toplevel != NULL ? tl->xdg_toplevel->parent : NULL;
+		tl = parent != NULL && parent->base != NULL
+			? parent->base->data : NULL;
+	}
+	return false;
+}
+
+// toplevel 应处的场景层: 全屏窗口放进 LAYER_FULLSCREEN (盖住状态栏等面板);
+// 其对话框子窗口也必须跟到同一层, 否则独立对话框 (set_parent 的 xdg_toplevel,
+// 其 scene_tree 默认建在 LAYER_TOPLEVELS) 会被压在父窗口之下.
+// 沿 xdg parent 链上溯, 任一祖先全屏即算全屏层.
+//
+// 但只有当前聚焦的窗口仍在全屏子树里时才留在全屏层: 切到别的窗口后全屏
+// 窗口必须降回普通窗口层, 否则它永远盖住新聚焦的窗口 (焦点切了却看不见,
+// 只有状态栏/外框变了个色). 切回全屏窗口时它再升回全屏层.
+static int toplevel_layer(struct server *server, struct toplevel *tl) {
+	struct toplevel *root = toplevel_fullscreen_root(tl);
+	if (root == NULL) {
+		return LAYER_TOPLEVELS;
+	}
+	if (server->focused == NULL ||
+			!toplevel_in_subtree(server->focused, root)) {
+		return LAYER_TOPLEVELS;
+	}
+	return LAYER_FULLSCREEN;
 }
 
 // 把 tl 的 scene_tree 挪到应有的层; 已在目标层则不动 (保留层内堆叠顺序)
@@ -596,14 +649,14 @@ static void toplevel_reparent_layer(struct server *server, struct toplevel *tl) 
 	if (tl->scene_tree == NULL) {
 		return;
 	}
-	int layer = toplevel_layer(tl);
+	int layer = toplevel_layer(server, tl);
 	if (tl->scene_tree->node.parent != server->layers[layer]) {
 		wlr_scene_node_reparent(&tl->scene_tree->node,
 			server->layers[layer]);
 	}
 }
 
-// tl 及其所有对话框子窗口同步换层 (进入/退出全屏时用)
+// tl 及其所有对话框子窗口同步换层 (进入/退出全屏、xdg 父链变化时用)
 static void toplevel_reparent_subtree(struct server *server,
 		struct toplevel *tl) {
 	toplevel_reparent_layer(server, tl);
@@ -613,6 +666,16 @@ static void toplevel_reparent_subtree(struct server *server,
 				child->xdg_toplevel->parent == tl->xdg_toplevel) {
 			toplevel_reparent_subtree(server, child);
 		}
+	}
+}
+
+// 焦点变化后重算所有 toplevel 的场景层: 全屏窗口/子树随焦点进出
+// LAYER_FULLSCREEN. 层内堆叠顺序不变 (只在层号变化时才 reparent);
+// 需要把新聚焦窗口摆到最前时, 调用方再 raise 它 (focus_toplevel 会做).
+static void toplevel_reparent_all(struct server *server) {
+	struct toplevel *tl;
+	wl_list_for_each(tl, &server->toplevels, link) {
+		toplevel_reparent_layer(server, tl);
 	}
 }
 
@@ -635,8 +698,9 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 		tl->has_fullscreen_restore_box = true;
 	}
 	tl->fullscreen = fullscreen;
-	// 全屏窗口移到 top 层之上 (遮盖状态栏等面板), 但仍低于 overlay 层,
-	// 所以启动器/覆盖菜单依旧显示在最前. 退出全屏时放回普通窗口层.
+	// 聚焦的全屏窗口移到 top 层之上 (遮盖状态栏等面板), 但仍低于 overlay 层,
+	// 所以启动器/覆盖菜单依旧显示在最前; 未聚焦的则由 toplevel_layer 降回
+	// 普通窗口层. 退出全屏时放回普通窗口层.
 	// 对话框子窗口一起换层: 它们跟随父窗口所在层, 否则全屏父窗口弹出的
 	// 独立对话框会被压在下面.
 	toplevel_reparent_subtree(server, tl);
@@ -791,7 +855,13 @@ void set_minimized(struct server *server, struct toplevel *tl,
 		// 把键盘/光标焦点交给上一个可见窗口. 窗口已被标记为最小化,
 		// 所以没有东西会再聚焦它;
 		// 还原它 (焦点循环、foreign-toplevel 激活) 会把它放回原位.
-		struct toplevel *prev = neighbor_toplevel(server, tl, false, false);
+		// 刚失去焦点的窗口优先 (点标题栏/任务栏聚焦后才最小化的场景:
+		// 应回到点击前的窗口, 而不是按创建顺序退回启动它的窗口).
+		// 它不可用 (已最小化/消失) 时退回上一个可见窗口.
+		struct toplevel *prev = server->last_focused;
+		if (prev == tl || !toplevel_focusable(prev)) {
+			prev = neighbor_toplevel(server, tl, false, false);
+		}
 		server->focused = NULL;
 		if (tl->xdg_toplevel->base != NULL) {
 			wlr_xdg_toplevel_set_activated(tl->xdg_toplevel, false);
@@ -852,6 +922,10 @@ void focus_toplevel(struct server *server, struct toplevel *tl) {
 		toplevel_raise(server, tl);
 		return;
 	}
+	if (prev != NULL && prev != tl) {
+		// 记住刚失去焦点的窗口: 新聚焦窗口最小化/关闭时优先交还给它
+		server->last_focused = prev;
+	}
 	if (prev != NULL && prev->xdg_toplevel->base != NULL) {
 		wlr_xdg_toplevel_set_activated(prev->xdg_toplevel, false);
 		if (prev->fthandle != NULL) {
@@ -873,6 +947,9 @@ void focus_toplevel(struct server *server, struct toplevel *tl) {
 	} else {
 		seat_keyboard_focus(server, tl->xdg_toplevel->base->surface);
 	}
+	// 先把不再聚焦的全屏窗口降回普通层, 再 raise 新聚焦窗口,
+	// 否则全屏层永远压在它上面, 新窗口看不见
+	toplevel_reparent_all(server);
 	toplevel_raise(server, tl);
 	// 告诉输入法现在哪个 surface 拥有文本输入
 	ime_set_focus(server, tl->xdg_toplevel->base->surface);
@@ -1113,6 +1190,10 @@ static void toplevel_client_cursor_gone(struct server *server,
 static void xdg_surface_destroy(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, destroy);
 	wl_list_remove(&tl->destroy.link);
+	// last_focused 可能指向本窗口: 必须在释放前清空, 否则成为悬空指针
+	if (tl->server->last_focused == tl) {
+		tl->server->last_focused = NULL;
+	}
 	// 窗口消失前通知状态栏
 	if (tl->ipc_added) {
 		ipc_send_window_event(tl->server, "window_removed", tl);
@@ -1295,7 +1376,9 @@ static void xdg_toplevel_set_parent(struct wl_listener *listener, void *data) {
 	wlr_log(WLR_DEBUG, "xdg_toplevel: set_parent app_id \"%s\" -> %s",
 		tl->app_id != NULL ? tl->app_id : "?",
 		toplevel_is_dialog(tl) ? "dialog" : "none");
-	toplevel_reparent_layer(tl->server, tl);
+	// 父链变化会改变 tl 及其所有后代的全屏归属 (父窗口被销毁时 wlroots 只
+	// 清空直接子窗口的 parent), 整棵子树都要重算, 不能只动 tl 自己
+	toplevel_reparent_subtree(tl->server, tl);
 	struct wlr_xdg_surface *base = tl->xdg_toplevel->base;
 	if (base == NULL || !base->surface->mapped) {
 		return; // 还没映射: map 处理器会用最新父窗口关系决定

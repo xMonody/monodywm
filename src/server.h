@@ -396,6 +396,7 @@ struct server {
 	struct wl_list toplevels;      // struct toplevel.link
 	struct wl_list layer_surfaces; // struct layer_surface.link
 	struct toplevel *focused;
+	struct toplevel *last_focused; // 刚失去焦点的窗口: 最小化/关闭时优先交还
 	struct layer_surface *layer_focused; // 当前持有 seat 键盘的 layer surface
 					       // (rofi 覆盖层等); toplevel 持有键盘时为 NULL
 
