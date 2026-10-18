@@ -361,6 +361,17 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	struct server *server = kb->server;
 	struct wlr_keyboard *keyboard = data;
 	wlr_seat_keyboard_notify_modifiers(server->seat, &keyboard->modifiers);
+	// 循环切换在绑定要求的修饰符全部松开时结束. 不能等到切换键松开:
+	// Alt+Tab 是按住 Alt、反复点 Tab, 每次 Tab 松开时循环还没有停.
+	// 只认发起循环的那块键盘, 否则另一块键盘的事件会误结束循环.
+	if (server->cycle_active && server->cycle_keyboard == keyboard) {
+		uint32_t mods = keyboard->modifiers.depressed |
+			keyboard->modifiers.latched;
+		if (server->cycle_mods != 0 &&
+				(mods & server->cycle_mods) != server->cycle_mods) {
+			cycle_end(server);
+		}
+	}
 }
 
 // 记录被合成器快捷键消费的按下键码; 其释放也必须吞掉
@@ -379,6 +390,16 @@ static void keyboard_consumed_add(struct keyboard *kb, uint32_t keycode) {
 	kb->consumed_keys[kb->consumed_key_count++] = keycode;
 }
 
+// 该键的按下是否已被合成器快捷键消费? (自动重复/后续释放都要继续吞掉)
+static bool keyboard_consumed_contains(struct keyboard *kb, uint32_t keycode) {
+	for (size_t i = 0; i < kb->consumed_key_count; i++) {
+		if (kb->consumed_keys[i] == keycode) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // 该释放是否属于之前被消费的按下? 是则移除并返回 true
 static bool keyboard_consumed_remove(struct keyboard *kb, uint32_t keycode) {
 	for (size_t i = 0; i < kb->consumed_key_count; i++) {
@@ -391,10 +412,13 @@ static bool keyboard_consumed_remove(struct keyboard *kb, uint32_t keycode) {
 	return false;
 }
 
-// 相对聚焦窗口的下一个/上一个已映射 toplevel, 会绕回链表.
-// 含最小化窗口 (调用方会还原它们); 跳过未映射的 toplevel.
+// 相对循环游标 (或当前聚焦窗口) 的下一个/上一个已映射 toplevel, 会绕回链表.
+// 含最小化窗口 (由调用方决定是否显示); 跳过未映射的 toplevel.
 static struct toplevel *cycle_toplevel(struct server *server, bool next) {
-	if (server->focused == NULL) {
+	struct toplevel *from =
+		server->cycle_active && server->cycle_current != NULL
+			? server->cycle_current : server->focused;
+	if (from == NULL) {
 		struct toplevel *tl;
 		wl_list_for_each(tl, &server->toplevels, link) {
 			if (tl->xdg_toplevel->base != NULL &&
@@ -404,7 +428,7 @@ static struct toplevel *cycle_toplevel(struct server *server, bool next) {
 		}
 		return NULL;
 	}
-	return neighbor_toplevel(server, server->focused, next, true);
+	return neighbor_toplevel(server, from, next, true);
 }
 
 // 按创建顺序的第 N 个已映射 toplevel (0 基); 没有则返回 NULL.
@@ -436,6 +460,51 @@ void focus_window(struct server *server, struct toplevel *tl) {
 	}
 	focus_toplevel(server, tl);
 	update_cursor_style(server);
+}
+
+// 下一个/上一个窗口: 每步都把新目标聚焦, 所以最小化目标会被还原,
+// 只有当它确实拥有焦点时才显示. 离开它时 (选到别的窗口) 它已经
+// 失去焦点, 重新最小化, 因此循环中始终只有“当前有焦点”的窗口是显示的.
+static void cycle_windows(struct server *server, bool next,
+		uint32_t mods, struct wlr_keyboard *keyboard) {
+	struct toplevel *target = cycle_toplevel(server, next);
+	if (target == NULL) {
+		// 没有可切换的目标 (例如只剩当前窗口): 别让循环状态挂着.
+		cycle_end(server);
+		return;
+	}
+	struct toplevel *prev_minimized = server->cycle_minimized;
+	bool target_minimized = target->minimized;
+
+	server->cycle_active = true;
+	// 记住这次绑定的修饰符: Alt+Tab 时 Alt 松开才算循环结束
+	server->cycle_mods = mods;
+	server->cycle_keyboard = keyboard;
+	server->cycle_current = target;
+
+	// 目标获得焦点; 若它是最小化窗口, focus_window 会在此还原它
+	focus_window(server, target);
+
+	// 上一个因循环而还原的窗口已经失去焦点: 重新最小化
+	if (prev_minimized != NULL && prev_minimized != target &&
+			!prev_minimized->minimized) {
+		set_minimized(server, prev_minimized, true);
+	}
+	// 只有当前有焦点的最小化窗口保持还原
+	server->cycle_minimized = target_minimized ? target : NULL;
+}
+
+// 循环结束 (修饰符松开或触发其它动作): 当前焦点窗口保持现状.
+// 中途离开的最小化窗口已经在 cycle_windows 里重新最小化了.
+void cycle_end(struct server *server) {
+	if (!server->cycle_active) {
+		return;
+	}
+	server->cycle_active = false;
+	server->cycle_mods = 0;
+	server->cycle_keyboard = NULL;
+	server->cycle_current = NULL;
+	server->cycle_minimized = NULL;
 }
 
 // 从 config_app_shortcuts 表启动应用
@@ -527,6 +596,15 @@ static bool keyboard_shortcut(struct server *server,
 			if ((mods & sc->mods) != sc->mods || sym != sc->key) {
 				continue;
 			}
+			// 循环切换中被别的动作打断: 先把循环收尾, 否则状态会一直挂着.
+			// TASK 除外: 它把焦点移到别的窗口, 交给 focus_toplevel() 的
+			// abandonment 路径把本次循环恢复的最小化窗口重新最小化.
+			if (server->cycle_active &&
+					sc->action != CONFIG_ACTION_NEXT_WINDOW &&
+					sc->action != CONFIG_ACTION_PREV_WINDOW &&
+					sc->action != CONFIG_ACTION_TASK) {
+				cycle_end(server);
+			}
 			switch (sc->action) {
 			case CONFIG_ACTION_QUIT:
 				wl_display_terminate(server->display);
@@ -547,10 +625,10 @@ static bool keyboard_shortcut(struct server *server,
 				}
 				return true;
 			case CONFIG_ACTION_NEXT_WINDOW:
-				focus_window(server, cycle_toplevel(server, true));
+				cycle_windows(server, true, sc->mods, keyboard);
 				return true;
 			case CONFIG_ACTION_PREV_WINDOW:
-				focus_window(server, cycle_toplevel(server, false));
+				cycle_windows(server, false, sc->mods, keyboard);
 				return true;
 			case CONFIG_ACTION_CLOSE:
 				if (server->focused != NULL) {
@@ -587,6 +665,10 @@ static bool keyboard_shortcut(struct server *server,
 				&config_app_shortcuts[i];
 			if ((mods & app->mods) == app->mods &&
 					sym == app->key) {
+				// 启动应用也算离开循环: 先把暂缓的最小化窗口收尾
+				if (server->cycle_active) {
+					cycle_end(server);
+				}
 				spawn_app(app);
 				return true;
 			}
@@ -623,14 +705,24 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	//  - 其他键盘正常到达聚焦客户端.
 	bool handled = false;
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		handled = keyboard_shortcut(server, kb->keyboard, keycode);
-		if (handled) {
+		if (keyboard_consumed_contains(kb, event->keycode)) {
+			// 自动重复的键: 它的初次按下已被合成器消费. 不再重新匹配
+			// 绑定 (修饰符可能已经变化, 否则会误触发另一条动作),
+			// 也绝不能作为孤立 press 发给客户端.
+			handled = true;
+		} else if (keyboard_shortcut(server, kb->keyboard, keycode)) {
+			handled = true;
 			keyboard_consumed_add(kb, event->keycode);
 		}
 	} else if (keyboard_consumed_remove(kb, event->keycode)) {
 		// 按下被合成器快捷键消费: 释放也必须吞掉, 不能作为孤立 release
 		// 发给客户端 (被消费的键不会到达 IM, 所以这里是 seat 客户端路径)
 		handled = true;
+		// 无修饰符的循环绑定没有 modifiers 事件可等, 用按键释放收尾
+		if (server->cycle_active && server->cycle_mods == 0 &&
+				server->cycle_keyboard == kb->keyboard) {
+			cycle_end(server);
+		}
 	}
 	if (ime_keyboard_grabbed(server, kb->keyboard)) {
 		if (!handled) {
@@ -648,6 +740,10 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	struct keyboard *kb = wl_container_of(listener, kb, destroy);
 	struct server *server = kb->server;
+	// 发起循环的键盘拔掉/销毁: 状态不能挂着 (不能等一个不会到来的松开事件)
+	if (server->cycle_keyboard == kb->keyboard) {
+		cycle_end(server);
+	}
 	ime_detach_keyboard(server, kb->keyboard);
 	// 摘掉所有监听器, 以便通过 wlr 销毁时的断言
 	wl_list_remove(&kb->key.link);

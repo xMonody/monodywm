@@ -113,14 +113,18 @@ struct config_action_shortcut {
 };
 
 static const struct config_action_shortcut config_action_shortcuts[] = {
-	{ CONFIG_ACTION_MAXIMIZE,    MODKEY1, XKB_KEY_Return },  // win+Enter 最大化还原
 	{ CONFIG_ACTION_MAXIMIZE,    MODKEY2, XKB_KEY_Return },  // shift+alt+Enter 最大化还原
+
 	{ CONFIG_ACTION_QUIT,        MODKEY3, XKB_KEY_q },       // shift+ctrl+q 退出合成器
-	{ CONFIG_ACTION_NEXT_WINDOW, MODKEY4, XKB_KEY_n },       // ctrl+alt+n 下一个窗口
-	{ CONFIG_ACTION_PREV_WINDOW, MODKEY4, XKB_KEY_p },       // ctrl+alt+p 上一个窗口
-	{ CONFIG_ACTION_CLOSE,       MODKEY4, XKB_KEY_c },       // ctrl+alt+c 关闭当前窗口
-	{ CONFIG_ACTION_MINIMIZE,    MODKEY2, XKB_KEY_m },       // shift+alt+m 最小化窗口
-	{ CONFIG_ACTION_CLOSE_OTHER, MODKEY3, XKB_KEY_q },       // ctrl+alt+q 关闭其他窗口
+
+	{ CONFIG_ACTION_NEXT_WINDOW, MODKEY1, XKB_KEY_n },       // win+n 下一个窗口
+	{ CONFIG_ACTION_NEXT_WINDOW, MODKEY0, XKB_KEY_Tab },       //alt+Tab 下一个窗口
+	{ CONFIG_ACTION_PREV_WINDOW, MODKEY1, XKB_KEY_p },       // win+p 上一个窗口
+
+	{ CONFIG_ACTION_CLOSE,       MODKEY1, XKB_KEY_w },       // win+w 关闭当前窗口
+	{ CONFIG_ACTION_MINIMIZE,    MODKEY1, XKB_KEY_s },       // win+m 最小化窗口
+	{ CONFIG_ACTION_MINIMIZE,    MODKEY1, XKB_KEY_m },       // win+m 最小化窗口
+	{ CONFIG_ACTION_CLOSE_OTHER, MODKEY1, XKB_KEY_q },       // win+q 关闭其他窗口
 
 	{ CONFIG_ACTION_TASK,        MODKEY1, XKB_KEY_1 },       // win+1..9 切换窗口
 	{ CONFIG_ACTION_TASK,        MODKEY1, XKB_KEY_2 },
@@ -143,14 +147,14 @@ struct config_app_shortcut {
 
 // MODKEY0(alt) MODKEY1(win) MODKEY2(shift+alt) MODKEY3(shift+ctrl) MODKEY4(ctrl+alt)
 static const struct config_app_shortcut config_app_shortcuts[] = {
-	{ MODKEY1, XKB_KEY_t, "foot",    NULL },
-	{ MODKEY1, XKB_KEY_f, "firefox", NULL },
-	{ MODKEY1, XKB_KEY_w, "wezterm", NULL },
-	{ MODKEY1, XKB_KEY_k, "kitty",   NULL },
-	{ MODKEY1, XKB_KEY_q, "qq",      NULL },
+	{ MODKEY4, XKB_KEY_t, "foot",    NULL },
+	{ MODKEY4, XKB_KEY_f, "firefox", NULL },
+	{ MODKEY4, XKB_KEY_w, "wezterm", NULL },
+	{ MODKEY4, XKB_KEY_k, "kitty",   NULL },
+	{ MODKEY4, XKB_KEY_q, "qq",      NULL },
 
-	{ MODKEY1, XKB_KEY_s, "fuzzel ", NULL },
-	{ MODKEY1, XKB_KEY_p, "fuzzel ", NULL },
+	{ MODKEY1, XKB_KEY_Return, "fuzzel", NULL },
+	// { MODKEY4, XKB_KEY_p, "fuzzel", NULL },
 };
 
 // 强制「无装饰」窗口 (合成器接管边框): 这些客户端自己画 CSD, 但它们的

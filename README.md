@@ -327,20 +327,20 @@ All key bindings (modifier combos and keysyms) are defined in
 
 | keys            | action                     |
 |---|---|
-| `Win+Enter`, `Shift+Alt+Enter` | toggle maximize / restore the focused window |
-| `Shift+Alt+M`    | minimize the focused window |
-| `Ctrl+Alt+N`     | focus the next window (minimized windows are restored) |
-| `Ctrl+Alt+P`     | focus the previous window (minimized windows are restored) |
-| `Ctrl+Alt+C`     | close the focused window      |
-| `Ctrl+Alt+Q`     | close every other window      |
+| `Shift+Alt+Enter` | toggle maximize / restore the focused window |
+| `Win+S`, `Win+M` | minimize the focused window |
+| `Win+N`, `Alt+Tab` | focus the next window (a minimized target is focused and restored) |
+| `Win+P`          | focus the previous window (a minimized target is focused and restored) |
+| `Win+W`          | close the focused window      |
+| `Win+Q`          | close every other window      |
 | `Shift+Ctrl+Q`   | quit the compositor        |
 | `Win+1` … `Win+9`| switch to the N-th window     |
-| `Win+T`          | open a `foot` terminal        |
-| `Win+K`          | open `kitty`                  |
-| `Win+W`          | open `wezterm`                |
-| `Win+F`          | open `firefox`                |
-| `Win+Q`          | open `qq`                     |
-| `Win+S`, `Win+P` | open `rofi -show drun`        |
+| `Ctrl+Alt+T`     | open a `foot` terminal        |
+| `Ctrl+Alt+K`     | open `kitty`                  |
+| `Ctrl+Alt+W`     | open `wezterm`                |
+| `Ctrl+Alt+F`     | open `firefox`                |
+| `Ctrl+Alt+Q`     | open `qq`                     |
+| `Win+Enter`      | open `fuzzel`                 |
 
 Notes:
 
@@ -348,6 +348,10 @@ Notes:
   again restores the previous size and position.
 * Minimizing only hides the window, so it reappears at its original position
   when restored (via the focus cycle or a foreign-toplevel activate).
+* While a next/previous-window cycle is active (e.g. tapping Tab with Alt
+  down), the selected window gets focus. A minimized window selected by the
+  cycle is restored; as soon as the cycle moves on it loses focus and is
+  minimized again, so only the window that actually has focus stays restored.
 * Closing or minimizing the focused window hands keyboard/cursor focus to the
   previous visible window (or clears it when no other window is shown).
 

@@ -847,6 +847,11 @@ void set_minimized(struct server *server, struct toplevel *tl,
 	if (tl->minimized == minimized) {
 		return;
 	}
+	// 循环中选中而还原的最小化窗口被外部还原/最小化 (任务栏/foreign-toplevel):
+	// 不再由循环接管它的显隐
+	if (!minimized && server->cycle_minimized == tl) {
+		server->cycle_minimized = NULL;
+	}
 	tl->minimized = minimized;
 	if (tl->fthandle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_minimized(tl->fthandle, minimized);
@@ -916,9 +921,21 @@ void focus_toplevel(struct server *server, struct toplevel *tl) {
 			!tl->xdg_toplevel->base->surface->mapped) {
 		return;
 	}
+	// 焦点被鼠标/IPC/激活请求移到别处: 放弃正在进行的 next/prev 循环.
+	// 因循环选中而还原、现在失去焦点的最小化窗口要重新最小化
+	// (下面切换完焦点后再做, 避免 set_minimized 里的焦点交接重入).
+	struct toplevel *cycle_abandoned = NULL;
+	if (server->cycle_active && server->cycle_current != tl) {
+		cycle_abandoned = server->cycle_minimized;
+		cycle_end(server);
+	}
 	bool layer_held = server->layer_focused != NULL;
 	struct toplevel *prev = server->focused;
 	if (prev == tl && !layer_held) {
+		if (cycle_abandoned != NULL && cycle_abandoned != tl &&
+				!cycle_abandoned->minimized) {
+			set_minimized(server, cycle_abandoned, true);
+		}
 		toplevel_raise(server, tl);
 		return;
 	}
@@ -955,6 +972,12 @@ void focus_toplevel(struct server *server, struct toplevel *tl) {
 	ime_set_focus(server, tl->xdg_toplevel->base->surface);
 	// 通知状态栏焦点变化 (对话框归到其主窗口)
 	ipc_send_focus(server, tl);
+	// 循环中还原过、现在已失去焦点的最小化窗口: 重新最小化,
+	// 保证只有拥有焦点的窗口是还原状态
+	if (cycle_abandoned != NULL && cycle_abandoned != tl &&
+			!cycle_abandoned->minimized) {
+		set_minimized(server, cycle_abandoned, true);
+	}
 }
 
 // xdg-activation-v1 request_activate: surface 的客户端用有效激活 token 请求焦点.
@@ -1110,10 +1133,17 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, unmap);
+	struct server *server = tl->server;
+	// 循环正停在本窗口上: 先结束循环. 否则 toplevel_unfocus() 把焦点
+	// 交给别的窗口时会走 focus_toplevel() 的 abandonment 路径, 把正在
+	// unmap 的窗口重新标记为最小化; 它之后 remap 就会一直隐藏.
+	if (server->cycle_current == tl || server->cycle_minimized == tl) {
+		cycle_end(server);
+	}
 	// 内容子树会被 wlroots 禁用, 但边框/阴影/模糊不会: 显式隐藏, 避免残留
 	decor_hide(tl);
-	toplevel_unfocus(tl->server, tl);
-	refresh_pointer_focus(tl->server);
+	toplevel_unfocus(server, tl);
+	refresh_pointer_focus(server);
 }
 
 static void toplevel_client_cursor_gone(struct server *server,
@@ -1123,6 +1153,11 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	struct toplevel *tl = wl_container_of(listener, tl, toplevel_destroy);
 	struct server *server = tl->server;
 
+	// 循环正持有本窗口: 先结束循环, 避免下面 toplevel_unfocus() 的
+	// 焦点交接把正在销毁的窗口重新 set_minimized().
+	if (server->cycle_current == tl || server->cycle_minimized == tl) {
+		cycle_end(server);
+	}
 	toplevel_unfocus(server, tl);
 	// 窗口正在消失: 若其客户端拥有当前光标 (文本框上的 I-beam 等), 回到默认箭头.
 	// 必须在这里做, 此时 xdg_toplevel 仍存活 - wlroots 在此信号后立即释放它,
@@ -1193,6 +1228,11 @@ static void xdg_surface_destroy(struct wl_listener *listener, void *data) {
 	// last_focused 可能指向本窗口: 必须在释放前清空, 否则成为悬空指针
 	if (tl->server->last_focused == tl) {
 		tl->server->last_focused = NULL;
+	}
+	// 循环切换也可能正停在本窗口上 (最小化窗口被关闭)
+	if (tl->server->cycle_current == tl ||
+			tl->server->cycle_minimized == tl) {
+		cycle_end(tl->server);
 	}
 	// 窗口消失前通知状态栏
 	if (tl->ipc_added) {

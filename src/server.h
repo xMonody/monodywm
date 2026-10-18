@@ -397,6 +397,13 @@ struct server {
 	struct wl_list layer_surfaces; // struct layer_surface.link
 	struct toplevel *focused;
 	struct toplevel *last_focused; // 刚失去焦点的窗口: 最小化/关闭时优先交还
+	// next/prev 循环切换状态: 选中的窗口获得焦点, 最小化窗口在被选中时
+	// 还原; 选到别的窗口后, 它失去焦点, 重新最小化.
+	struct toplevel *cycle_current; // 循环游标/当前选中窗口
+	struct toplevel *cycle_minimized; // 因本次循环选中而还原的最小化窗口
+	bool cycle_active;              // 循环是否进行中
+	uint32_t cycle_mods;            // 本次循环绑定要求的修饰符; 松开它们才结束
+	struct wlr_keyboard *cycle_keyboard; // 发起循环的键盘 (多键盘时只认它)
 	struct layer_surface *layer_focused; // 当前持有 seat 键盘的 layer surface
 					       // (rofi 覆盖层等); toplevel 持有键盘时为 NULL
 
@@ -639,6 +646,9 @@ void server_new_virtual_keyboard(struct wl_listener *listener, void *data);
 bool keyboard_is_typing(struct wlr_input_device *device);
 // 把 seat 键盘移到某个 surface (NULL 清空焦点)
 void seat_keyboard_focus(struct server *server, struct wlr_surface *surface);
+// 结束 next/prev 循环切换状态; 当前焦点窗口保持现状.
+// 修饰符松开、切换被其它动作打断、目标窗口消失时调用.
+void cycle_end(struct server *server);
 
 // ---- ime.c: 输入法中继 (fcitx5 / ibus) ----
 void ime_set_focus(struct server *server, struct wlr_surface *surface);
