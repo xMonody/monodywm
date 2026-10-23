@@ -99,7 +99,17 @@ bool pointer_over_layer_surface(struct server *server) {
 		if (n->data != NULL) {
 			struct scene_tag *tag = n->data;
 			if (tag->type == TAG_LAYER) {
-				return true;
+				struct layer_surface *ls = tag->ptr;
+				if (ls == NULL || ls->layer_surface == NULL) {
+					return false;
+				}
+				// background/bottom 层在窗口之下 (壁纸、桌面图标).
+				// 它们不能阻止窗口外半侧的 resize 手柄/标题条; 只有
+				// 真正盖在窗口之上的 top/overlay 才赢得指针.
+				enum zwlr_layer_shell_v1_layer layer =
+					ls->layer_surface->current.layer;
+				return layer == ZWLR_LAYER_SHELL_V1_LAYER_TOP ||
+					layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
 			}
 		}
 		n = n->parent != NULL ? &n->parent->node : NULL;

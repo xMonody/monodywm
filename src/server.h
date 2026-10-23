@@ -19,7 +19,6 @@
 #include <wayland-server-protocol.h>
 
 #include <wlr/types/wlr_cursor.h>
-#include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
@@ -75,6 +74,24 @@ struct wlr_swapchain;  // 定义在 wlr/render/swapchain.h
 struct server;
 struct toplevel;
 struct layer_surface;
+struct ime;
+
+// IM 抓取期间连接的一块键盘. 一个输入法只能给键盘抓取设置一个
+// wlr_keyboard (用于 keymap/repeat), 但所有真实键盘的按键都应转发给
+// 输入法, 所以每块键盘单独保留一个 modifiers 监听器.
+struct ime_keyboard {
+	struct ime *ime;
+	struct wlr_keyboard *keyboard;
+	struct wl_list link; // ime.keyboards
+	struct wl_listener modifiers;
+};
+
+// 已转发给 IM 抓取的按下键; 同一 keycode 可能同时来自多块键盘,
+// 释放时必须按 (keyboard, keycode) 配对, 不能只按 keycode.
+struct ime_forwarded_key {
+	struct wlr_keyboard *keyboard;
+	uint32_t keycode;
+};
 
 // 一个已连接的输入法 (fcitx5/ibus); 只使用第一个
 struct ime {
@@ -88,21 +105,21 @@ struct ime {
 	struct wl_listener keyboard_grab_destroy;
 	struct wl_listener new_popup_surface;
 
-	// IM 持有键盘抓取期间的 seat 键盘. 按键由 input.c 通过 ime_forward_key() 转发,
-	// 以便先检查合成器快捷键; 只有修饰符通过监听器同步.
+	// IM 抓取连接的键盘. keyboard 是给抓取提供 keymap/repeat 信息的主键盘
+	// (始终是 keyboards 中的一块), last_keyboard 是最后转发按键的键盘:
+	// 在另一块键盘的按键到来前需要先补发它的 modifiers.
+	struct wl_list keyboards; // struct ime_keyboard.link
 	struct wlr_keyboard *keyboard;
-	struct wl_listener keyboard_grab_modifiers;
+	struct wlr_keyboard *last_keyboard;
 	bool keyboard_grab_destroy_added; // 抓取 destroy 监听器已挂接
 
-	// 已转发给 IM 抓取的按下键码; 用于抑制没有匹配按下的杂散释放事件
-	uint32_t forwarded_keys[16];
+	// 已转发给 IM 抓取的按下键; 用于抑制没有匹配按下的杂散释放事件
+	struct ime_forwarded_key forwarded_keys[16];
 	size_t forwarded_key_count;
 
-	// IM (fcitx5) 显示的候选窗
-	struct wlr_input_popup_surface_v2 *popup_surface;
-	struct wlr_scene_surface *popup_scene_surface;
-	struct wl_listener popup_commit;
-	struct wl_listener popup_destroy;
+	// IM (fcitx5) 显示的候选窗. 协议允许同时存在多个 popup surface,
+	// 所以每个都单独跟踪 (struct ime_popup, 定义在 ime.c).
+	struct wl_list popups; // struct ime_popup.link
 };
 
 // 客户端的一个 zwp_text_input_v3 对象 (通常每客户端一个)
@@ -190,8 +207,9 @@ struct toplevel {
 	bool minimized;
 	bool positioned; // 初始位置已分配
 
-	// 已发目标尺寸 configure 但客户端 buffer 还没到位: 节点停在原位,
-	// 等提交到目标尺寸再落框 (否则旧 buffer 会先闪到作区/输出左上角)
+	// 已请求目标尺寸的 configure, 节点停在原位, 等客户端 ack 并应用它
+	// (toplevel_size_acked) 后再落框, 否则旧 buffer 会先闪到作区/输出左上角.
+	// 纯 ack 门控: 与客户端最终提交的 buffer/geometry 尺寸无关.
 	bool pending_frame;
 	struct wlr_box pending_frame_box;
 
@@ -212,6 +230,9 @@ struct toplevel {
 	// 拖动取消最大化时要还原的几何 (Windows 风格)
 	struct wlr_box restore_box;
 	bool has_restore_box;
+	// 已向客户端请求最大化、但客户端还没 ack: 防止 ack 前重复捕获
+	// restore_box (节点可能已被 apply_maximized_box 移到最大化位置)
+	bool maximize_pending;
 
 	// 离开全屏时还原的几何; 与 restore_box 分开, 这样从最大化进入全屏
 	// 不会覆盖最大化保存的浮动几何
@@ -264,6 +285,9 @@ struct layer_surface {
 	struct wlr_scene_blur *blur;
 
 	struct wl_list link; // server.layer_surfaces
+	// 交互 layer surface 的键盘焦点栈 (server.layer_focus_stack).
+	// 后进入的覆盖层在上, 消失后键盘还给前一个交互层.
+	struct wl_list focus_link;
 
 	// 上次提交的布局签名 (独占区 + 客户端期望尺寸): 它变化时 (状态栏出现、
 	// 改尺寸或消失) 作区变化, 已有窗口必须重新排布, 并且需要给客户端发新的
@@ -314,6 +338,9 @@ struct bound_buttons {
 	int size;
 };
 
+// IPC Unix 域套接字路径长度 (<sys/un.h> 的 sun_path 为 108 字节)
+#define IPC_PATH_MAX 108
+
 struct server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
@@ -356,12 +383,6 @@ struct server {
 	struct wlr_cursor_shape_manager_v1 *cursor_shape_manager;
 	struct wl_listener cursor_shape_set_shape;
 
-	// color-management-v1: 客户端声明/查询输出的颜色管理, 仅支持参数化
-	// 图像描述 (命名传输函数 + 命名 primaries), 不支持 ICC. 只有渲染器支持
-	// 输入色彩变换时创建, 并关联到 scene 以便按 surface 的图像描述渲染.
-	// wlroots 自行随 display 销毁, 无需显式清理.
-	struct wlr_color_manager_v1 *color_manager;
-
 	// ext-data-control-v1: 面向 wl-clipboard (wl-copy/wl-paste) 和剪贴板管理器
 	// 的剪贴板/选择区特权控制, vim 这类终端编辑器就是这样访问 Wayland 剪贴板的.
 	struct wlr_ext_data_control_manager_v1 *ext_data_control_manager;
@@ -395,6 +416,8 @@ struct server {
 
 	struct wl_list toplevels;      // struct toplevel.link
 	struct wl_list layer_surfaces; // struct layer_surface.link
+	// 交互 layer surface 的键盘焦点栈 (栈顶为当前持有键盘的覆盖层)
+	struct wl_list layer_focus_stack;
 	struct toplevel *focused;
 	struct toplevel *last_focused; // 刚失去焦点的窗口: 最小化/关闭时优先交还
 	// next/prev 循环切换状态: 选中的窗口获得焦点, 最小化窗口在被选中时
@@ -419,7 +442,15 @@ struct server {
 	int ipc_fd;
 	struct wl_event_source *ipc_source;
 	struct wl_list ipc_clients; // ipc_client.link
+	// 套接字文件路径: 退出时必须 unlink, 否则留下无人监听的 socket 文件
+	char ipc_path[IPC_PATH_MAX];
 	uint32_t next_window_id;
+
+	// SIGINT/SIGTERM/SIGHUP: 经事件循环转成 wl_display_terminate,
+	// 让这些终止信号也走 main() 里的完整拆除路径 (见 main.c)
+	struct wl_event_source *sigint_source;
+	struct wl_event_source *sigterm_source;
+	struct wl_event_source *sighup_source;
 
 	struct wlr_scene_tree *drag_tree;
 	// 拖拽图标的场景树被 wlroots 在其图标销毁时一并销毁; 监听它以便
@@ -448,6 +479,13 @@ struct server {
 	enum input_mode input_mode;      // PASSTHROUGH / MOVE / RESIZE
 	struct bound_buttons bound_buttons; // 被合成器吞掉的按压
 	double grab_x, grab_y; // 光标相对窗口原点的偏移
+	// 隐式抓取 (按钮按住) 期间被抓 surface 的布局原点. 抓取可能发生在
+	// popup / subsurface / layer surface 上, 这些 surface 不能通过
+	// toplevel_surface_origin() 换算, 所以在首次按下时直接记录
+	// (光标布局坐标 - surface 局部坐标).
+	struct wlr_surface *implicit_grab_surface;
+	bool implicit_grab_origin_valid;
+	double implicit_grab_origin_x, implicit_grab_origin_y;
 	// 移动开始时的光标位置: 最大化窗口在拖动中途被还原后用它重新锚定抓取
 	// (客户端自己的标题栏在普通点击时也会发 xdg_toplevel.move,
 	// 所以延迟到用户真正拖动时才还原)
@@ -542,8 +580,9 @@ struct toplevel *toplevel_at(struct server *server);
 // 光标位于 popup surface (菜单/下拉框/工具提示) 上: popup 在合成器边框
 // (resize 边缘、标题栏) 之前赢得指针
 bool pointer_over_popup(struct server *server);
-// 光标位于 layer-shell surface (状态栏/菜单覆盖层) 上: 与 popup 一样赢得指针 -
-// 光标在其上时不启动窗口移动/缩放抓取, 点击到达 layer surface
+// 光标位于盖在窗口之上的 layer-shell surface (top/overlay: 状态栏/菜单覆盖层)
+// 上: 与 popup 一样赢得指针 - 光标在其上时不启动窗口移动/缩放抓取, 点击到达
+// layer surface. background/bottom 层 (壁纸/桌面) 不算, 否则会挡住窗口边缘手柄.
 bool pointer_over_layer_surface(struct server *server);
 // 对话框/瞬态窗口 (通过 xdg_toplevel.set_parent 声明父 toplevel, GTK/Qt 对话框会这样):
 // 不可缩放、不可最大化/最小化, 其顶部边框是一个关闭按钮
@@ -554,6 +593,10 @@ bool toplevel_is_fixed_size(struct toplevel *tl);
 struct toplevel *toplevel_ipc_owner(struct toplevel *tl);
 
 // ---- toplevel.c: xdg-shell 窗口、窗口状态、装饰 ----
+// 窗口当前能否成为焦点: 已映射、未最小化、且角色对象仍存活.
+// 角色对象 (wlr_xdg_toplevel) 可能比 tl 先销毁, 所以外部引用 toplevel 时
+// (last_focused / server->focused / layer 键盘回退) 先用它过滤.
+bool toplevel_focusable(const struct toplevel *tl);
 void toplevel_box(struct toplevel *tl, struct wlr_box *box);
 void toplevel_frame_box(struct server *server, struct toplevel *tl,
 	struct wlr_box *box);

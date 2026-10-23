@@ -127,7 +127,6 @@ and **scenefx 0.5**.
 | `wp_cursor_shape_manager_v1` | clients pick a cursor shape; the compositor renders it from its own xcursor theme at the output's (fractional) scale, so the size always matches — no client-side guessing |
 | `xdg_activation_v1` | client-driven window activation/focus; activation requests focus (and restore) the matching toplevel |
 | `wp_fractional_scale_v1` | surfaces are told the output's exact fractional scale |
-| `wp_color_manager_v1` (v2) | client-declared **parametric** image descriptions (named transfer function + named primaries); only advertised when the renderer supports input color transforms (currently only the Vulkan renderer, so run with `WLR_RENDERER=vulkan`), and the manager is attached to the scene so surfaces render with their description — otherwise clients fall back to sRGB. ICC v2/v4 and mastering-display metadata are not supported |
 | `wp_single_pixel_buffer_manager_v1` | clients fill a surface with one solid color (backgrounds/overlays) without allocating a 1×1 `wl_shm`/dmabuf buffer |
 | `ext_data_control_manager_v1` | privileged selection/clipboard control used by `wl-clipboard` (`wl-copy`/`wl-paste`) and clipboard managers, which is how terminal editors such as `vim` reach the Wayland clipboard |
 | `zwlr_data_control_manager_v1` | legacy wlroots clipboard-control protocol; still the only one bound by CopyQ and older clipboard tools, advertised alongside the `ext-` variant |
@@ -296,15 +295,15 @@ options:
 | `CONFIG_TITLEBAR_CURSOR` | cursor shown while hovering the title strip | `pointer` |
 | `CONFIG_MOVE_CURSOR` | cursor shown while moving a window | `all-scroll` |
 | `CONFIG_ROUNDED_RADIUS` | window corner radius (px) | `8` |
-| `CONFIG_BORDER_WIDTH` | border ring width (px) | `2.0` |
+| `CONFIG_BORDER_WIDTH` | border ring width (px) | `1.0` |
 | `CONFIG_BORDER_FOCUSED` / `CONFIG_BORDER_UNFOCUSED` | focused / unfocused border color (`0xRRGGBB`) | `0x7c73b0` |
 | `CONFIG_BORDER_UNFOCUSED_DRAW` | draw a border on unfocused windows too (0/1) | `1` |
 | `CONFIG_BORDER_TOP_LEFT` / `_MID` / `_RIGHT` | top-strip third colors (minimize / maximize / close) | see `config.h` |
-| `CONFIG_BORDER_GRADIENT_WIDTH` / `CONFIG_BORDER_GRADIENT_STEPS` | width (px) and approximation steps of the color gradient between the three top segments | `15` / `8` |
-| `CONFIG_FULLSCREEN_BORDER*` | draw/color/radius of the border on fullscreen windows (radius only applies when the border is drawn; otherwise corners stay square) | off / `0xb87898` / `8` |
+| `CONFIG_BORDER_GRADIENT_WIDTH` / `CONFIG_BORDER_GRADIENT_STEPS` | width (px) and approximation steps of the color gradient between the three top segments | `15` / `4` |
+| `CONFIG_FULLSCREEN_BORDER*` | draw/color/radius of the border on fullscreen windows (radius only applies when the border is drawn; otherwise corners stay square) | off / `0x9f6686` / `8` |
 | `CONFIG_BLUR` / `CONFIG_BLUR_LAYER` | background blur for windows / for non-overlay, non-background layer surfaces | `1` / `1` |
-| `CONFIG_BLUR_RADIUS` / `CONFIG_BLUR_PASSES` | blur sample radius / downsample passes | `5` / `2` |
-| `CONFIG_BLUR_OPTIMIZE_FULLSCREEN` | fullscreen/maximized blur source: `1` = cached background/bottom layers only (cheap); `0` = real-time blur of everything behind, including other windows | `1` |
+| `CONFIG_BLUR_RADIUS` / `CONFIG_BLUR_PASSES` | blur sample radius / downsample passes | `5` / `3` |
+| `CONFIG_BLUR_OPTIMIZE_FULLSCREEN` | fullscreen/maximized blur source: `1` = cached background/bottom layers only (cheap); `0` = real-time blur of everything behind, including other windows | `0` |
 | `CONFIG_SHADOW_BLUR_SIGMA` / `_COLOR` / `_ALPHA` | drop-shadow softness / color / opacity | `15.0` / `0x000000` / `0.5` |
 | `CONFIG_TITLEBAR_HEIGHT` | title strip grab zone at the window top (px) | `6` |
 | `CONFIG_EDGE_THICKNESS` | grab zone on window edges/corners for move+resize (px) | `6` |

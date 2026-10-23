@@ -42,7 +42,6 @@
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
-#include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
@@ -88,6 +87,18 @@ void spawn_command(const char *cmd) {
 	if (setsid() == -1) {
 		_exit(127);
 	}
+
+	// 合成器忽略了 SIGPIPE (避免状态栏断开时杀死自己), 但被忽略的信号
+	// 会跨 exec 继承. 启动的应用必须恢复默认行为, 否则 shell 管道/CLI
+	// 在写已关闭管道时不会按预期退出.
+	signal(SIGPIPE, SIG_DFL);
+
+	// 合成器用 signalfd (wl_event_loop_add_signal) 处理 SIGINT/SIGTERM/SIGHUP,
+	// 那会把这些信号加入本进程的信号屏蔽字; 屏蔽字跨 fork+exec 继承. 不重置的话
+	// 启动的应用会收不到 Ctrl+C / SIGTERM. 子进程必须按默认 (空) 屏蔽字运行.
+	sigset_t empty_mask;
+	sigemptyset(&empty_mask);
+	sigprocmask(SIG_SETMASK, &empty_mask, NULL);
 
 	// 不要把孩子留在合成器的工作目录: 合成器运行期间其 CWD 可能被删除
 	// (例如构建目录被删掉重建), 某些应用 - 尤其是会启动 shell 的 foot -
@@ -154,6 +165,17 @@ static void init_reaper(void) {
 	// 绝不能因为向已断开的 IPC 客户端 (退出的状态栏) 写入而死掉:
 	// IPC 层会清理该客户端并上报失败, 而不是让 SIGPIPE 杀死整个合成器
 	signal(SIGPIPE, SIG_IGN);
+}
+
+// SIGINT/SIGTERM/SIGHUP: 经事件循环 (signalfd) 转成 wl_display_terminate,
+// 让 wl_display_run() 返回并走 main() 末尾的完整拆除路径. 否则这些信号按
+// 默认动作直接杀死进程, 跳过 destroy_clients/destroy_display, 留下
+// wayland/IPC 套接字和未释放的协议对象.
+static int quit_signal(int sig, void *data) {
+	struct wl_display *display = data;
+	wlr_log(WLR_INFO, "signal %d received, terminating", sig);
+	wl_display_terminate(display);
+	return 0;
 }
 
 static void run_startup_file(void) {
@@ -289,9 +311,6 @@ static void init_logging(void) {
 	wlr_log_init(debug ? WLR_DEBUG : WLR_INFO, log_callback);
 }
 
-// wp_color_manager_v1 协议版本 (wlroots 内部上限为 2, 未导出对应宏)
-#define COLOR_MANAGEMENT_V1_VERSION 2
-
 int main(int argc, char *argv[]) {
 	// 正常输出只到 stderr; WLR_DEBUG=1 时额外写 $XDG_RUNTIME_DIR/monodywm.log,
 	// 显式 MONODYWM_LOG=<path> 则只写该文件
@@ -317,6 +336,21 @@ int main(int argc, char *argv[]) {
 	server.display = wl_display_create();
 	if (server.display == NULL) {
 		return EXIT_FAILURE;
+	}
+	// 终止信号也走优雅退出: 注册到事件循环而不是用 sigaction. 信号会被
+	// 加入本进程的屏蔽字 (spawn_command() 会在 exec 前给子进程清空).
+	struct wl_event_loop *event_loop =
+		wl_display_get_event_loop(server.display);
+	server.sigint_source = wl_event_loop_add_signal(event_loop, SIGINT,
+		quit_signal, server.display);
+	server.sigterm_source = wl_event_loop_add_signal(event_loop, SIGTERM,
+		quit_signal, server.display);
+	server.sighup_source = wl_event_loop_add_signal(event_loop, SIGHUP,
+		quit_signal, server.display);
+	if (server.sigint_source == NULL || server.sigterm_source == NULL ||
+			server.sighup_source == NULL) {
+		wlr_log(WLR_ERROR,
+			"failed to install SIGINT/SIGTERM/SIGHUP handlers");
 	}
 	server.backend = wlr_backend_autocreate(
 		wl_display_get_event_loop(server.display), NULL);
@@ -390,6 +424,7 @@ int main(int argc, char *argv[]) {
 	}
 	wl_list_init(&server.toplevels);
 	wl_list_init(&server.layer_surfaces);
+	wl_list_init(&server.layer_focus_stack);
 	wl_list_init(&server.monitors);
 	wl_list_init(&server.imes);
 	wl_list_init(&server.text_inputs);
@@ -504,63 +539,6 @@ int main(int argc, char *argv[]) {
 		wlr_fractional_scale_manager_v1_create(server.display, 1);
 	if (server.fractional_scale_manager == NULL) {
 		wlr_log(WLR_ERROR, "failed to create fractional-scale-v1 global");
-	}
-
-	// wp_color_manager_v1: 客户端声明/查询输出的颜色管理. 只支持参数化
-	// 图像描述 (命名传输函数 + 命名 primaries), 不支持 ICC。只有渲染器
-	// 支持输入色彩变换时创建; 创建后关联到 scene, 场景才会按 surface 的
-	// 图像描述渲染。渲染器不支持时直接不注册 global, 客户端会退回 sRGB。
-	if (server.renderer->features.input_color_transform) {
-		const enum wp_color_manager_v1_render_intent render_intents[] = {
-			WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL,
-		};
-		size_t transfer_functions_len = 0;
-		enum wp_color_manager_v1_transfer_function *transfer_functions =
-			wlr_color_manager_v1_transfer_function_list_from_renderer(
-				server.renderer, &transfer_functions_len);
-		size_t primaries_len = 0;
-		enum wp_color_manager_v1_primaries *primaries =
-			wlr_color_manager_v1_primaries_list_from_renderer(
-				server.renderer, &primaries_len);
-
-		if (transfer_functions == NULL || primaries == NULL) {
-			// 渲染器声明支持输入色彩变换, 却给不出任何描述, 多半是 OOM;
-			// 此时注册一个不带 TF/primaries 的空 manager 只会误导客户端
-			wlr_log(WLR_ERROR, "failed to query renderer color "
-				"descriptions, disabling color-management-v1");
-		} else {
-			server.color_manager = wlr_color_manager_v1_create(
-				server.display, COLOR_MANAGEMENT_V1_VERSION,
-				&(struct wlr_color_manager_v1_options){
-					.features = {
-						.parametric = true,
-						// wlroots 尚未在 get_information 回传 mastering
-						// primaries/luminance, 补全前不对外声明该 feature
-						.set_mastering_display_primaries = false,
-					},
-					.render_intents = render_intents,
-					.render_intents_len = sizeof(render_intents) /
-						sizeof(render_intents[0]),
-					.transfer_functions = transfer_functions,
-					.transfer_functions_len = transfer_functions_len,
-					.primaries = primaries,
-					.primaries_len = primaries_len,
-				});
-
-			if (server.color_manager == NULL) {
-				wlr_log(WLR_ERROR,
-					"failed to create color-management-v1 global");
-			} else {
-				wlr_scene_set_color_manager_v1(server.scene,
-					server.color_manager);
-			}
-		}
-
-		free(transfer_functions);
-		free(primaries);
-	} else {
-		wlr_log(WLR_INFO, "renderer lacks input color transform, "
-			"disabling color-management-v1");
 	}
 
 	// ---- 输入法 (fcitx5 / ibus) ----
@@ -687,14 +665,19 @@ int main(int argc, char *argv[]) {
 	// 若此时 socket 尚未创建, 连接就失败, 表现为状态栏偶尔起不来.
 	const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
 	char ipc_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+	int path_len;
 	if (runtime_dir != NULL && runtime_dir[0] != '\0') {
-		snprintf(ipc_path, sizeof(ipc_path), "%s/monodywm.sock",
+		path_len = snprintf(ipc_path, sizeof(ipc_path), "%s/monodywm.sock",
 			runtime_dir);
 	} else {
-		snprintf(ipc_path, sizeof(ipc_path), "/tmp/monodywm.sock");
+		path_len = snprintf(ipc_path, sizeof(ipc_path),
+			"/tmp/monodywm.sock");
 	}
 	server.ipc_fd = -1;
-	if (!ipc_server_init(&server, ipc_path)) {
+	if (path_len < 0 || (size_t)path_len >= sizeof(ipc_path)) {
+		// 静默截断会让 IPC 绑定到一个错误路径; 宁可不启动 IPC
+		wlr_log(WLR_ERROR, "IPC socket path is too long");
+	} else if (!ipc_server_init(&server, ipc_path)) {
 		wlr_log(WLR_ERROR, "failed to start IPC socket at %s", ipc_path);
 	}
 
@@ -759,9 +742,51 @@ int main(int argc, char *argv[]) {
 	if (server.drag_destroy.link.prev != NULL) {
 		wl_list_remove(&server.drag_destroy.link);
 	}
+	// display 销毁后再收到终止信号会解引用已释放的 display: 先摘掉信号源
+	if (server.sigint_source != NULL) {
+		wl_event_source_remove(server.sigint_source);
+		server.sigint_source = NULL;
+	}
+	if (server.sigterm_source != NULL) {
+		wl_event_source_remove(server.sigterm_source);
+		server.sigterm_source = NULL;
+	}
+	if (server.sighup_source != NULL) {
+		wl_event_source_remove(server.sighup_source);
+		server.sighup_source = NULL;
+	}
 
 	ipc_server_destroy(&server);
 	wl_display_destroy_clients(server.display);
+
+	// 光标与 xcursor 管理器不依赖 display 销毁过程中的任何对象, 在这里
+	// 显式释放 (先光标后主题: 光标可能持有主题 buffer 的引用).
+	wlr_cursor_destroy(server.cursor);
+	server.cursor = NULL;
+	wlr_xcursor_manager_destroy(server.xcursor_manager);
+	server.xcursor_manager = NULL;
+
+	// backend 必须显式销毁: wl_display 不拥有它. 销毁时会一并销毁输出,
+	// 触发 monitor_destroy() 清掉各输出的预模糊节点 (scene 此时仍活着).
+	wlr_backend_destroy(server.backend);
+	server.backend = NULL;
+
 	wl_display_destroy(server.display);
+	server.display = NULL;
+
+	// wlr_scene 也不随 display 销毁; 它持有 buffer/texture 引用, 必须在
+	// 渲染器/分配器之前释放. 此时 backend 已销毁, monitor 的 blur 节点
+	// 都已移除, 不会 double free.
+	wlr_scene_node_destroy(&server.scene->tree.node);
+	server.scene = NULL;
+
+	wlr_allocator_destroy(server.allocator);
+	wlr_renderer_destroy(server.renderer);
+
+	// 日志每行都 fflush, 这里只是关掉 fd (同样只为 LSan 干净)
+	if (log_file != NULL) {
+		fclose(log_file);
+		log_file = NULL;
+	}
 	return EXIT_SUCCESS;
 }

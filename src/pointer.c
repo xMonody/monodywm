@@ -104,9 +104,13 @@ static bool is_double_click(struct server *server, uint32_t button) {
 
 void begin_move(struct server *server, struct toplevel *tl,
 		double ref_x, double ref_y) {
+	// 每次抓取都从干净状态开始; xdg_toplevel.move 路径在成功进入移动后
+	// 再显式置位 (见 toplevel.c: xdg_toplevel_request_move).
+	server->move_deferred_restore = false;
 	// tl == NULL 表示没有可移动的窗口: 直接拒绝, 不进入 move 模式
-	// (移动中解引用 tl->scene_tree/tl->xdg_toplevel 会崩溃)
-	if (server->moving || tl == NULL) {
+	// (移动中解引用 tl->scene_tree/tl->xdg_toplevel 会崩溃).
+	// moving/resizing 互斥: 一个抓取未结束时绝不能叠加另一种抓取.
+	if (server->moving || server->resizing || tl == NULL) {
 		return;
 	}
 	// 全屏窗口覆盖整个输出, 无处可去:
@@ -745,6 +749,9 @@ static int resize_final_timeout_cb(void *data) {
 	struct server *server = data;
 	if (server->resizing && server->resize_final_pending) {
 		resize_grab_clear(server);
+		// 客户端始终不提交最终尺寸: 抓取结束后必须恢复客户端光标,
+		// 否则光标会一直停在 resize 形状, 直到下一次 motion.
+		update_cursor_style(server);
 	}
 	return 0;
 }
@@ -771,9 +778,12 @@ static void disarm_resize_final_timer(struct server *server) {
 
 void begin_resize(struct server *server, struct toplevel *tl,
 		uint32_t edges) {
-	// 绝不缩放最大化或全屏窗口
-	if (server->resizing || tl->xdg_toplevel->current.maximized ||
-			tl->fullscreen) {
+	// 绝不缩放最大化或全屏窗口; moving/resizing 也互斥. 最大化 configure
+	// 还没被 ack 时也不能开始: 缩放会持续发 set_size 顶掉它, 落框等待的
+	// ack 就永远等不到.
+	if (server->resizing || server->moving ||
+			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
+			tl->maximize_pending) {
 		return;
 	}
 	server->resizing = true;
@@ -848,20 +858,19 @@ static void update_resize(struct server *server) {
 		nh = max_h;
 	}
 
-	// 目标框: 上/左抓取会移动窗口原点, 使对侧边缘保持在抓取开始时的锚点
-	struct wlr_box box = {
-		.x = (server->resize_edges & WLR_EDGE_LEFT) != 0
-			? orig.x + orig.width - nw : orig.x,
-		.y = (server->resize_edges & WLR_EDGE_TOP) != 0
-			? orig.y + orig.height - nh : orig.y,
-		.width = nw,
-		.height = nh,
-	};
-
 	if (!CONFIG_RESIZE_DRAW_CONTENTS) {
 		// 轮廓模式 (labwc 风格): 只用轮廓跟随光标;
 		// 释放时一次性应用真实尺寸, 使拖动边缘无需等待客户端
 		// configure -> commit 往返, 手感像窗口移动一样紧.
+		// 目标框: 上/左抓取会移动窗口原点, 使对侧边缘保持在抓取开始时的锚点
+		struct wlr_box box = {
+			.x = (server->resize_edges & WLR_EDGE_LEFT) != 0
+				? orig.x + orig.width - nw : orig.x,
+			.y = (server->resize_edges & WLR_EDGE_TOP) != 0
+				? orig.y + orig.height - nh : orig.y,
+			.width = nw,
+			.height = nh,
+		};
 		if (box.x == server->resize_target.x &&
 				box.y == server->resize_target.y &&
 				box.width == server->resize_target.width &&
@@ -1055,6 +1064,10 @@ static void chord_double_click(struct server *server, uint32_t chord_button) {
 // (其释放也要吞掉), 并区分双击 (切换最大化) 和按住 (移动)
 static void begin_chord(struct server *server, uint32_t button) {
 	struct toplevel *tl = toplevel_at(server);
+	if (tl == NULL || pointer_over_popup(server) ||
+			pointer_over_layer_surface(server)) {
+		return;
+	}
 	server->chord_active = true;
 	server->chord_button = button;
 	server->chord_toplevel = tl;
@@ -1121,8 +1134,12 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 			server->last_click_button = button;
 			server->chord_pending = false;
 		} else if (server->chord_moving) {
-			// 释放结束移动并恢复光标样式
+			// 释放结束移动并恢复光标样式. 另一个按钮可能还按着 (它已被
+			// 通知给客户端, button_count > 0), 此时 update_cursor_style()
+			// 会按隐式抓取规则提前返回并保留 all-scroll; 先显式清掉
+			// 合成器覆盖, 光标就能在释放瞬间恢复.
 			end_chord(server);
+			clear_cursor_override(server);
 			update_cursor_style(server);
 		} else {
 			end_chord(server);
@@ -1153,6 +1170,12 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 		} else {
 			server->chord_swallow_right = false;
 		}
+		// 和弦移动在释放任一按钮时结束. 触发键的释放路径已经刷新过光标,
+		// 但先释放的是被按住的另一个按钮时, 这里是最后一次按压被通知给
+		// 客户端的地方: 必须在 notify_button 之后再算一次光标样式,
+		// 否则 button_count 仍 > 0, update_cursor_style() 会保持移动光标,
+		// 直到下一次 motion 才恢复.
+		update_cursor_style(server);
 	}
 }
 
@@ -1178,6 +1201,70 @@ static bool toplevel_surface_origin(struct server *server,
 		return true;
 	}
 	return false;
+}
+
+// 布局坐标下的命中 surface 及其 surface 局部坐标. 与 process_cursor_motion
+// 原来的内联逻辑一致, 额外被隐式抓取的原点记录复用. 返回 NULL 表示
+// 光标下没有可接收指针事件的 surface.
+static struct wlr_surface *scene_surface_at(struct server *server,
+		double lx, double ly, double *sx, double *sy) {
+	struct wlr_scene_node *node = wlr_scene_node_at(
+		&server->scene->tree.node, lx, ly, sx, sy);
+	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
+		return NULL;
+	}
+
+	struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+	struct wlr_scene_surface *scene_surface =
+		wlr_scene_surface_try_from_buffer(buffer);
+	if (scene_surface != NULL) {
+		return scene_surface->surface;
+	}
+
+	// 命中的 buffer 是合成器圆角掩码内容的重绘: 通过树上的场景标签
+	// 解析出它所属的 xdg surface.
+	struct wlr_scene_node *n = node;
+	while (n != NULL) {
+		if (n->data != NULL) {
+			struct scene_tag *tag = n->data;
+			if (tag->type == TAG_POPUP) {
+				struct wlr_xdg_popup *popup = tag->ptr;
+				if (popup != NULL && popup->base != NULL) {
+					return popup->base->surface;
+				}
+			} else if (tag->type == TAG_TOPLEVEL) {
+				struct toplevel *tl = tag->ptr;
+				if (tl->xdg_toplevel != NULL &&
+						tl->xdg_toplevel->base != NULL) {
+					return tl->xdg_toplevel->base->surface;
+				}
+			}
+			break; // 更近的带标签对象赢得命中测试
+		}
+		n = n->parent != NULL ? &n->parent->node : NULL;
+	}
+	return NULL;
+}
+
+// 记录 surface 在布局坐标中的原点, 使隐式抓取能把任意光标位置换算成
+// 该 surface 的局部坐标. toplevel_surface_origin() 只认识根 toplevel
+// surface; popup / subsurface / layer surface 用当前命中点的局部坐标反推.
+static bool scene_surface_origin_at_cursor(struct server *server,
+		struct wlr_surface *surface, double *ox, double *oy) {
+	if (surface == NULL) {
+		return false;
+	}
+	if (toplevel_surface_origin(server, surface, ox, oy)) {
+		return true;
+	}
+	double sx, sy;
+	if (scene_surface_at(server, server->cursor->x, server->cursor->y,
+			&sx, &sy) != surface) {
+		return false;
+	}
+	*ox = server->cursor->x - sx;
+	*oy = server->cursor->y - sy;
+	return true;
 }
 
 static void process_cursor_motion(struct server *server, uint32_t time_msec) {
@@ -1231,43 +1318,8 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 
 	// 常规路径: 把指针 motion 转发给光标下的 surface
 	double sx, sy;
-	struct wlr_surface *surface = NULL;
-	struct wlr_scene_node *node = wlr_scene_node_at(
-			&server->scene->tree.node, server->cursor->x, server->cursor->y,
-			&sx, &sy);
-	if (node != NULL && node->type == WLR_SCENE_NODE_BUFFER) {
-		struct wlr_scene_buffer *buffer =
-			wlr_scene_buffer_from_node(node);
-		struct wlr_scene_surface *scene_surface =
-			wlr_scene_surface_try_from_buffer(buffer);
-		if (scene_surface != NULL) {
-			surface = scene_surface->surface;
-		} else {
-			// 命中的 buffer 是合成器圆角掩码内容的重绘:
-			// 通过其树上的场景标签解析 xdg surface
-			struct wlr_scene_node *n = node;
-			while (n != NULL) {
-				if (n->data != NULL) {
-					struct scene_tag *tag = n->data;
-					if (tag->type == TAG_POPUP) {
-						// 圆角 popup (Qt 菜单): 命中的 buffer 是它的
-						// 掩码重绘; 解析出 popup surface
-						struct wlr_xdg_popup *popup = tag->ptr;
-						if (popup != NULL && popup->base != NULL) {
-							surface = popup->base->surface;
-						}
-					} else if (tag->type == TAG_TOPLEVEL) {
-						struct toplevel *tl = tag->ptr;
-						if (tl->xdg_toplevel->base != NULL) {
-							surface = tl->xdg_toplevel->base->surface;
-						}
-					}
-					break; // 更近的带标签对象赢得命中测试
-				}
-				n = n->parent != NULL ? &n->parent->node : NULL;
-			}
-		}
-	}
+	struct wlr_surface *surface = scene_surface_at(server,
+		server->cursor->x, server->cursor->y, &sx, &sy);
 
 	// 进行中的 wl_data_device 拖拽: 指针抓取属于 wlroots 的 drag grab,
 	// 必须把 enter/motion 喂给它, 否则 drag focus 不会更新, 目标收不到
@@ -1291,9 +1343,25 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 			server->seat->pointer_state.focused_surface;
 		if (focused != NULL) {
 			if (surface == focused) {
+				// 抓取期间 surface 可能被客户端移动 (popup 重排等):
+				// 指针仍在 surface 内时顺手刷新原点, 离开后坐标才不会偏.
+				server->implicit_grab_surface = focused;
+				server->implicit_grab_origin_x =
+					server->cursor->x - sx;
+				server->implicit_grab_origin_y =
+					server->cursor->y - sy;
+				server->implicit_grab_origin_valid = true;
 				wlr_seat_pointer_notify_motion(server->seat, time_msec,
 					sx, sy);
+			} else if (server->implicit_grab_surface == focused &&
+					server->implicit_grab_origin_valid) {
+				// 抓取可能发生在 popup / subsurface / layer surface 上,
+				// 这些 surface 不能用 toplevel_surface_origin() 换算.
+				wlr_seat_pointer_notify_motion(server->seat, time_msec,
+					server->cursor->x - server->implicit_grab_origin_x,
+					server->cursor->y - server->implicit_grab_origin_y);
 			} else {
+				// 兼容旧路径: 根 toplevel 且尚未记录原点.
 				double ox, oy;
 				if (toplevel_surface_origin(server, focused, &ox, &oy)) {
 					wlr_seat_pointer_notify_motion(server->seat, time_msec,
@@ -1383,6 +1451,20 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		process_cursor_motion(server, time_msec);
 	}
 
+	// 第一次按下时记住被抓住 surface 的布局原点. 之后隐式抓取可能把
+	// 指针拖到 surface 之外, 仍需要把全局坐标换算成该 surface 的局部坐标;
+	// popup / subsurface / layer surface 不能靠 toplevel_surface_origin().
+	if (state == WL_POINTER_BUTTON_STATE_PRESSED &&
+			server->seat->pointer_state.button_count == 0) {
+		struct wlr_surface *focused =
+			server->seat->pointer_state.focused_surface;
+		server->implicit_grab_surface = focused;
+		server->implicit_grab_origin_valid =
+			scene_surface_origin_at_cursor(server, focused,
+				&server->implicit_grab_origin_x,
+				&server->implicit_grab_origin_y);
+	}
+
 	// 记住每个按钮是否按住: 滚轮手势 (上滚 = 最大化, 下滚 = 最小化)
 	// 依赖右键, 和弦手势依赖两者
 	if (button == BTN_LEFT) {
@@ -1409,9 +1491,14 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	// 开始和弦: 一个按钮按住, 另一个被按下.
 	// 由 CONFIG_WHEEL_DEBOUNCE_ENABLED 设门控: 手势总开关关闭时,
 	// 和弦从不启动, 两次按压都作为普通点击落到客户端.
+	// 光标在 popup/layer surface 上或下面没有窗口时不启动: 那些按压属于
+	// 覆盖层/客户端, 和弦不能把它们吞掉.
 	if (CONFIG_WHEEL_DEBOUNCE_ENABLED &&
 			state == WL_POINTER_BUTTON_STATE_PRESSED &&
 			!server->resizing && !server->moving &&
+			!pointer_over_popup(server) &&
+			!pointer_over_layer_surface(server) &&
+			toplevel_at(server) != NULL &&
 			((button == BTN_LEFT && server->right_button_held) ||
 			 (button == BTN_RIGHT && server->left_button_held))) {
 		begin_chord(server, button);
@@ -1434,6 +1521,9 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 			} else {
 				server->chord_swallow_right = false;
 			}
+			// 这个释放被吞掉, 没有 notify_button 来降低 button_count.
+			// 和弦已经结束时仍要立即恢复光标, 不能等下一次 motion.
+			update_cursor_style(server);
 			return;
 		}
 
@@ -1601,6 +1691,11 @@ static bool wheel_action_allowed(struct server *server) {
 // 滚轮手势作用的 toplevel: 光标下的窗口, 或 - 光标位于最小化 (隐藏) 窗口的
 // 位置时 - 那个窗口, 使下滚可以还原它
 static struct toplevel *toplevel_at_or_minimized(struct server *server) {
+	// 光标在 popup/layer surface 上时, 指针属于它们: 不要穿透到下面的
+	// 窗口, 更不要扫描最小化窗口.
+	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
+		return NULL;
+	}
 	struct toplevel *tl = toplevel_at(server);
 	if (tl != NULL && !tl->minimized) {
 		return tl;
@@ -1624,11 +1719,21 @@ static struct toplevel *toplevel_at_or_minimized(struct server *server) {
 
 static void process_cursor_axis(struct server *server, uint32_t time_msec,
 		struct wlr_pointer_axis_event *event) {
+	// popup/layer surface 赢得指针: 菜单、启动器、状态栏上的滚动属于它们,
+	// 不能触发下面窗口的合成器手势.
+	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
+		wlr_seat_pointer_notify_axis(server->seat, time_msec,
+			event->orientation, event->delta, event->delta_discrete,
+			event->source, event->relative_direction);
+		return;
+	}
 	struct toplevel *tl = toplevel_at_or_minimized(server);
 	// 由手势总开关门控: CONFIG_WHEEL_DEBOUNCE_ENABLED 为 false 时
 	// 滚轮不抓取滚动 - 它像普通滚动一样在下面转发给客户端
 	if (CONFIG_WHEEL_DEBOUNCE_ENABLED && tl != NULL &&
 			server->right_button_held &&
+			!server->moving && !server->resizing &&
+			!server->chord_active &&
 			!pointer_constraint_active(server) &&
 			event->orientation == WL_POINTER_AXIS_VERTICAL_SCROLL &&
 			event->delta_discrete != 0) {

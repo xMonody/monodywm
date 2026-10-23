@@ -356,6 +356,23 @@ bool keyboard_is_typing(struct wlr_input_device *device) {
 		libinput_device_keyboard_has_key(dev, KEY_SPACE);
 }
 
+// 这个键盘是输入法自己的 passthrough 虚拟键盘吗?
+// 它绝不能成为 seat 键盘, 否则真实键盘上的按键会绕过输入法.
+static bool keyboard_emulated_by_ime(struct server *server,
+		struct wlr_keyboard *keyboard) {
+	if (keyboard == NULL || server->input_method == NULL ||
+			server->input_method->resource == NULL) {
+		return false;
+	}
+	struct wlr_virtual_keyboard_v1 *vk =
+		wlr_input_device_get_virtual_keyboard(&keyboard->base);
+	if (vk == NULL || vk->resource == NULL) {
+		return false;
+	}
+	return wl_resource_get_client(vk->resource) ==
+		wl_resource_get_client(server->input_method->resource);
+}
+
 static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	struct keyboard *kb = wl_container_of(listener, kb, modifiers);
 	struct server *server = kb->server;
@@ -533,8 +550,6 @@ static void spawn_app(const struct config_app_shortcut *app) {
 // 只有当它的 surface 持有键盘焦点时才生效 (见 shortcuts_suppressed()),
 // 这与协议"仅在聚焦时生效"的规则一致.
 void new_shortcuts_inhibitor(struct wl_listener *listener, void *data) {
-	struct server *server = wl_container_of(listener, server,
-		new_shortcuts_inhibitor);
 	struct wlr_keyboard_shortcuts_inhibitor_v1 *inhibitor = data;
 	wlr_log(WLR_DEBUG, "input: shortcuts-inhibit new surface=%p seat=%p",
 		(void *)inhibitor->surface, (void *)inhibitor->seat);
@@ -658,11 +673,11 @@ static bool keyboard_shortcut(struct server *server,
 				return true;
 			}
 		}
-		for (size_t i = 0;
-				i < sizeof(config_app_shortcuts) /
-					sizeof(config_app_shortcuts[0]); i++) {
+		for (size_t j = 0;
+				j < sizeof(config_app_shortcuts) /
+					sizeof(config_app_shortcuts[0]); j++) {
 			const struct config_app_shortcut *app =
-				&config_app_shortcuts[i];
+				&config_app_shortcuts[j];
 			if ((mods & app->mods) == app->mods &&
 					sym == app->key) {
 				// 启动应用也算离开循环: 先把暂缓的最小化窗口收尾
@@ -737,6 +752,24 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	}
 }
 
+// 当前键盘焦点应落在哪个 surface: 交互 layer surface (rofi/wofi 等)
+// 优先, 否则是可见的聚焦 toplevel. 用于键盘热插拔时重建 enter.
+static struct wlr_surface *keyboard_focus_surface(struct server *server) {
+	if (server->layer_focused != NULL &&
+			server->layer_focused->keyboard_focused) {
+		struct wlr_surface *surface =
+			server->layer_focused->layer_surface->surface;
+		if (surface != NULL && surface->mapped) {
+			return surface;
+		}
+	}
+	struct toplevel *tl = server->focused;
+	if (toplevel_focusable(tl)) {
+		return tl->xdg_toplevel->base->surface;
+	}
+	return NULL;
+}
+
 static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	struct keyboard *kb = wl_container_of(listener, kb, destroy);
 	struct server *server = kb->server;
@@ -744,12 +777,40 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	if (server->cycle_keyboard == kb->keyboard) {
 		cycle_end(server);
 	}
+	struct wlr_keyboard *seat_keyboard = wlr_seat_get_keyboard(server->seat);
+	bool seat_lost = seat_keyboard == NULL || seat_keyboard == kb->keyboard;
 	ime_detach_keyboard(server, kb->keyboard);
 	// 摘掉所有监听器, 以便通过 wlr 销毁时的断言
 	wl_list_remove(&kb->key.link);
 	wl_list_remove(&kb->modifiers.link);
 	wl_list_remove(&kb->destroy.link);
 	wl_list_remove(&kb->link);
+
+	// 被拔掉的是 seat 键盘时, 从剩余键盘里选一个接替. 否则 seat 会
+	// 停在 NULL: 新客户端拿不到 keymap, 后续键盘焦点切换也缺少键盘状态.
+	// 排除输入法的虚拟键盘 (它永远不能劫持 seat).
+	if (seat_lost) {
+		struct wlr_keyboard *next = NULL;
+		struct keyboard *candidate;
+		wl_list_for_each(candidate, &server->keyboards, link) {
+			if (keyboard_is_typing(&candidate->keyboard->base) &&
+					!keyboard_emulated_by_ime(server,
+						candidate->keyboard)) {
+				next = candidate->keyboard;
+				break;
+			}
+		}
+		// 先显式清空: wlroots 自己的 keyboard_destroy 监听器也在同一个
+		// signal 上, 若直接 set(next), 它稍后会把 seat 键盘清成 NULL.
+		// set(NULL) 会先摘掉那个监听器, 再换到 next 才是稳定的.
+		if (wlr_seat_get_keyboard(server->seat) == kb->keyboard) {
+			wlr_seat_set_keyboard(server->seat, NULL);
+		}
+		if (next != NULL) {
+			wlr_seat_set_keyboard(server->seat, next);
+			seat_keyboard_focus(server, keyboard_focus_surface(server));
+		}
+	}
 	free(kb);
 }
 
@@ -902,18 +963,27 @@ static void keyboard_attach(struct server *server,
 
 	// 第一个真实的打字键盘成为 seat 键盘 (这样输入法的辅助虚拟键盘和
 	// Power Button 这类特殊按键伪键盘永远不会劫持 seat);
-	// 之后的键盘保留自己的监听器, 仍能到达聚焦客户端
-	bool first = wlr_seat_get_keyboard(server->seat) == NULL &&
-		keyboard_is_typing(device);
-	if (first) {
+	// 之后的键盘保留自己的监听器, 仍能到达聚焦客户端.
+	//
+	// 另外允许真实键盘替换当前占着 seat 的虚拟键盘: fcitx5 的
+	// PersistentVirtualKeyboard 可能比物理键盘先出现 (且此时 IM 对象还没
+	// 建立, 无法按 client 识别它是 IM 的 vk). 真实键盘到达后应当接管.
+	struct wlr_keyboard *current = wlr_seat_get_keyboard(server->seat);
+	bool typing = keyboard_is_typing(device);
+	bool emulated_by_ime = keyboard_emulated_by_ime(server, keyboard);
+	bool current_is_virtual = current != NULL &&
+		wlr_input_device_get_virtual_keyboard(&current->base) != NULL;
+	bool incoming_is_real =
+		wlr_input_device_get_virtual_keyboard(device) == NULL;
+	bool take_seat = typing && !emulated_by_ime &&
+		(current == NULL || (current_is_virtual && incoming_is_real));
+	if (take_seat) {
 		wlr_seat_set_keyboard(server->seat, keyboard);
-		if (server->focused != NULL &&
-				server->focused->xdg_toplevel->base != NULL &&
-				server->focused->xdg_toplevel->base->surface->mapped) {
-			wlr_seat_keyboard_notify_enter(server->seat,
-				server->focused->xdg_toplevel->base->surface,
-				keyboard->keycodes, keyboard->num_keycodes,
-				&keyboard->modifiers);
+		// 键盘焦点可能属于交互 layer surface (rofi/wofi), 而不一定是
+		// server->focused 的 toplevel. 用统一 helper 决定 enter 目标.
+		struct wlr_surface *focus = keyboard_focus_surface(server);
+		if (focus != NULL) {
+			seat_keyboard_focus(server, focus);
 		}
 	}
 }

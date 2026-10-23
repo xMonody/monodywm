@@ -111,9 +111,14 @@ void get_work_area(struct server *server, struct wlr_output *output,
 	struct layer_surface *ls;
 	wl_list_for_each(ls, &server->layer_surfaces, link) {
 		struct wlr_layer_surface_v1 *layer = ls->layer_surface;
-		// 不指定输出的状态栏会横跨每个输出 (wlroots 在每个输出上都渲染它),
-		// 所以它的独占区缩小的是每个输出的作区, 而不只是它指定的那个
-		if (layer->output != NULL && layer->output != output) {
+		// output == NULL 的 layer surface 只被配置到中心输出
+		// (configure_layer_surface/arrange_layer_surfaces 的约定), 所以
+		// 它的独占区也只能缩小中心输出的作区; 否则多显示器时其他输出
+		// 会被无端缩小.
+		struct wlr_output *effective = layer->output != NULL
+			? layer->output
+			: wlr_output_layout_get_center_output(server->output_layout);
+		if (effective != output) {
 			continue;
 		}
 		if (layer->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY) {
@@ -156,7 +161,10 @@ static void layer_surface_sync_blur(struct layer_surface *ls) {
 	}
 	int w = ls->layer_surface->surface->current.width;
 	int h = ls->layer_surface->surface->current.height;
-	if (CONFIG_BLUR && CONFIG_BLUR_LAYER && w > 0 && h > 0) {
+	// blur 是 surface 子树的兄弟节点, unmap 时 wlroots 不会替我们禁用;
+	// 必须显式检查 mapped, 否则面板隐藏后留下一块模糊残影.
+	if (CONFIG_BLUR && CONFIG_BLUR_LAYER &&
+			ls->layer_surface->surface->mapped && w > 0 && h > 0) {
 		wlr_scene_node_set_enabled(&ls->blur->node, true);
 		wlr_scene_blur_set_size(ls->blur, w, h);
 	} else {
@@ -207,14 +215,66 @@ static void arrange_for_layer_surface(struct layer_surface *ls) {
 		return;
 	}
 	struct wlr_output *output = ls->layer_surface->output;
+	if (output == NULL) {
+		// output == NULL: 该 surface 配置在中心输出上 (见 configure_layer_surface)
+		output = wlr_output_layout_get_center_output(
+			ls->server->output_layout);
+	}
 	if (output != NULL) {
 		arrange_toplevels_work_area(ls->server, output);
-		return;
 	}
-	struct wlr_output_layout_output *lo;
-	wl_list_for_each(lo, &ls->server->output_layout->outputs, link) {
-		arrange_toplevels_work_area(ls->server, lo->output);
+}
+
+static bool layer_surface_is_interactive(struct layer_surface *ls) {
+	return ls->layer_surface != NULL &&
+		ls->layer_surface->surface != NULL &&
+		ls->layer_surface->surface->mapped &&
+		ls->layer_surface->current.keyboard_interactive !=
+			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
+}
+
+static void layer_focus_stack_remove(struct layer_surface *ls) {
+	if (ls->focus_link.prev != NULL) {
+		wl_list_remove(&ls->focus_link);
 	}
+}
+
+static void layer_focus_stack_push(struct server *server,
+		struct layer_surface *ls) {
+	layer_focus_stack_remove(ls);
+	wl_list_insert(&server->layer_focus_stack, &ls->focus_link);
+}
+
+// 放弃整条覆盖层焦点链 (窗口接管键盘时): 栈里残留的下层覆盖层
+// 不应在之后某个覆盖层消失时被重新激活.
+static void layer_focus_stack_clear(struct server *server) {
+	struct layer_surface *ls, *tmp;
+	wl_list_for_each_safe(ls, tmp, &server->layer_focus_stack, focus_link) {
+		wl_list_remove(&ls->focus_link);
+		ls->keyboard_focused = false;
+	}
+}
+
+// 栈顶仍是可交互的 layer surface; 不可交互的条目应在 commit/destroy 中移除.
+static struct layer_surface *layer_focus_stack_top(struct server *server) {
+	struct layer_surface *ls;
+	wl_list_for_each(ls, &server->layer_focus_stack, focus_link) {
+		if (layer_surface_is_interactive(ls)) {
+			return ls;
+		}
+	}
+	return NULL;
+}
+
+static void layer_surface_take_keyboard(struct server *server,
+		struct layer_surface *ls) {
+	ls->keyboard_focused = true;
+	server->layer_focused = ls;
+	wlr_log(WLR_DEBUG, "layer: keyboard focus -> %s surface %p",
+		ls->layer_surface->namespace ? ls->layer_surface->namespace : "(null)",
+		(void *)ls->layer_surface->surface);
+	seat_keyboard_focus(server, ls->layer_surface->surface);
+	ime_set_focus(server, ls->layer_surface->surface);
 }
 
 // 把 seat 键盘焦点交给一个已映射且要求键盘交互的 layer surface
@@ -222,20 +282,18 @@ static void arrange_for_layer_surface(struct layer_surface *ls) {
 // "聚焦窗口" (边框保持聚焦色), 覆盖层消失后重新拿回键盘.
 static void layer_surface_keyboard_focus(struct server *server,
 		struct layer_surface *ls) {
-	struct wlr_layer_surface_v1 *layer_surface = ls->layer_surface;
 	if (server->layer_focused == ls) {
 		return;
 	}
-	ls->keyboard_focused = true;
-	server->layer_focused = ls;
-	wlr_log(WLR_DEBUG, "layer: keyboard focus -> %s surface %p",
-		layer_surface->namespace ? layer_surface->namespace : "(null)",
-		(void *)layer_surface->surface);
-	seat_keyboard_focus(server, layer_surface->surface);
-	ime_set_focus(server, layer_surface->surface);
+	// 旧覆盖层仍在栈里: 新覆盖层消失后它重新拿回键盘.
+	if (server->layer_focused != NULL) {
+		server->layer_focused->keyboard_focused = false;
+	}
+	layer_focus_stack_push(server, ls);
+	layer_surface_take_keyboard(server, ls);
 }
 
-// 释放交互 layer surface 的键盘持有 (若有), 并在同一步把 seat 键盘交给
+// 释放当前交互 layer surface 的键盘持有, 并在同一步把 seat 键盘交给
 // `surface`. `surface` 是接管键盘的 toplevel (focus_toplevel) 或先前聚焦
 // toplevel 的 surface (layer 解除映射/销毁/失去交互); NULL 表示清空键盘焦点.
 void layer_keyboard_clear(struct server *server, struct wlr_surface *surface) {
@@ -245,6 +303,9 @@ void layer_keyboard_clear(struct server *server, struct wlr_surface *surface) {
 	}
 	ls->keyboard_focused = false;
 	server->layer_focused = NULL;
+	layer_focus_stack_remove(ls);
+	// 键盘交给 toplevel: 覆盖层焦点链到此结束.
+	layer_focus_stack_clear(server);
 	wlr_log(WLR_DEBUG, "layer: keyboard focus released (surface %p)",
 		(void *)ls->layer_surface->surface);
 	seat_keyboard_focus(server, surface);
@@ -252,19 +313,32 @@ void layer_keyboard_clear(struct server *server, struct wlr_surface *surface) {
 }
 
 // layer surface 不再持有键盘 (解除映射/销毁/交互关闭):
-// 交还给先前聚焦的 toplevel, 没有 toplevel 时清空
+// 优先交还给栈中前一个交互覆盖层, 否则交还给先前聚焦的 toplevel.
 static void layer_surface_keyboard_unfocus(struct server *server,
 		struct layer_surface *ls) {
+	layer_focus_stack_remove(ls);
+	ls->keyboard_focused = false;
 	if (server->layer_focused != ls) {
+		return; // 只是从栈中间移除, 当前覆盖层没变
+	}
+	server->layer_focused = NULL;
+
+	struct layer_surface *prev = layer_focus_stack_top(server);
+	if (prev != NULL) {
+		layer_surface_take_keyboard(server, prev);
 		return;
 	}
+
 	struct wlr_surface *surface = NULL;
 	struct toplevel *tl = server->focused;
-	if (tl != NULL && tl->xdg_toplevel->base != NULL &&
-			tl->xdg_toplevel->base->surface->mapped) {
+	// 回退目标必须是真正能接管焦点/键盘的窗口. 统一用 toplevel_focusable():
+	// 它同时挡住 minimized、未映射, 以及角色对象 (wlr_xdg_toplevel) 已销毁
+	// 但 tl 还没 free 的悬空窗口 - 直接解引用 tl->xdg_toplevel 会 UAF.
+	if (toplevel_focusable(tl)) {
 		surface = tl->xdg_toplevel->base->surface;
 	}
-	layer_keyboard_clear(server, surface);
+	seat_keyboard_focus(server, surface);
+	ime_set_focus(server, surface);
 }
 
 static void layer_surface_commit(struct wl_listener *listener, void *data) {
@@ -302,8 +376,14 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 
 	if (became_interactive) {
 		layer_surface_keyboard_focus(ls->server, ls);
-	} else if (ls->keyboard_focused && (!mapped || !interactive)) {
-		layer_surface_keyboard_unfocus(ls->server, ls);
+	} else if (!mapped || !interactive) {
+		if (ls->keyboard_focused) {
+			layer_surface_keyboard_unfocus(ls->server, ls);
+		} else {
+			// 只是栈中间的覆盖层消失/取消交互: 从栈里移除即可,
+			// 当前持有键盘的覆盖层不受影响.
+			layer_focus_stack_remove(ls);
+		}
 	}
 	ls->last_keyboard_interactive = st->keyboard_interactive;
 
@@ -322,10 +402,12 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 
 static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	struct layer_surface *ls = wl_container_of(listener, ls, destroy);
-	// 持有键盘的启动器覆盖层正在消失: 交还给先前聚焦的 toplevel
+	// 持有键盘的启动器覆盖层正在消失: 交还给栈中前一个交互层,
+	// 没有则交还给先前聚焦的 toplevel.
 	if (ls->keyboard_focused) {
 		layer_surface_keyboard_unfocus(ls->server, ls);
 	}
+	layer_focus_stack_remove(ls);
 	// 背景/底部层消失: 预模糊缓存的输入变了, 让它失效
 	enum zwlr_layer_shell_v1_layer layer = ls->layer_surface->current.layer;
 	if (layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND ||

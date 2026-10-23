@@ -40,9 +40,11 @@ struct ipc_client {
 	char in[4096];    // 尚未凑齐一行的输入
 	size_t in_len;
 
-	// 写失败的客户端立即摘链, 结构体则延迟到空闲回调再释放:
+	// 写失败的客户端立即关闭 fd 并标记 dead, 结构体则延迟到空闲回调再释放:
 	// 释放可能发生在广播循环或该客户端自己的读处理中, 调用方仍持有指针.
-	// dead 让后续访问 (queue/flush/handler) 全部变成空操作.
+	// dead 让后续访问 (queue/flush/handler) 全部变成空操作; link 仍留在
+	// server->ipc_clients 里直到空闲回调真正释放, 这样 ipc_server_destroy()
+	// 退出时还能遍历到它并直接 free (不会因为 idle 永远不执行而泄漏).
 	bool dead;
 	struct wl_event_source *destroy_idle;
 };
@@ -50,17 +52,8 @@ struct ipc_client {
 static void ipc_send_window_list(struct server *server,
 		struct ipc_client *target);
 
-static void ipc_client_destroy_idle(void *data) {
-	struct ipc_client *client = data;
-	free(client->out);
-	free(client);
-}
-
-static void ipc_client_destroy(struct ipc_client *client) {
-	if (client->dead) {
-		return;
-	}
-	client->dead = true;
+// 摘掉 fd/event source; 幂等 (destroy 与其后的强制释放都可能调用)
+static void ipc_client_close(struct ipc_client *client) {
 	if (client->source != NULL) {
 		wl_event_source_remove(client->source);
 		client->source = NULL;
@@ -69,14 +62,42 @@ static void ipc_client_destroy(struct ipc_client *client) {
 		close(client->fd);
 		client->fd = -1;
 	}
-	wl_list_remove(&client->link);
+}
+
+// 真正释放: 先摘掉可能还挂着的延迟释放源, 再从链表里摘除.
+// 既用于空闲回调, 也用于 ipc_server_destroy() 的退出路径.
+static void ipc_client_free(struct ipc_client *client) {
+	if (client->destroy_idle != NULL) {
+		wl_event_source_remove(client->destroy_idle);
+		client->destroy_idle = NULL;
+	}
+	if (client->link.prev != NULL) {
+		wl_list_remove(&client->link);
+	}
+	free(client->out);
+	free(client);
+}
+
+static void ipc_client_destroy_idle(void *data) {
+	struct ipc_client *client = data;
+	client->destroy_idle = NULL; // idle 源在 dispatch 时已自动摘除
+	ipc_client_free(client);
+}
+
+static void ipc_client_destroy(struct ipc_client *client) {
+	if (client->dead) {
+		return;
+	}
+	client->dead = true;
+	ipc_client_close(client);
 	// 延迟释放: 让广播循环/读处理中仍持有的指针在事件循环空闲前保持有效
 	client->destroy_idle = wl_event_loop_add_idle(
 		wl_display_get_event_loop(client->server->display),
 		ipc_client_destroy_idle, client);
 	if (client->destroy_idle == NULL) {
-		// 没有空闲源时宁可泄漏, 也不释放调用方可能仍会解引用的内存
-		wlr_log(WLR_ERROR, "ipc: failed to schedule client destroy, leaking");
+		// 没有空闲源: 先保留结构体 (其 link 仍在链表里), 退出时由
+		// ipc_server_destroy() 的强制释放回收
+		wlr_log(WLR_ERROR, "ipc: failed to schedule client destroy");
 	}
 }
 
@@ -87,11 +108,20 @@ static bool ipc_client_flush(struct ipc_client *client) {
 		ssize_t n = write(client->fd, client->out + client->out_off,
 			client->out_len - client->out_off);
 		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				return true; // 等待可写事件
 			}
 			ipc_client_destroy(client);
 			return false; // 客户端已消失
+		}
+		if (n == 0) {
+			// 非阻塞 socket 上 write() 返回 0 不应发生; 若按 0 继续
+			// 循环, out_off 不前进, 事件循环会被卡死.
+			ipc_client_destroy(client);
+			return false;
 		}
 		client->out_off += n;
 	}
@@ -234,6 +264,9 @@ static int ipc_client_handle_data(int fd, uint32_t mask, void *data) {
 	if ((mask & WL_EVENT_READABLE) != 0) {
 		char buf[4096];
 		ssize_t n = read(fd, buf, sizeof(buf));
+		if (n < 0 && errno == EINTR) {
+			return 0; // 被信号打断: 下次可读事件再试
+		}
 		if (n <= 0) {
 			ipc_client_destroy(client);
 			return 0;
@@ -252,7 +285,11 @@ static int ipc_handle_accept(int fd, uint32_t mask, void *data) {
 	if (cfd < 0) {
 		return 0;
 	}
-	if (fcntl(cfd, F_SETFL, O_NONBLOCK | O_CLOEXEC) < 0) {
+	// F_SETFL 只处理文件状态标志; O_CLOEXEC 是 fd 标志, 必须用 F_SETFD.
+	// 否则 fork/exec 出来的应用会继承状态栏 IPC 连接, 状态栏退出后合成器
+	// 也检测不到断开.
+	if (fcntl(cfd, F_SETFL, O_NONBLOCK) < 0 ||
+			fcntl(cfd, F_SETFD, FD_CLOEXEC) < 0) {
 		close(cfd);
 		return 0;
 	}
@@ -383,17 +420,23 @@ bool ipc_server_init(struct server *server, const char *path) {
 		close(fd);
 		return false;
 	}
+	// bind 成功后套接字文件已经存在: 之后任何失败都要 unlink, 否则留下
+	// 一个无人监听的 socket 文件 (下次 connect 会拿到 ECONNREFUSED)
 	if (listen(fd, 8) < 0) {
 		close(fd);
+		unlink(path);
 		return false;
 	}
 	server->ipc_fd = fd;
+	snprintf(server->ipc_path, sizeof(server->ipc_path), "%s", path);
 	server->ipc_source = wl_event_loop_add_fd(
 		wl_display_get_event_loop(server->display), fd, WL_EVENT_READABLE,
 		ipc_handle_accept, server);
 	if (server->ipc_source == NULL) {
 		close(fd);
 		server->ipc_fd = -1;
+		unlink(path);
+		server->ipc_path[0] = '\0';
 		return false;
 	}
 	wlr_log(WLR_INFO, "IPC socket listening on %s", path);
@@ -401,9 +444,15 @@ bool ipc_server_init(struct server *server, const char *path) {
 }
 
 void ipc_server_destroy(struct server *server) {
+	// 退出时直接释放, 不走延迟释放的 idle: 调用方是 main() 的拆除路径,
+	// 之后马上就会销毁事件循环, idle 永远不会被 dispatch (否则就漏了).
+	// 广播/读处理中的临时指针问题在正常运行时由 dead 标记 + idle 保证,
+	// 这里已经没有任何 handler 在跑.
 	struct ipc_client *client, *tmp;
 	wl_list_for_each_safe(client, tmp, &server->ipc_clients, link) {
-		ipc_client_destroy(client);
+		client->dead = true;
+		ipc_client_close(client);
+		ipc_client_free(client);
 	}
 	if (server->ipc_source != NULL) {
 		wl_event_source_remove(server->ipc_source);
@@ -412,5 +461,9 @@ void ipc_server_destroy(struct server *server) {
 	if (server->ipc_fd >= 0) {
 		close(server->ipc_fd);
 		server->ipc_fd = -1;
+	}
+	if (server->ipc_path[0] != '\0') {
+		unlink(server->ipc_path);
+		server->ipc_path[0] = '\0';
 	}
 }

@@ -5,6 +5,16 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# 未指定 build type 时 CMake 默认不传任何优化/警告 flag; 对合成器来说
+# 这就是一个无优化的调试构建. 默认给 RelWithDebInfo.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
+		"Build type" FORCE)
+	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+		Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+
 # wlroots exposes unstable headers through this define
 add_compile_definitions(WLR_USE_UNSTABLE)
 
@@ -88,7 +98,6 @@ set(PROTOCOLS
 	xdg-activation-v1
 	wp_fractional_scale_v1=fractional-scale
 	linux-drm-syncobj-v1
-	color-management-v1
 	ext-data-control-v1
 	wlr-data-control-unstable-v1
 	pointer-constraints-unstable-v1
@@ -109,33 +118,44 @@ function(find_protocol_xml out name)
 		set(stem ${ARGN})
 	endif()
 
-	file(GLOB_RECURSE exact
-		"${LOCAL_PROTOCOL_DIR}/${stem}.xml"
-		"${WAYLAND_PROTOCOLS_DIR}/${stem}.xml"
-		"${WAYLAND_DIR}/${stem}.xml")
-	if(exact)
-		list(GET exact 0 hit)
-		set(${out} "${hit}" PARENT_SCOPE)
-		return()
-	endif()
-
-	string(REGEX REPLACE "-v[0-9]+$" "" prefix "${stem}")
-	file(GLOB_RECURSE candidates
-		"${LOCAL_PROTOCOL_DIR}/${prefix}-v*.xml"
-		"${WAYLAND_PROTOCOLS_DIR}/${prefix}-v*.xml"
-		"${WAYLAND_DIR}/${prefix}-v*.xml")
-	set(best "")
-	set(best_num -1)
-	foreach(f ${candidates})
-		if(f MATCHES "-v([0-9]+)\\.xml$")
-			set(num ${CMAKE_MATCH_1})
-			if(num GREATER best_num)
-				set(best "${f}")
-				set(best_num ${num})
-			endif()
+	# 明确优先级: 本地 vendored > wayland-protocols > wayland.
+	# GLOB 结果顺序不保证, 因此每个目录内排序后再取第一个.
+	foreach(dir "${LOCAL_PROTOCOL_DIR}" "${WAYLAND_PROTOCOLS_DIR}"
+			"${WAYLAND_DIR}")
+		file(GLOB_RECURSE exact "${dir}/${stem}.xml")
+		if(exact)
+			list(SORT exact)
+			list(GET exact 0 hit)
+			set(${out} "${hit}" PARENT_SCOPE)
+			return()
 		endif()
 	endforeach()
-	set(${out} "${best}" PARENT_SCOPE)
+
+	string(REGEX REPLACE "-v[0-9]+$" "" prefix "${stem}")
+	foreach(dir "${LOCAL_PROTOCOL_DIR}" "${WAYLAND_PROTOCOLS_DIR}"
+			"${WAYLAND_DIR}")
+		file(GLOB_RECURSE candidates "${dir}/${prefix}-v*.xml")
+		if(NOT candidates)
+			continue()
+		endif()
+		list(SORT candidates)
+		set(best "")
+		set(best_num -1)
+		foreach(f ${candidates})
+			if(f MATCHES "-v([0-9]+)\\.xml$")
+				set(num ${CMAKE_MATCH_1})
+				if(num GREATER best_num)
+					set(best "${f}")
+					set(best_num ${num})
+				endif()
+			endif()
+		endforeach()
+		if(best)
+			set(${out} "${best}" PARENT_SCOPE)
+			return()
+		endif()
+	endforeach()
+	set(${out} "" PARENT_SCOPE)
 endfunction()
 
 set(PROTOCOL_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/protocol)
@@ -209,6 +229,11 @@ set(COMPOSITOR_SOURCES
 )
 
 add_executable(monodywm ${COMPOSITOR_SOURCES})
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+	# wayland 回调天然有一堆不用的 listener/data 参数, 不为此刷屏
+	target_compile_options(monodywm PRIVATE
+		-Wall -Wextra -Wno-unused-parameter)
+endif()
 target_include_directories(monodywm PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/src
 	${PROTOCOL_GEN_DIR} # wlroots' installed headers #include generated ones

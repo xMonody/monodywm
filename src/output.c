@@ -74,8 +74,13 @@ static void monitor_update_blur_layer(struct monitor *mon) {
 	struct wlr_output_layout_output *lo =
 		wlr_output_layout_get(mon->server->output_layout, mon->output);
 	if (lo == NULL) {
+		// 输出被 output-management 禁用/list 移除: 缓存节点不能再留在
+		// 共享场景里 (它可能和别的输出区域重叠), 重新启用时 layout
+		// change 会再次调用这里.
+		wlr_scene_node_set_enabled(&mon->optimized_blur->node, false);
 		return;
 	}
+	wlr_scene_node_set_enabled(&mon->optimized_blur->node, true);
 	wlr_scene_node_set_position(&mon->optimized_blur->node, lo->x, lo->y);
 	int w = 0, h = 0;
 	wlr_output_effective_resolution(mon->output, &w, &h);
@@ -130,6 +135,15 @@ static void monitor_destroy(struct wl_listener *listener, void *data) {
 	if (mon->optimized_blur != NULL) {
 		wlr_scene_node_destroy(&mon->optimized_blur->node);
 	}
+	// foreign-toplevel 句柄里缓存了输出指针. 输出对象即将被释放, 必须清掉
+	// 所有引用, 否则下一次 update_toplevel_output() 会把悬空指针传给
+	// wlr_foreign_toplevel_handle_v1_output_leave().
+	struct toplevel *tl;
+	wl_list_for_each(tl, &mon->server->toplevels, link) {
+		if (tl->last_output == mon->output) {
+			tl->last_output = NULL;
+		}
+	}
 	free(mon);
 }
 
@@ -178,7 +192,10 @@ void server_new_output(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server, new_output);
 	struct wlr_output *output = data;
 
-	wlr_output_init_render(output, server->allocator, server->renderer);
+	if (!wlr_output_init_render(output, server->allocator, server->renderer)) {
+		wlr_log(WLR_ERROR, "failed to initialize output rendering");
+		return;
+	}
 
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
@@ -206,6 +223,7 @@ void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_scene_output_create(server->scene, output);
 	if (scene_output == NULL) {
 		wlr_log(WLR_ERROR, "failed to create scene output");
+		wlr_output_layout_remove(server->output_layout, output);
 		return;
 	}
 	wlr_scene_output_set_position(scene_output, lo->x, lo->y);
@@ -213,6 +231,10 @@ void server_new_output(struct wl_listener *listener, void *data) {
 
 	struct monitor *mon = calloc(1, sizeof(*mon));
 	if (mon == NULL) {
+		wlr_log(WLR_ERROR, "failed to allocate monitor state");
+		wlr_scene_output_destroy(scene_output);
+		output->data = NULL;
+		wlr_output_layout_remove(server->output_layout, output);
 		return;
 	}
 	mon->server = server;
@@ -253,6 +275,12 @@ void server_layout_change(struct wl_listener *listener, void *data) {
 	wl_list_for_each(tl, &server->toplevels, link) {
 		update_toplevel_output(tl->server, tl);
 	}
+	// 输出位置/作区变化后, 最大化窗口和贴边窗口必须重新适配到新的作区.
+	// 输出被拔掉时这一步也会把原本落在已移除输出上的窗口拉回可用区域.
+	struct wlr_output_layout_output *lo;
+	wl_list_for_each(lo, &server->output_layout->outputs, link) {
+		arrange_toplevels_work_area(server, lo->output);
+	}
 }
 
 void output_manager_apply(struct wl_listener *listener, void *data) {
@@ -270,8 +298,16 @@ void output_manager_apply(struct wl_listener *listener, void *data) {
 	if (ok) {
 		struct wlr_output_configuration_head_v1 *head;
 		wl_list_for_each(head, &config->heads, link) {
-			wlr_output_layout_add(server->output_layout, head->state.output,
-				head->state.x, head->state.y);
+			if (head->state.enabled) {
+				wlr_output_layout_add(server->output_layout,
+					head->state.output, head->state.x,
+					head->state.y);
+			} else {
+				// 被禁用的输出不能继续留在 layout 里: layout 不检查
+				// output->enabled, 否则窗口仍会居中/贴到一块黑屏上.
+				wlr_output_layout_remove(server->output_layout,
+					head->state.output);
+			}
 		}
 	}
 	if (ok) {
