@@ -15,7 +15,7 @@
 //     (其 passthrough 重注入设备) 的按键绝不转发回抓取, 避免事件成环.
 //
 // 候选窗 (input popup surface) 放在 overlay 图层, 靠近文本光标
-// (应用未提供矩形时用指针位置).
+// (应用未提供矩形时用指针位置); 下方放不下时放到光标上一行, 并避开状态栏.
 
 #include "server.h"
 
@@ -387,26 +387,44 @@ void ime_update_popup(struct server *server) {
 
 			int popup_x = lx;
 			int popup_y = ly;
-			// 钳制到光标所在的输出内
+			int pw = scene_surface->surface->current.width;
+			int ph = scene_surface->surface->current.height;
+			// 用文本光标 (应用未提供时用指针) 所在的输出, 并钳制到它的作区:
+			// 作区已排除状态栏等 layer-shell 独占区, 而候选窗在 overlay 层,
+			// 不钳制作区就会盖住状态栏.
+			int ref_x = caret_mapped ? caret_global_x : lx;
+			int ref_y = caret_mapped ? caret_global_y : ly;
 			struct wlr_output *output = wlr_output_layout_output_at(
-				server->output_layout, lx, ly);
+				server->output_layout, ref_x, ref_y);
+			if (output == NULL) {
+				output = wlr_output_layout_output_at(
+					server->output_layout, (int)server->cursor->x,
+					(int)server->cursor->y);
+			}
 			if (output != NULL) {
-				struct wlr_box box;
-				wlr_output_layout_get_box(server->output_layout,
-					output, &box);
-				int pw = scene_surface->surface->current.width;
-				int ph = scene_surface->surface->current.height;
-				if (popup_x + pw > box.x + box.width) {
-					popup_x = box.x + box.width - pw;
+				struct wlr_box area;
+				get_work_area(server, output, &area);
+				// 文本行下方放不下时翻到上一行 (光标上方), 而不是只把框
+				// 顶回屏幕内 - 那样候选窗会压在正在输入的那一行上.
+				int caret_top = caret_mapped ? caret_global_y : ly;
+				int caret_bottom = caret_mapped
+					? caret_global_y + caret.height : ly;
+				if (caret_bottom + ph > area.y + area.height) {
+					popup_y = caret_top - ph;
+				} else {
+					popup_y = caret_bottom;
 				}
-				if (popup_y + ph > box.y + box.height) {
-					popup_y = box.y + box.height - ph;
+				if (popup_x + pw > area.x + area.width) {
+					popup_x = area.x + area.width - pw;
 				}
-				if (popup_x < box.x) {
-					popup_x = box.x;
+				if (popup_x < area.x) {
+					popup_x = area.x;
 				}
-				if (popup_y < box.y) {
-					popup_y = box.y;
+				if (popup_y + ph > area.y + area.height) {
+					popup_y = area.y + area.height - ph;
+				}
+				if (popup_y < area.y) {
+					popup_y = area.y;
 				}
 			}
 
