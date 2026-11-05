@@ -148,11 +148,23 @@ struct toplevel_popup {
 	struct toplevel *tl;
 	struct wlr_xdg_popup *popup;
 	struct wlr_scene_tree *tree;
+	// 上次提交后的布局命中框 (= 该 popup 的 surface 在布局里的位置与尺寸,
+	// popup 不经过 decor 的内容裁切), 用于判断一次提交/消失是否可能改变
+	// 光标下的 surface. 缓存坐标是**上次提交时**的布局坐标, 读取时要按
+	// popup 树节点的位移平移 (见 popup_hit_box_cached): 窗口被拖动、
+	// 或父 popup 重新定位后, 整棵 popup 子树跟着移动, 不平移就会拿一个
+	// 过期位置去比对光标.
+	struct wlr_box hit_box;
+	bool hit_box_valid;
+	// 缓存命中框时 popup 树节点 (pp->tree->node) 的布局坐标. 用树节点而不是
+	// 所属窗口节点, 嵌套 popup (子菜单) 随父 popup 移动时也能正确平移.
+	int hit_box_tree_x, hit_box_tree_y;
 	// 首次提交前的约束跟踪 (定义在 toplevel.c); popup 角色/树先销毁时
 	// 必须一并释放, 否则之后的一次 commit 会解引用已释放的 wlr_xdg_popup
 	struct popup_unconstrain *unconstrain;
 	struct wl_listener tree_destroy;  // 树销毁时释放 pp
-	struct wl_listener commit;
+	struct wl_listener surface_commit;  // popup 提交后刷新命中 (出现/移动)
+	struct wl_listener surface_unmap;   // popup 消失后刷新命中
 	struct wl_listener new_popup;
 	struct wl_listener destroy;
 };
@@ -219,6 +231,24 @@ struct toplevel {
 	// 位置恒取当前节点 (scene_tree->node.x/y), 拖动还原时自动跟随, 无需保存.
 	bool restore_frame_pending;
 	int restore_frame_w, restore_frame_h;
+
+	// 上次提交后的实际命中框: 布局坐标下的内容裁切区 (= 外框内缩一个边框宽,
+	// 与 decor_update() 给场景节点设的 clip 一致). 它变化时, 光标下方
+	// 可能换上/换走本窗口 (如最大化后长到光标底下), 必须重做命中测试,
+	// 否则指针焦点和光标形状要等到下一次 motion 才更新.
+	// 不能用 toplevel_box() (节点 + window geometry) 代替: 最大化/全屏/
+	// 还原中的外框来自作区/输出/保存尺寸, 而客户端不一定在每次缩放时更新
+	// window geometry (wezterm 就只在启动时设一次).
+	// 不复用 decor.c 的 decor_signature: 签名里没有节点位置 (纯移动不改签名),
+	// 且它算完就丢在 decor_update() 里, 拿不到变化结果.
+	// hit_box 存的是上次提交那一刻的布局框, 而窗口在提交之间会被拖动/
+	// 落框 (move_toplevel_to/apply_saved_box/place_toplevel ...), 内容跟着
+	// 节点一起移动. 所以读取时先按节点位移平移 (见 commit 里的 old_hit_box),
+	// 否则窗口移动到光标下面后旧框仍停在原处, 会把"光标已经在窗口上"
+	// 误判成"不在附近", 于是漏掉命中刷新.
+	struct wlr_box hit_box;
+	bool hit_box_valid;
+	int hit_box_node_x, hit_box_node_y;  // 缓存时的 scene_tree->node 位置
 
 	// 自动居中 (place.c): 新窗口在 surface 尺寸变化时重新居中,
 	// 直到用户与之交互 (移动/缩放/最大化/全屏会置 user_moved 并停止).
@@ -476,6 +506,10 @@ struct server {
 	struct wl_event_source *chord_timer; // 双击与按住的判定定时器
 	bool moving;                    // 窗口移动进行中
 	struct toplevel *move_toplevel;
+	// 正在处理的输入事件属于指针 motion 批次 (cursor_motion*): 设备 frame
+	// 事件随后由 cursor_frame() 统一补, 期间合成器自己触发的刷新不该再
+	// 单独补一个 frame (见 refresh_pointer_focus)
+	bool pointer_motion_batch;
 	enum input_mode input_mode;      // PASSTHROUGH / MOVE / RESIZE
 	struct bound_buttons bound_buttons; // 被合成器吞掉的按压
 	double grab_x, grab_y; // 光标相对窗口原点的偏移

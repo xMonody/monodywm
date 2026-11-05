@@ -840,6 +840,8 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 	if (tl->ipc_added) {
 		ipc_send_window_event(server, "window_full", tl);
 	}
+	// 全屏/退出全屏改变了节点位置与尺寸: 光标下的 surface 可能变了
+	refresh_pointer_focus(server);
 }
 
 void set_maximized(struct server *server, struct toplevel *tl,
@@ -872,6 +874,8 @@ void set_maximized(struct server *server, struct toplevel *tl,
 		// 重新声明该框能让最大化请求总有响应.
 		tl->maximize_pending = false;
 		apply_maximized_box(server, tl);
+		// 节点/内容框可能已移到光标底下: 立即重做命中测试, 光标不用等 motion
+		refresh_pointer_focus(server);
 		return;
 	}
 	if (tl->xdg_toplevel->current.maximized == maximized) {
@@ -936,6 +940,10 @@ void set_maximized(struct server *server, struct toplevel *tl,
 	if (tl->fthandle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_maximized(tl->fthandle, maximized);
 	}
+	// 最大化/还原已把节点落到新位置 (或已在途): 光标下的 surface 可能变了.
+	// 在途的落框会在 commit 里再查一次 (hit_box 变化), 这里先刷一次让
+	// 立即落框的路径 (尺寸已 ack) 也不必等鼠标移动.
+	refresh_pointer_focus(server);
 }
 
 // 取消最大化回到之前保存的几何 (拖动最大化窗口的标题栏, 键盘/按钮切换).
@@ -960,6 +968,22 @@ void restore_maximized_toplevel(struct toplevel *tl) {
 	wlr_xdg_toplevel_set_maximized(tl->xdg_toplevel, false);
 	if (tl->fthandle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_maximized(tl->fthandle, false);
+	}
+	// 节点已落在还原位置: 光标可能从窗口上移到桌面 (或相反), 立即重做命中测试.
+	//
+	// 移动/缩放抓取中跳过: 这条路径会被 move_toplevel_to()/restore_for_drag()
+	// 在抓取过程中调到, 而 refresh_pointer_focus() 会再进
+	// process_cursor_motion() -> move_toplevel_to(), 那条路径目前只靠
+	// restore_frame_pending 和 move_max_w/move_max_h 的隐式状态才不重复按比例
+	// 重锚抓取点. 抓取期间每次 motion 都会走一遍光标流程, 结束时也会刷新,
+	// 所以跳过是安全的.
+	//
+	// 抓取开始前 (begin_zone_drag/chord_double_click 调进来时 moving 还没置位)
+	// 这里会真的跑一遍: 此时 process_cursor_motion() 在 zone_press/chord 分支
+	// 提前 return (dragged 已置位但 moving 还没有), 不会动抓取几何, 只是徒劳
+	// 一次刷新, 无害.
+	if (!tl->server->moving && !tl->server->resizing) {
+		refresh_pointer_focus(tl->server);
 	}
 }
 
@@ -1017,8 +1041,16 @@ void set_minimized(struct server *server, struct toplevel *tl,
 		decor_update(tl);
 	}
 	// 隐藏/显示窗口都可能让光标下露出/盖上不同的 surface:
-	// 重做命中测试, 让指针焦点和光标样式立刻跟上
-	refresh_pointer_focus(server);
+	// 重做命中测试, 让指针焦点和光标样式立刻跟上.
+	// 不能按「光标是否在窗口外框内」收窄: popup (菜单/下拉框/提示) 可以伸到
+	// 外框之外, 最小化会把整棵子树一起隐藏, 光标下的 popup 也可能被藏掉 -
+	// 那样指针焦点就会停在一个已经不可见的 surface 上. 最小化不是热路径,
+	// 多刷一次比漏掉便宜.
+	// 抓取进行中不重入: 此时 process_cursor_motion() 只会走 move/resize 分支,
+	// 命中测试根本不会执行, 抓取自己会处理光标.
+	if (!server->moving && !server->resizing) {
+		refresh_pointer_focus(server);
+	}
 }
 
 // 提升 toplevel 的场景节点, 以及声明它为 xdg 父窗口的所有对话框 (递归):
@@ -1296,6 +1328,8 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	tl->maximize_pending = false;
 	tl->pending_frame = false;
 	tl->restore_frame_pending = false;
+	// remap 时会重新 place/落框, 旧的命中框不再可信
+	tl->hit_box_valid = false;
 	if (tl->minimized) {
 		tl->minimized = false;
 		if (tl->fthandle != NULL) {
@@ -1488,7 +1522,85 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 			tl->pending_frame_box.x, tl->pending_frame_box.y);
 		tl->pending_frame = false;
 	}
+	// 显示框变化可能让本窗口长到光标底下, 或从光标下缩走: 重做命中测试,
+	// 让指针焦点/光标形状立刻跟上. 不做的话 (如快捷键最大化一个光标在窗外的
+	// 终端) 光标会停在默认箭头, 要等下一次 motion 才变成客户端的光标.
+	// 命中区取 decor_update() 那个内容裁切框: 外框内缩一个边框宽. 不能用
+	// toplevel_box() 的 (节点 + window geometry): 最大化/全屏的外框来自作区/
+	// 输出, 还原中的外框来自保存的尺寸, 都不看客户端上报的 geometry - 有的
+	// 客户端 (wezterm) 只在启动时设一次 window geometry, 之后缩放不再更新,
+	// 用 geometry 会得到一个过期的小框, 光标已经在窗口里却判定为"不在附近",
+	// 于是永远不重做命中测试.
+	struct wlr_box old_hit_box = tl->hit_box;
+	bool old_hit_box_valid = tl->hit_box_valid;
+	// 距上次提交后窗口可能被拖动/重新落框 (内容跟着节点一起移动): 把缓存的框
+	// 按节点位移平移, 才是它此刻实际覆盖的位置. 不平移的话, 窗口移到光标
+	// 底下后旧框仍停在原处, 下面的 near_cursor 会误判而漏掉刷新.
+	if (old_hit_box_valid) {
+		old_hit_box.x += tl->scene_tree->node.x - tl->hit_box_node_x;
+		old_hit_box.y += tl->scene_tree->node.y - tl->hit_box_node_y;
+	}
+	struct wlr_box frame;
+	toplevel_frame_box(tl->server, tl, &frame);
+	int bw = (int)roundf(decor_border_width(tl));
+	if (bw < 0) {
+		bw = 0;
+	}
+	struct wlr_box hit_box = {
+		.x = frame.x + bw,
+		.y = frame.y + bw,
+		.width = frame.width - 2 * bw,
+		.height = frame.height - 2 * bw,
+	};
+	// 客户端从未设过 geometry 时按维度退回 surface 尺寸
+	if (base != NULL && base->surface != NULL) {
+		if (hit_box.width <= 0) {
+			hit_box.width = base->surface->current.width;
+		}
+		if (hit_box.height <= 0) {
+			hit_box.height = base->surface->current.height;
+		}
+	}
+	bool hit_box_changed = !old_hit_box_valid ||
+		!wlr_box_equal(&old_hit_box, &hit_box);
+	// 未映射/最小化的窗口不在场景里参与命中, 这次提交不可能改变光标下的
+	// surface (map/unmap/最小化/还原自己都会重做命中测试).
+	bool hittable = !tl->minimized && base != NULL &&
+		base->surface != NULL && base->surface->mapped;
+	// 只有光标落在旧框或新框里, 本次几何变化才可能改变光标下的 surface.
+	// 否则 (如光标在别的窗口上, 本窗口在远处做动画) 不做无谓的命中测试,
+	// 也不给光标下那个毫无关系的客户端灌 motion 事件.
+	double cx = tl->server->cursor != NULL ? tl->server->cursor->x : 0;
+	double cy = tl->server->cursor != NULL ? tl->server->cursor->y : 0;
+	bool near_cursor = hittable && tl->server->cursor != NULL &&
+		((old_hit_box_valid &&
+			wlr_box_contains_point(&old_hit_box, cx, cy)) ||
+		 wlr_box_contains_point(&hit_box, cx, cy));
+	// 未映射/最小化的窗口不参与命中, 这次提交不可能改变光标下的 surface,
+	// 也不该把 unmap 刚刚作废的缓存重新标成有效. 等窗口重新可命中时
+	// (remap/还原后的提交) 再重新捕获.
+	if (hittable) {
+		tl->hit_box = hit_box;
+		tl->hit_box_valid = true;
+		tl->hit_box_node_x = tl->scene_tree->node.x;
+		tl->hit_box_node_y = tl->scene_tree->node.y;
+	}
+	// 交互缩放/拖动时命中框每个事件都会变: 日志只在非抓取时打,
+	// 否则 WLR_DEBUG 调试别的问题时会被刷屏.
+	if (hit_box_changed && !tl->server->moving && !tl->server->resizing) {
+		wlr_log(WLR_DEBUG,
+			"cursor: toplevel %d hit box %dx%d+%d+%d near=%d",
+			tl->id, hit_box.width, hit_box.height, hit_box.x,
+			hit_box.y, near_cursor);
+	}
 	decor_update(tl);
+	// decor_update() 先把新的内容 clip 应用到场景节点, 命中结果才与 hit_box 一致.
+	if (hit_box_changed && near_cursor) {
+		refresh_pointer_focus(tl->server);
+	}
+	// process_cursor_motion() 在多条提前 return 的分支 (标题区按压、
+	// wl_data_device 拖拽、隐式抓取) 不会更新光标样式, 而改动前每次提交
+	// 都会调. 这里无条件补一次 (幂等, 代价很小), 不依赖 refresh 的副作用.
 	update_cursor_style(tl->server);
 }
 
@@ -1719,13 +1831,135 @@ static void listener_remove_if_attached(struct wl_listener *listener) {
 	}
 }
 
+// popup 在布局坐标里的命中区: popup 树的位置 - xdg window geometry + surface 尺寸.
+// 场景里 popup 树的位置就是 popup->current.geometry 的布局位置, 而内容又以
+// xdg window geometry 为原点 (wlroots 的 xdg 场景处理器把 surface 树放在树内
+// -geometry 处), 所以 surface 原点是 "树位置 - geometry".
+// 这里不取 "树里第一个子节点" (surface 树): 那依赖 wlroots 内部布局, 一变就
+// 静默失效. 也不用整块 surface 与 popup->current.geometry 求交: CSD popup 的
+// surface 比 geometry 大, 场景本来也按整块 surface 参与命中, 框偏大只会多刷新
+// 一次, 偏小才会漏掉刷新 (第一次点击仍发给旧 surface).
+// 返回 false 表示树被禁用 (所属窗口隐藏/最小化); tree_x/tree_y 带回
+// 本次计算所用的 popup 树节点布局坐标, 供缓存平移使用.
+static bool popup_hit_box(struct toplevel_popup *pp,
+		struct wlr_surface *surface, struct wlr_box *box,
+		int *tree_x, int *tree_y) {
+	struct wlr_xdg_surface *base = pp->popup->base;
+	if (base == NULL) {
+		return false;
+	}
+	int lx, ly;
+	if (!wlr_scene_node_coords(&pp->tree->node, &lx, &ly)) {
+		return false;
+	}
+	*tree_x = lx;
+	*tree_y = ly;
+	*box = (struct wlr_box){
+		.x = lx - base->geometry.x,
+		.y = ly - base->geometry.y,
+		.width = surface->current.width,
+		.height = surface->current.height,
+	};
+	return box->width > 0 && box->height > 0;
+}
+
+// 缓存的命中框按 "缓存时 popup 树节点的布局坐标 -> 现在" 平移.
+// 窗口在提交之间可能被拖动/落框, 父 popup 也可能重新定位, 整棵 popup 子树
+// 跟着移动: 不平移就会拿过期位置去和光标比对, 从而漏掉本该做的命中刷新.
+// 用树节点坐标 (而不是所属窗口节点) 才能覆盖嵌套 popup 随父菜单移动的情况.
+static void popup_hit_box_cached(struct toplevel_popup *pp,
+		struct wlr_box *box) {
+	*box = pp->hit_box;
+	int lx, ly;
+	// 树被禁用时 wlr_scene_node_coords() 也照样算出坐标, 只是返回 false;
+	// 这里只要坐标, 所以不看返回值.
+	(void)wlr_scene_node_coords(&pp->tree->node, &lx, &ly);
+	box->x += lx - pp->hit_box_tree_x;
+	box->y += ly - pp->hit_box_tree_y;
+}
+
+// popup 出现/移动/消失会改变光标下的 surface (菜单、工具提示), 与 toplevel 的
+// 几何提交同理, 需要立即重做命中测试 - 否则第一次点击会发给旧的 surface.
+// 这两个监听器都晚于 wlroots 的场景监听器注册, 所以提交后读到的节点位置已
+// 是本次提交的结果, unmap 时场景节点也已被禁用.
+static void xdg_popup_surface_commit(struct wl_listener *listener, void *data) {
+	struct toplevel_popup *pp = wl_container_of(listener, pp, surface_commit);
+	struct wlr_surface *surface = data;
+	// 初始提交 (还没 buffer) 不会出现在光标下; 映射那一提交会再进来一次
+	if (!surface->mapped) {
+		return;
+	}
+	struct wlr_box box;
+	int tree_x, tree_y;
+	if (!popup_hit_box(pp, surface, &box, &tree_x, &tree_y)) {
+		return;
+	}
+	struct wlr_box old_box = pp->hit_box;
+	bool old_valid = pp->hit_box_valid;
+	if (old_valid) {
+		popup_hit_box_cached(pp, &old_box);
+	}
+	bool changed = !old_valid || !wlr_box_equal(&old_box, &box);
+	pp->hit_box = box;
+	pp->hit_box_valid = true;
+	pp->hit_box_tree_x = tree_x;
+	pp->hit_box_tree_y = tree_y;
+	if (!changed) {
+		return; // 只是内容重绘 (悬停高亮等): 命中结果不可能变
+	}
+	// 与 toplevel 同样的收窄: 只有光标落在旧框/新框里才需要重做命中测试
+	struct server *server = pp->tl->server;
+	if (server->cursor == NULL) {
+		return;
+	}
+	double cx = server->cursor->x;
+	double cy = server->cursor->y;
+	if ((old_valid && wlr_box_contains_point(&old_box, cx, cy)) ||
+			wlr_box_contains_point(&box, cx, cy)) {
+		refresh_pointer_focus(server);
+	}
+}
+
+static void xdg_popup_surface_unmap(struct wl_listener *listener, void *data) {
+	struct toplevel_popup *pp = wl_container_of(listener, pp, surface_unmap);
+	(void)data;
+	struct server *server = pp->tl->server;
+	// popup 已从场景里禁用: 光标下面露出的是别的 surface.
+	// 只有光标本来就在 popup 框内时命中结果才会变 (框是最后一次提交的位置,
+	// 按 popup 树节点位移平移到现在).
+	bool was_near = false;
+	if (pp->hit_box_valid && server->cursor != NULL) {
+		struct wlr_box box;
+		popup_hit_box_cached(pp, &box);
+		was_near = wlr_box_contains_point(&box, server->cursor->x,
+			server->cursor->y);
+	}
+	pp->hit_box_valid = false;
+	if (was_near) {
+		refresh_pointer_focus(server);
+	}
+}
+
 // wlr_xdg_popup 角色对象消失 (菜单关闭/抓取取消): 停止响应它的 new popup 和 destroy 信号.
 // 结构体本身在场景树销毁时由 xdg_popup_tree_destroy 释放.
+//
+// 注意 surface_commit 必须一起摘掉: 它要用 pp->popup->base 读 geometry,
+// 而 pp->popup 马上就要被 wlroots 释放. surface_unmap 则**保留**: 它只用
+// pp->hit_box / pp->tl, 不碰 popup. 角色销毁后 surface 可能还映射着 (树也还在),
+// 客户端通常紧接着销毁 surface - 那次 unmap 仍然需要重做命中测试, 否则指针
+// 焦点会停在已从场景里消失的 popup 上, 直到用户移动鼠标.
+//
+// 保留是有前提的 (wlroots 0.20): destroy_xdg_popup() 先 wlr_surface_unmap()
+// 再发 popup->events.destroy, 所以这个 unmap 一定在 pp->popup 失效前跑完;
+// 而树在 xdg_surface destroy 时被销毁, xdg_popup_tree_destroy() 会把它从
+// surface->events.unmap 上摘掉, 发生在 wl_surface 释放对其 unmap listener
+// 空列表的断言之前. 依赖的是 wlroots 的销毁顺序, 升级 wlroots 时要复查.
 static void xdg_popup_destroy(struct wl_listener *listener, void *data) {
 	struct toplevel_popup *pp = wl_container_of(listener, pp, destroy);
 	(void)data;
 	listener_remove_if_attached(&pp->new_popup);
 	listener_remove_if_attached(&pp->destroy);
+	listener_remove_if_attached(&pp->surface_commit);
 	// popup 角色先销毁 (xdg_popup.destroy) 时 base/surface 可能还活着,
 	// 之后的一次 commit 会解引用已释放的 wlr_xdg_popup
 	if (pp->unconstrain != NULL) {
@@ -1749,6 +1983,8 @@ static void xdg_popup_tree_destroy(struct wl_listener *listener, void *data) {
 	listener_remove_if_attached(&pp->tree_destroy);
 	listener_remove_if_attached(&pp->new_popup);
 	listener_remove_if_attached(&pp->destroy);
+	listener_remove_if_attached(&pp->surface_commit);
+	listener_remove_if_attached(&pp->surface_unmap);
 	free(pp);
 }
 
@@ -1791,6 +2027,13 @@ static void xdg_popup_attach(struct toplevel *tl, struct wlr_xdg_popup *popup,
 	}
 	// 打标签, 使命中测试在 popup 下仍能解析出所属窗口 (scene.c)
 	xdg_surface_tag(pp->tree, TAG_POPUP, popup);
+
+	// 命中测试刷新 (见上面的 xdg_popup_surface_*): 必须在场景树创建之后注册,
+	// 保证排在 wlroots 的提交/取消映射监听器之后.
+	pp->surface_commit.notify = xdg_popup_surface_commit;
+	wl_signal_add(&popup->base->surface->events.commit, &pp->surface_commit);
+	pp->surface_unmap.notify = xdg_popup_surface_unmap;
+	wl_signal_add(&popup->base->surface->events.unmap, &pp->surface_unmap);
 
 	// pp 的生命周期与树完全相同: 树销毁时 (popup xdg surface 消失,
 	// 或 toplevel 的树消失) 下面的监听器释放一切.

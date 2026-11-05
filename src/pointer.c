@@ -1267,6 +1267,26 @@ static bool scene_surface_origin_at_cursor(struct server *server,
 	return true;
 }
 
+// 给 surface 发 enter, 并紧跟着发一次真正送达的 motion.
+//
+// wlr_seat_pointer_enter() 会把内部记录的 surface 坐标设成 enter 的那一点
+// (内部调 wlr_seat_pointer_warp), 而 wlr_seat_pointer_send_motion() 会丢弃与
+// 记录坐标相同的 motion. 所以 "notify_enter(); notify_motion();" 这种写法
+// 客户端只会收到 enter, 收不到 motion - 而有的客户端 (wezterm) 只在 motion
+// 里重设光标, 光标样式就会停在合成器给的默认箭头上, 直到用户真的动一下鼠标.
+// 用 warp(NAN) 把记录坐标标成无效 (与 wlroots 自己清焦点时用法一致),
+// 后续那次 motion 才会真的发出去.
+static void pointer_enter_with_motion(struct server *server,
+		struct wlr_surface *surface, double sx, double sy,
+		uint32_t time_msec) {
+	bool changed = server->seat->pointer_state.focused_surface != surface;
+	wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+	if (changed) {
+		wlr_seat_pointer_warp(server->seat, NAN, NAN);
+	}
+	wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+}
+
 static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 	if (server->drag_tree != NULL) {
 		wlr_scene_node_set_position(&server->drag_tree->node,
@@ -1325,10 +1345,19 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 	// 必须把 enter/motion 喂给它, 否则 drag focus 不会更新, 目标收不到
 	// data_device.enter/drop, 而下面的隐式抓取分支会因为 button_count > 0
 	// 把 motion 全部吞掉. 这里不做隐式抓取处理.
+	//
+	// 这里**不能**用 pointer_enter_with_motion(): drag grab 的 enter/motion
+	// 只是转发 wl_data_device.enter/motion, 本来就不去重, 而它从不更新
+	// seat->pointer_state.focused_surface. 于是按 focused_surface 判断
+	// "焦点变了" 在拖拽期间几乎恒为真, 每个 motion 都会 warp(NAN) 却又
+	// 没有 default grab 把坐标写回去 - 整个拖拽期间 pointer_state.sx/sy
+	// 会是 NaN 而 focused_surface 非空, pointer_constraint_apply() 拿它做
+	// 算术就会把光标算成 NaN.
 	if (server->seat->drag != NULL) {
 		if (surface != NULL) {
 			wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-			wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+			wlr_seat_pointer_notify_motion(server->seat, time_msec,
+				sx, sy);
 		} else {
 			wlr_seat_pointer_notify_clear_focus(server->seat);
 		}
@@ -1379,8 +1408,7 @@ static void process_cursor_motion(struct server *server, uint32_t time_msec) {
 	}
 	update_cursor_style(server);
 	if (surface != NULL) {
-		wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
-		wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+		pointer_enter_with_motion(server, surface, sx, sy, time_msec);
 	} else {
 		wlr_seat_pointer_clear_focus(server->seat);
 	}
@@ -1399,6 +1427,16 @@ void refresh_pointer_focus(struct server *server) {
 	uint32_t now_ms = (uint32_t)now.tv_sec * 1000u +
 		(uint32_t)(now.tv_nsec / 1000000u);
 	process_cursor_motion(server, now_ms);
+	// 合成器自己触发的这次 motion 不由输入设备的 frame 事件驱动, 所以必须
+	// 自己补一个 frame: 按 wl_pointer 协议, 客户端只在收到 frame 后才处理
+	// 之前那批 motion (wezterm 只有这样才会重算光标; 不补就永远停在默认箭头上,
+	// 直到用户真的动一下鼠标).
+	// 但在指针 motion 的处理过程中 (pointer_motion_batch) 不用补: 那批事件
+	// 属于当前输入帧, 随后的设备 frame 事件由 cursor_frame() 统一发送,
+	// 再补一次只会让一个输入帧出现两个 wl_pointer.frame.
+	if (!server->pointer_motion_batch) {
+		wlr_seat_pointer_notify_frame(server->seat);
+	}
 }
 
 static void process_cursor_button(struct server *server, uint32_t time_msec,
@@ -1974,7 +2012,9 @@ void cursor_motion(struct wl_listener *listener, void *data) {
 		return; // 锁定指针: 合成器光标保持不动
 	}
 	wlr_cursor_move(server->cursor, &event->pointer->base, dx, dy);
+	server->pointer_motion_batch = true;
 	process_cursor_motion(server, event->time_msec);
+	server->pointer_motion_batch = false;
 }
 
 void cursor_motion_absolute(struct wl_listener *listener, void *data) {
@@ -1996,7 +2036,9 @@ void cursor_motion_absolute(struct wl_listener *listener, void *data) {
 	// 取整后刚好落在设备映射之外的点
 	wlr_cursor_warp_closest(server->cursor, &event->pointer->base,
 		server->cursor->x + dx, server->cursor->y + dy);
+	server->pointer_motion_batch = true;
 	process_cursor_motion(server, event->time_msec);
+	server->pointer_motion_batch = false;
 }
 
 void cursor_button(struct wl_listener *listener, void *data) {
