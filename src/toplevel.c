@@ -626,37 +626,47 @@ static void apply_saved_box(struct server *server, struct toplevel *tl,
 	decor_update(tl);
 }
 
-// 适配到输出的作区框; 没有输出时返回 false (调用方决定是否退回 0x0)
-static bool apply_maximized_box(struct server *server, struct toplevel *tl) {
-	tl->restore_frame_pending = false;
+// 最大化时的内容框: 外框 = 作区, 客户端内容内缩一个边框宽 (边框画在内容外).
+// 没有输出时返回 false.
+static bool maximized_content_box(struct server *server, struct toplevel *tl,
+		struct wlr_box *box) {
 	struct wlr_output *output = toplevel_output(server, tl);
 	if (output == NULL) {
 		return false;
 	}
-	struct wlr_box box;
-	maximized_box(server, output, &box);
-	// 外框 = 作区; 客户端内容内缩一个边框宽, 边框画在内容之外
+	struct wlr_box frame;
+	maximized_box(server, output, &frame);
 	int bw = (int)roundf(decor_border_width(tl));
-	int cw = box.width - 2 * bw;
-	int ch = box.height - 2 * bw;
-	if (cw < 1) {
-		cw = 1;
+	*box = (struct wlr_box){
+		.x = frame.x + bw,
+		.y = frame.y + bw,
+		.width = frame.width - 2 * bw,
+		.height = frame.height - 2 * bw,
+	};
+	if (box->width < 1) {
+		box->width = 1;
 	}
-	if (ch < 1) {
-		ch = 1;
+	if (box->height < 1) {
+		box->height = 1;
 	}
-	int cx = box.x + bw;
-	int cy = box.y + bw;
-	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, cw, ch);
-	if (toplevel_size_acked(tl, cw, ch)) {
-		wlr_scene_node_set_position(&tl->scene_tree->node, cx, cy);
+	return true;
+}
+
+// 适配到输出的作区框; 没有输出时返回 false (调用方决定是否退回 0x0)
+static bool apply_maximized_box(struct server *server, struct toplevel *tl) {
+	tl->restore_frame_pending = false;
+	struct wlr_box box;
+	if (!maximized_content_box(server, tl, &box)) {
+		return false;
+	}
+	wlr_xdg_toplevel_set_size(tl->xdg_toplevel, box.width, box.height);
+	if (toplevel_size_acked(tl, box.width, box.height)) {
+		wlr_scene_node_set_position(&tl->scene_tree->node, box.x, box.y);
 		tl->pending_frame = false;
 	} else {
 		// configure 还没被 ack: 停在原位, 等客户端确认后再落框
 		tl->pending_frame = true;
-		tl->pending_frame_box = (struct wlr_box){
-			.x = cx, .y = cy, .width = cw, .height = ch,
-		};
+		tl->pending_frame_box = box;
 	}
 	return true;
 }
@@ -776,10 +786,15 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 	tl->pending_frame = false;
 	tl->restore_frame_pending = false;
 	tl->maximize_pending = false;
-	// 在改动 tl->fullscreen 前取当前内容框 (scene_tree 位置 + geometry),
-	// 作为进入全屏时的还原框. 必须是内容框: apply_saved_box 用它 set_size/定位.
+	// 在改动 tl->fullscreen 前取当前内容框, 作为进入全屏时的还原框.
+	// 必须是内容框: apply_saved_box 用它 set_size/定位.
+	// 最大化窗口不能用 node + window geometry: 客户端可能从不更新 geometry
+	// (wezterm), 那会保存一个过期的小框, 退出全屏后窗口缩成小块且无法拖动还原.
 	struct wlr_box from_box;
-	toplevel_box(tl, &from_box);
+	if (!(fullscreen && tl->xdg_toplevel->current.maximized &&
+			maximized_content_box(server, tl, &from_box))) {
+		toplevel_box(tl, &from_box);
+	}
 	if (fullscreen) {
 		// 与 restore_box 分开保存, 免得从最大化进全屏覆盖浮动几何
 		tl->fullscreen_restore_box = from_box;
@@ -1503,15 +1518,19 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 		}
 	}
 	// 几何 (以及光标下的 resize/标题区) 可能变化, 边框/圆角要重新刷新.
-	// 还原 configure 已被 ack (current.* 已翻转) 且客户端已把 window geometry
-	// 缩回到还原尺寸: 丢掉占位尺寸, 改用真实几何. 只看 current.* 会在客户端
-	// ack 但 buffer 仍旧尺寸时提前清掉占位, 又变回"旧尺寸挂在新位置"的闪动.
+	// 还原 configure 已被 ack (current.* 已翻转) 时丢掉占位尺寸, 改用真实几何.
+	// 普通还原要等客户端把 geometry 缩回保存框 (避免旧大 buffer 挂在新位置);
+	// 但退出全屏回到最大化时外框由作区决定, 与 geometry 无关, 而且
+	// current.maximized 为真会让上面的 geometry 条件永远不成立 - 占位框会
+	// 一直卡住, 之后拖动最大化窗口就无法还原.
 	if (tl->restore_frame_pending && base != NULL &&
-			!tl->xdg_toplevel->current.maximized &&
 			!tl->xdg_toplevel->current.fullscreen &&
-			base->geometry.width > 0 && base->geometry.height > 0 &&
-			base->geometry.width <= tl->restore_frame_w &&
-			base->geometry.height <= tl->restore_frame_h) {
+			((tl->xdg_toplevel->current.maximized &&
+			  tl->xdg_toplevel->scheduled.maximized) ||
+			 (!tl->xdg_toplevel->current.maximized &&
+			  base->geometry.width > 0 && base->geometry.height > 0 &&
+			  base->geometry.width <= tl->restore_frame_w &&
+			  base->geometry.height <= tl->restore_frame_h))) {
 		tl->restore_frame_pending = false;
 	}
 	// 客户端 ack 目标 configure 后, 把等待中的目标框落下
