@@ -52,6 +52,37 @@ float decor_border_width(struct toplevel *tl) {
 	return (float)CONFIG_BORDER_WIDTH;
 }
 
+// 取整后的边框宽 (>= 0). 几何相关模块统一用它, 避免每处各自 roundf/判负.
+int decor_bw(struct toplevel *tl) {
+	int bw = (int)roundf(decor_border_width(tl));
+	return bw > 0 ? bw : 0;
+}
+
+// 内容框 -> 显示外框 (内容四边各向外扩一个边框宽).
+void decor_expand_frame_box(struct toplevel *tl, struct wlr_box *box) {
+	int bw = decor_bw(tl);
+	if (bw <= 0) {
+		return;
+	}
+	box->x -= bw;
+	box->y -= bw;
+	box->width += 2 * bw;
+	box->height += 2 * bw;
+}
+
+// 显示外框 -> 内容框 (外框四边各内缩一个边框宽).
+// 结果可能 <= 0, 由调用方决定回退/钳制.
+void decor_frame_to_content_box(struct toplevel *tl,
+		const struct wlr_box *frame, struct wlr_box *content) {
+	int bw = decor_bw(tl);
+	*content = (struct wlr_box){
+		.x = frame->x + bw,
+		.y = frame->y + bw,
+		.width = frame->width - 2 * bw,
+		.height = frame->height - 2 * bw,
+	};
+}
+
 static void decor_border_color(struct toplevel *tl, float out[4]) {
 	uint32_t hex;
 	if (tl->fullscreen) {
@@ -158,16 +189,13 @@ static void decor_top_gradient(struct toplevel *tl, int base_idx, int x0,
 	}
 }
 
-// 重排顶部三段边框 (窗口几何 / 焦点 / 全屏变化时调用)
-static void decor_border_top_update(struct toplevel *tl) {
+// 重排顶部三段边框 (窗口几何 / 焦点 / 全屏变化时调用).
+// w/h/bw 由 decor_update() 已经算好, 这里不再重复求 frame box.
+static void decor_border_top_update(struct toplevel *tl, int w, int h,
+		int bw) {
 	if (tl->scene_tree == NULL) {
 		return;
 	}
-	struct wlr_box box;
-	toplevel_frame_box(tl->server, tl, &box);
-	int w = box.width;
-	int h = box.height;
-	int bw = (int)roundf(decor_border_width(tl));
 	if (w <= 0 || h <= 0 || bw <= 0) {
 		for (int i = 0; i < DECOR_BORDER_TOP_RECTS; i++) {
 			if (tl->border_top[i] != NULL) {
@@ -411,13 +439,6 @@ static void decor_apply_rounding(struct toplevel *tl, int w, int h,
 		decor_iter_buffer, &it);
 }
 
-// 背景模糊: 和 swayfx 一样对整块窗口内容区做模糊, 不设透明掩码, 也不额外叠色,
-// 所以悬浮/透明窗口下面会自然透出被模糊的背景, 玻璃颜色随窗口自身背景色变化.
-static bool decor_blur_enabled(struct toplevel *tl) {
-	(void)tl;
-	return CONFIG_BLUR;
-}
-
 // 组装 decor_update() 的几何/状态签名. 只包含客户端 buffer 内容之外的输入:
 // buffer 本身只影响圆角重放 (见 decor_update), 不影响这里缓存的几何.
 static void decor_signature_build(struct toplevel *tl, int fw, int fh, int bw,
@@ -478,25 +499,13 @@ void decor_update(struct toplevel *tl) {
 	toplevel_frame_box(tl->server, tl, &box);
 	int fw = box.width;
 	int fh = box.height;
-	int bw = (int)roundf(decor_border_width(tl));
-	if (bw < 0) {
-		bw = 0;
-	}
+	int bw = decor_bw(tl);
 	int w = fw - 2 * bw;
 	int h = fh - 2 * bw;
 	if (fw <= 0 || fh <= 0 || w <= 0 || h <= 0) {
-		if (tl->border != NULL) {
-			wlr_scene_node_set_enabled(&tl->border->node, false);
-		}
-		if (tl->shadow != NULL) {
-			wlr_scene_node_set_enabled(&tl->shadow->node, false);
-		}
-		if (tl->blur != NULL) {
-			wlr_scene_node_set_enabled(&tl->blur->node, false);
-		}
-		decor_border_top_update(tl);
-		// 几何无效: 装饰节点已被关闭, 缓存作废, 下次有效几何必须完整重建
-		tl->decor_sig.valid = false;
+		// 几何无效: 关闭所有装饰节点并作废缓存, 下次有效几何必须完整重建.
+		// decor_hide() 正是做这件事 (含顶部三段), 不再手写一遍.
+		decor_hide(tl);
 		return;
 	}
 
@@ -593,7 +602,7 @@ void decor_update(struct toplevel *tl) {
 		// 背景模糊: 覆盖整块窗口内容区, 圆角与窗口一致. 和 swayfx 一样不设透明掩码:
 		// 模糊整块背景, 由窗口自身的半透明内容去混合, 所以不需要指定任何颜色.
 		if (tl->blur != NULL) {
-			if (decor_blur_enabled(tl)) {
+			if (CONFIG_BLUR) {
 				wlr_scene_node_set_enabled(&tl->blur->node, true);
 				wlr_scene_node_set_position(&tl->blur->node, 0, 0);
 				wlr_scene_blur_set_size(tl->blur, w, h);
@@ -618,7 +627,7 @@ void decor_update(struct toplevel *tl) {
 		}
 
 		// 顶部三段边框 (随窗口几何/焦点/全屏变化重排)
-		decor_border_top_update(tl);
+		decor_border_top_update(tl, fw, fh, bw);
 	}
 
 	// 圆角必须在每次提交重放: 客户端可能新建覆盖窗口四角的 subsurface buffer,

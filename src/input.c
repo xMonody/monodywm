@@ -59,44 +59,85 @@ static void client_cursor_shape_client_destroy(struct wl_listener *listener,
 	}
 }
 
-// 只在监听器仍挂着时移除: 对已摘下的 link 调 wl_list_remove 会破坏它曾所在的链表
-static void listener_remove_if_attached(struct wl_listener *listener) {
-	if (listener->link.prev != NULL) {
-		wl_list_remove(&listener->link);
-	}
-}
+// wl_pointer.set_cursor 与 cursor-shape-v1 的公共前置流程.
+// 返回 APPLY 时调用方可以立即显示光标; STORE 表示请求已记下但要延后
+// (抓取/按钮按住期间), IGNORE 表示不是聚焦客户端、直接丢弃.
+enum cursor_request_action {
+	CURSOR_REQUEST_IGNORE,
+	CURSOR_REQUEST_STORE,
+	CURSOR_REQUEST_APPLY,
+};
 
-void seat_request_set_cursor(struct wl_listener *listener, void *data) {
-	struct server *server = wl_container_of(listener, server,
-		seat_request_set_cursor);
-	struct wlr_seat_pointer_request_set_cursor_event *event = data;
+static enum cursor_request_action cursor_request_begin(struct server *server,
+		struct wlr_seat_client *seat_client) {
 	// 只接受当前聚焦客户端的请求: 其余直接丢弃, 避免记住别的客户端的光标
-	if (event->seat_client != server->seat->pointer_state.focused_client) {
-		return;
+	if (seat_client != server->seat->pointer_state.focused_client) {
+		return CURSOR_REQUEST_IGNORE;
 	}
-	// 合成器交互式移动/缩放或隐式抓取 (按钮按住) 期间, 可见光标由抓取方决定:
-	// 记住客户端最新的偏好但延后应用, 抓取结束后由 update_cursor_style() 恢复.
-	// 必须在存储前记下 pending, 因为下面的边框区分支可能直接 return.
-	// 若直接丢弃请求, 它会永远丢失, 而客户端认为已生效不会重发,
-	// 光标便卡在抓取开始时的样式, 直到重新 enter 或下一次点击.
+	// 合成器交互式移动/缩放或隐式抓取 (按钮按住) 期间, 可见光标由抓取方
+	// 决定: 记住客户端最新的偏好但延后应用, 抓取结束后由
+	// update_cursor_style() 恢复. 若直接丢弃请求, 它会永远丢失, 而客户端
+	// 认为已生效不会重发, 光标便卡在抓取开始时的样式.
 	bool defer = server->input_mode != INPUT_MODE_PASSTHROUGH ||
 		server->seat->pointer_state.button_count > 0;
 	if (defer) {
 		server->client_cursor_pending = true;
 	}
-	// 光标 surface 覆盖此前设置的任何光标形状
-	// (混用两种协议的客户端: 最后一次请求生效)
+	return defer ? CURSOR_REQUEST_STORE : CURSOR_REQUEST_APPLY;
+}
+
+// 两种光标协议互斥: 最后一次请求生效, 清掉另一套状态
+static void cursor_forget_shape(struct server *server) {
 	server->client_cursor_shape = 0;
 	if (server->client_cursor_shape_client != NULL) {
 		listener_remove_if_attached(
 			&server->client_cursor_shape_client_destroy);
 		server->client_cursor_shape_client = NULL;
 	}
+}
+
+static void cursor_forget_surface(struct server *server) {
+	if (server->client_cursor_surface != NULL) {
+		listener_remove_if_attached(&server->client_cursor_destroy);
+		server->client_cursor_surface = NULL;
+	}
+}
+
+// 合成器自己的边框区 (标题栏/resize 边缘) 或进行中的覆盖接管光标:
+// 客户端仍收到 motion 并保留悬停反馈, 但不能立即改光标. 返回 true 表示
+// 可见光标当前由合成器接管 (并顺手把覆盖光标重新套上).
+// 被捕获的指针 (pointer-constraints) 即使在边框区也属于客户端 - 由
+// respect_constraint 控制 (只用于 wl_pointer.set_cursor 的原有语义).
+static bool cursor_owned_by_compositor(struct server *server,
+		bool respect_constraint) {
+	if (respect_constraint && pointer_constraint_active(server)) {
+		return false;
+	}
+	if (server->cursor_override != NULL) {
+		// 进入 surface 会让客户端重新请求光标; 当我们接管光标
+		// (标题区/resize 边缘) 时, 立即重新套用自己的光标,
+		// 让样式在进入时就改变, 而不是等到下一次 motion
+		wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
+			server->cursor_override);
+	}
+	return pointer_over_frame_zone(server) || server->cursor_override != NULL;
+}
+
+void seat_request_set_cursor(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server,
+		seat_request_set_cursor);
+	struct wlr_seat_pointer_request_set_cursor_event *event = data;
+	enum cursor_request_action action =
+		cursor_request_begin(server, event->seat_client);
+	if (action == CURSOR_REQUEST_IGNORE) {
+		return;
+	}
+	// 光标 surface 覆盖此前设置的任何光标形状
+	// (混用两种协议的客户端: 最后一次请求生效)
+	cursor_forget_shape(server);
 	// 记住客户端光标, 以便合成器光标覆盖 (标题栏/resize 边缘) 结束后恢复
 	if (server->client_cursor_surface != event->surface) {
-		if (server->client_cursor_surface != NULL) {
-			listener_remove_if_attached(&server->client_cursor_destroy);
-		}
+		cursor_forget_surface(server);
 		server->client_cursor_surface = event->surface;
 		if (event->surface != NULL) {
 			server->client_cursor_destroy.notify =
@@ -107,25 +148,12 @@ void seat_request_set_cursor(struct wl_listener *listener, void *data) {
 	}
 	server->client_cursor_hotspot_x = event->hotspot_x;
 	server->client_cursor_hotspot_y = event->hotspot_y;
-	// 合成器自己的边框区 (标题栏/resize 边缘) 或进行中的覆盖接管光标:
-	// 客户端仍收到 motion 并保留悬停反馈, 但不能立即改光标.
 	// 仍要记住客户端的偏好 - 否则离开边框区后 reapply_client_cursor()
 	// 无光标可恢复, 就会错误地退回默认箭头.
-	// 被捕获的指针 (pointer-constraints) 即使在边框区也属于客户端,
-	// 所以它可以在那里设置或隐藏自己的光标.
-	if (!pointer_constraint_active(server) &&
-			(pointer_over_frame_zone(server) ||
-			 server->cursor_override != NULL)) {
-		if (server->cursor_override != NULL) {
-			// 进入 surface 会让客户端重新请求光标; 当我们接管光标
-			// (标题区/resize 边缘) 时, 立即重新套用自己的光标,
-			// 让样式在进入时就改变, 而不是等到下一次 motion
-			wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
-				server->cursor_override);
-		}
+	if (cursor_owned_by_compositor(server, true)) {
 		return;
 	}
-	if (defer) {
+	if (action == CURSOR_REQUEST_STORE) {
 		return;
 	}
 	wlr_cursor_set_surface(server->cursor, event->surface,
@@ -162,17 +190,11 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 			WLR_CURSOR_SHAPE_MANAGER_V1_DEVICE_TYPE_POINTER) {
 		return; // 本合成器不支持数位板
 	}
-	// 只接受当前聚焦客户端发的形状: 非聚焦客户端的请求直接丢弃,
-	// 避免把别的窗口的形状记成当前窗口的
-	if (event->seat_client != server->seat->pointer_state.focused_client) {
+	// 只接受当前聚焦客户端的请求 (原因见 cursor_request_begin)
+	enum cursor_request_action action =
+		cursor_request_begin(server, event->seat_client);
+	if (action == CURSOR_REQUEST_IGNORE) {
 		return;
-	}
-	// 合成器交互式移动/缩放或隐式抓取 (按钮按住) 期间, 可见光标由抓取方
-	// 决定: 记住最新形状并延后应用 (原因见 seat_request_set_cursor).
-	bool defer = server->input_mode != INPUT_MODE_PASSTHROUGH ||
-		server->seat->pointer_state.button_count > 0;
-	if (defer) {
-		server->client_cursor_pending = true;
 	}
 	// 自己画装饰但从不协商 xdg-decoration 的客户端 (Firefox、无 CSD 的 Chromium 等)
 	// 被视为无装饰窗口: 合成器接管其边框并负责 resize 边缘和光标.
@@ -197,10 +219,7 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 	// 记住该形状, 以便 pointer.c 在合成器光标覆盖结束后恢复;
 	// 形状覆盖更早的光标 surface (混用协议: 最后一次请求生效).
 	// 跟踪所属 seat client, 避免把过期形状显示给别的客户端.
-	if (server->client_cursor_surface != NULL) {
-		wl_list_remove(&server->client_cursor_destroy.link);
-		server->client_cursor_surface = NULL;
-	}
+	cursor_forget_surface(server);
 	if (server->client_cursor_shape_client != event->seat_client) {
 		if (server->client_cursor_shape_client != NULL) {
 			listener_remove_if_attached(
@@ -219,14 +238,10 @@ void seat_request_set_shape(struct wl_listener *listener, void *data) {
 	// 客户端只为同一次 enter 发一次 set_shape; 若这里直接丢弃,
 	// 离开边框区后 reapply_client_cursor() 无形状可恢复, 就会错误地
 	// 退回默认箭头 (如终端文本框的竖线丢失).
-	if (pointer_over_frame_zone(server) || server->cursor_override != NULL) {
-		if (server->cursor_override != NULL) {
-			wlr_cursor_set_xcursor(server->cursor, server->xcursor_manager,
-				server->cursor_override);
-		}
+	if (cursor_owned_by_compositor(server, false)) {
 		return;
 	}
-	if (defer) {
+	if (action == CURSOR_REQUEST_STORE) {
 		return;
 	}
 	// 自己渲染形状: 图像来自合成器 xcursor 主题并按当前输出缩放,
@@ -356,23 +371,6 @@ bool keyboard_is_typing(struct wlr_input_device *device) {
 		libinput_device_keyboard_has_key(dev, KEY_SPACE);
 }
 
-// 这个键盘是输入法自己的 passthrough 虚拟键盘吗?
-// 它绝不能成为 seat 键盘, 否则真实键盘上的按键会绕过输入法.
-static bool keyboard_emulated_by_ime(struct server *server,
-		struct wlr_keyboard *keyboard) {
-	if (keyboard == NULL || server->input_method == NULL ||
-			server->input_method->resource == NULL) {
-		return false;
-	}
-	struct wlr_virtual_keyboard_v1 *vk =
-		wlr_input_device_get_virtual_keyboard(&keyboard->base);
-	if (vk == NULL || vk->resource == NULL) {
-		return false;
-	}
-	return wl_resource_get_client(vk->resource) ==
-		wl_resource_get_client(server->input_method->resource);
-}
-
 static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	struct keyboard *kb = wl_container_of(listener, kb, modifiers);
 	struct server *server = kb->server;
@@ -389,44 +387,6 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 			cycle_end(server);
 		}
 	}
-}
-
-// 记录被合成器快捷键消费的按下键码; 其释放也必须吞掉
-// (键码用 evdev 原始值, 与 wlr_keyboard_key_event.keycode 一致).
-// 自动重复会再次投递 PRESSED, 已记录的直接跳过.
-static void keyboard_consumed_add(struct keyboard *kb, uint32_t keycode) {
-	for (size_t i = 0; i < kb->consumed_key_count; i++) {
-		if (kb->consumed_keys[i] == keycode) {
-			return;
-		}
-	}
-	if (kb->consumed_key_count >=
-			sizeof(kb->consumed_keys) / sizeof(kb->consumed_keys[0])) {
-		return; // 记录满: 退回旧行为, 释放可能被转发
-	}
-	kb->consumed_keys[kb->consumed_key_count++] = keycode;
-}
-
-// 该键的按下是否已被合成器快捷键消费? (自动重复/后续释放都要继续吞掉)
-static bool keyboard_consumed_contains(struct keyboard *kb, uint32_t keycode) {
-	for (size_t i = 0; i < kb->consumed_key_count; i++) {
-		if (kb->consumed_keys[i] == keycode) {
-			return true;
-		}
-	}
-	return false;
-}
-
-// 该释放是否属于之前被消费的按下? 是则移除并返回 true
-static bool keyboard_consumed_remove(struct keyboard *kb, uint32_t keycode) {
-	for (size_t i = 0; i < kb->consumed_key_count; i++) {
-		if (kb->consumed_keys[i] == keycode) {
-			kb->consumed_keys[i] =
-				kb->consumed_keys[--kb->consumed_key_count];
-			return true;
-		}
-	}
-	return false;
 }
 
 // 相对循环游标 (或当前聚焦窗口) 的下一个/上一个已映射 toplevel, 会绕回链表.
@@ -472,10 +432,7 @@ void focus_window(struct server *server, struct toplevel *tl) {
 	if (tl == NULL) {
 		return;
 	}
-	if (tl->minimized) {
-		set_minimized(server, tl, false);
-	}
-	focus_toplevel(server, tl);
+	activate_toplevel(server, tl);
 	update_cursor_style(server);
 }
 
@@ -625,14 +582,8 @@ static bool keyboard_shortcut(struct server *server,
 				wl_display_terminate(server->display);
 				return true;
 			case CONFIG_ACTION_MAXIMIZE:
-				if (server->focused != NULL) {
-					if (server->focused->xdg_toplevel->current.maximized) {
-						// 切换: 还原最大化前保存的尺寸/位置
-						restore_maximized_toplevel(server->focused);
-					} else {
-						set_maximized(server, server->focused, true);
-					}
-				}
+				// 切换: 还原最大化前保存的尺寸/位置
+				toggle_maximized_toplevel(server, server->focused);
 				return true;
 			case CONFIG_ACTION_MINIMIZE:
 				if (server->focused != NULL) {
@@ -720,16 +671,16 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	//  - 其他键盘正常到达聚焦客户端.
 	bool handled = false;
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		if (keyboard_consumed_contains(kb, event->keycode)) {
+		if (key_set_contains(&kb->consumed, NULL, event->keycode)) {
 			// 自动重复的键: 它的初次按下已被合成器消费. 不再重新匹配
 			// 绑定 (修饰符可能已经变化, 否则会误触发另一条动作),
 			// 也绝不能作为孤立 press 发给客户端.
 			handled = true;
 		} else if (keyboard_shortcut(server, kb->keyboard, keycode)) {
 			handled = true;
-			keyboard_consumed_add(kb, event->keycode);
+			key_set_add(&kb->consumed, NULL, event->keycode);
 		}
-	} else if (keyboard_consumed_remove(kb, event->keycode)) {
+	} else if (key_set_remove(&kb->consumed, NULL, event->keycode)) {
 		// 按下被合成器快捷键消费: 释放也必须吞掉, 不能作为孤立 release
 		// 发给客户端 (被消费的键不会到达 IM, 所以这里是 seat 客户端路径)
 		handled = true;
@@ -794,8 +745,8 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 		struct keyboard *candidate;
 		wl_list_for_each(candidate, &server->keyboards, link) {
 			if (keyboard_is_typing(&candidate->keyboard->base) &&
-					!keyboard_emulated_by_ime(server,
-						candidate->keyboard)) {
+					!keyboard_emulated_by_input_method(candidate->keyboard,
+						server->input_method)) {
 				next = candidate->keyboard;
 				break;
 			}
@@ -970,7 +921,8 @@ static void keyboard_attach(struct server *server,
 	// 建立, 无法按 client 识别它是 IM 的 vk). 真实键盘到达后应当接管.
 	struct wlr_keyboard *current = wlr_seat_get_keyboard(server->seat);
 	bool typing = keyboard_is_typing(device);
-	bool emulated_by_ime = keyboard_emulated_by_ime(server, keyboard);
+	bool emulated_by_ime = keyboard_emulated_by_input_method(keyboard,
+		server->input_method);
 	bool current_is_virtual = current != NULL &&
 		wlr_input_device_get_virtual_keyboard(&current->base) != NULL;
 	bool incoming_is_real =

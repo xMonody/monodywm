@@ -97,8 +97,7 @@ static bool is_double_click(struct server *server, uint32_t button) {
 	}
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	int64_t dt = (now.tv_sec - server->last_release_time.tv_sec) * 1000000000L
-		+ (now.tv_nsec - server->last_release_time.tv_nsec);
+	int64_t dt = time_diff_ns(&now, &server->last_release_time);
 	return dt >= 0 && dt <= CONFIG_DOUBLE_CLICK_NS;
 }
 
@@ -167,18 +166,13 @@ static void clamp_drag_position(struct server *server, struct toplevel *tl,
 	if (output == NULL) {
 		return;
 	}
-	struct wlr_box out;
-	wlr_output_layout_get_box(server->output_layout, output, &out);
-	struct wlr_box area;
-	get_work_area(server, output, &area);
+	struct wlr_box out, area;
+	get_output_boxes(server, output, &out, &area);
 
 	// *x/*y 是内容坐标, 外框是内容向外扩一个边框宽. 必须用候选坐标算外框:
 	// 若拿窗口当前 (旧) 位置的外框去修正, 每次修正只是相对上一帧的偏移,
 	// 拖动到状态栏下方时会与光标钳制互相追打, 窗口持续抖动.
-	double bw = decor_border_width(tl);
-	if (bw < 0) {
-		bw = 0;
-	}
+	double bw = decor_bw(tl);
 	double left = *x - bw;
 	double top = *y - bw;
 	double right = left + box.width + 2 * bw;
@@ -200,11 +194,8 @@ static void clamp_drag_position(struct server *server, struct toplevel *tl,
 // 钳制到其下输出的作区, 让它保持在状态栏之上可见.
 // 窗口跟随光标且没有底部限制, 所以它可以滑过状态栏并移出屏幕.
 static void clamp_move_cursor(struct server *server) {
-	struct wlr_output *output = wlr_output_layout_output_at(
-		server->output_layout, server->cursor->x, server->cursor->y);
-	if (output == NULL) {
-		output = wlr_output_layout_get_center_output(server->output_layout);
-	}
+	struct wlr_output *output = output_at_or_center(server,
+		server->cursor->x, server->cursor->y);
 	if (output == NULL) {
 		return;
 	}
@@ -249,10 +240,7 @@ static void move_toplevel_to(struct server *server, double lx, double ly) {
 		if (server->move_deferred_restore && tl->has_restore_box &&
 				tl->restore_box.width > 0 && server->move_max_w > 0) {
 			// 按比例把抓取点从最大化外框映射进还原外框 (都含边框)
-			int bw = (int)roundf(decor_border_width(tl));
-			if (bw < 0) {
-				bw = 0;
-			}
+			int bw = decor_bw(tl);
 			server->grab_x = (server->grab_x + bw) *
 				(tl->restore_box.width + 2 * bw) /
 				server->move_max_w - bw;
@@ -290,14 +278,7 @@ static void restore_for_drag(struct toplevel *tl, double *ref_x, double *ref_y) 
 	rb.x = tl->scene_tree->node.x;
 	rb.y = tl->scene_tree->node.y;
 	// 抓住的是合成器外框 (含边框): 允许按压落在边框那一圈上 (如标题条)
-	int bw = (int)roundf(decor_border_width(tl));
-	if (bw < 0) {
-		bw = 0;
-	}
-	rb.x -= bw;
-	rb.y -= bw;
-	rb.width += 2 * bw;
-	rb.height += 2 * bw;
+	decor_expand_frame_box(tl, &rb);
 	if (tl->has_restore_box && rb.width > 0) {
 		if (*ref_x < rb.x) {
 			*ref_x = rb.x;
@@ -368,6 +349,16 @@ static void arm_zone_timer(struct server *server) {
 // 边缘缩放
 // ------------------------------------------------------------------
 
+// 合成器是否负责这个窗口的边框/缩放手柄: 无 CSD、非最大化/全屏、
+// 非对话框/固定尺寸. toplevel_resize_edges 与 cursor_in_cursor_band 共用.
+static bool toplevel_compositor_frame(struct toplevel *tl) {
+	return !(tl->minimized || tl->xdg_toplevel->base == NULL ||
+		tl->decoration_mode ==
+			WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
+		tl->xdg_toplevel->current.maximized || tl->fullscreen ||
+		toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl));
+}
+
 // 光标位于 toplevel 的哪些边缘. 只有合成器拥有的窗口 (无客户端侧装饰) 在这里缩放;
 // CSD 窗口自行处理边缘. 顶部条本身是标题栏, 但它的两个角区 (左上/右上)
 // 是对角缩放柄. 每个抓取区跨骑边缘: CONFIG_EDGE_THICKNESS 的一半在窗口框外,
@@ -380,11 +371,7 @@ static uint32_t toplevel_resize_edges(struct server *server,
 	if (pointer_over_popup(server) || pointer_over_layer_surface(server)) {
 		return 0;
 	}
-	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
-			tl->decoration_mode ==
-				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
-			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
-			toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
+	if (!toplevel_compositor_frame(tl)) {
 		// 对话框和固定尺寸窗口 (如 QQ 登录) 绝不缩放,
 		// 所以它们的边缘也不会出现缩放光标
 		return 0;
@@ -455,35 +442,18 @@ static const char *resize_cursor_name(uint32_t edges) {
 }
 
 // ------------------------------------------------------------------
-// bound buttons (类似 labwc): 合成器吞掉的按压
+// bound buttons (类似 labwc): 合成器吞掉的按压, 用 util.h 的 key_set 记录
 // ------------------------------------------------------------------
 
-static bool bound_button_contains(struct bound_buttons *bb, uint32_t value) {
-	for (int i = 0; i < bb->size; i++) {
-		if (bb->values[i] == value) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void bound_button_add(struct bound_buttons *bb, uint32_t value) {
-	if (bound_button_contains(bb, value)) {
+// 只有按压到达过客户端时才转发释放; 被合成器吞掉的按压保持释放也被吞.
+static void notify_button_release(struct server *server, uint32_t time_msec,
+		uint32_t button, bool was_bound) {
+	if (was_bound) {
 		return;
 	}
-	if (bb->size >= BOUND_BUTTONS_MAX) {
-		return;
-	}
-	bb->values[bb->size++] = value;
-}
-
-static void bound_button_remove(struct bound_buttons *bb, uint32_t value) {
-	for (int i = 0; i < bb->size; i++) {
-		if (bb->values[i] == value) {
-			bb->values[i] = bb->values[--bb->size];
-			return;
-		}
-	}
+	wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+		WL_POINTER_BUTTON_STATE_RELEASED);
+	wlr_seat_pointer_notify_frame(server->seat);
 }
 
 static void set_cursor_override(struct server *server, const char *name) {
@@ -581,11 +551,7 @@ static struct toplevel *toplevel_nearby(struct server *server) {
 // (如 clash-verge 的 ew_resize) 存在抓取区外一点, 光标离开边缘后又被过期地恢复.
 static bool cursor_in_cursor_band(struct server *server,
 		struct toplevel *tl) {
-	if (tl->minimized || tl->xdg_toplevel->base == NULL ||
-			tl->decoration_mode ==
-				WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE ||
-			tl->xdg_toplevel->current.maximized || tl->fullscreen ||
-			toplevel_is_dialog(tl) || toplevel_is_fixed_size(tl)) {
+	if (!toplevel_compositor_frame(tl)) {
 		return false;
 	}
 	struct wlr_box box;
@@ -713,13 +679,7 @@ static void resize_outline_show(struct server *server, struct wlr_box *box_in) {
 	// 轮廓画在合成器外框上 (与拖动的手柄所在框一致)
 	struct wlr_box box = *box_in;
 	if (server->resize_toplevel != NULL) {
-		int bw = (int)roundf(decor_border_width(server->resize_toplevel));
-		if (bw > 0) {
-			box.x -= bw;
-			box.y -= bw;
-			box.width += 2 * bw;
-			box.height += 2 * bw;
-		}
+		decor_expand_frame_box(server->resize_toplevel, &box);
 	}
 	int t = 2;
 	struct wlr_scene_rect **e = server->resize_outline_edges;
@@ -1024,18 +984,37 @@ static void arm_chord_timer(struct server *server) {
 // 负责清空, 避免悬空指针.
 void end_chord(struct server *server) {
 	disarm_chord_timer(server);
-	disarm_zone_timer(server);
-	server->moving = false;
-	server->input_mode = INPUT_MODE_PASSTHROUGH;
-	server->move_deferred_restore = false;
-	server->move_toplevel = NULL;
-	server->zone_toplevel = NULL;
-	server->zone_press = false;
-	server->dragged = false;
-	server->zone_action = ZONE_NONE;
+	// 结束和弦可能正在进行的移动/标题栏抓取; end_move 会清掉这些状态
+	// (以及 zone 定时器), 这里只补上和弦自己的字段.
+	end_move(server);
 	server->chord_active = false;
 	server->chord_pending = false;
 	server->chord_moving = false;
+}
+
+// 和弦消费了某个按钮的按下: 其释放也必须吞掉 (即使和弦提前结束).
+static void chord_swallow_set(struct server *server, uint32_t button,
+		bool swallow) {
+	if (button == BTN_LEFT) {
+		server->chord_swallow_left = swallow;
+	} else if (button == BTN_RIGHT) {
+		server->chord_swallow_right = swallow;
+	}
+}
+
+// 取走该按钮的吞掉标志 (读取并清空)
+static bool chord_swallow_take(struct server *server, uint32_t button) {
+	if (button == BTN_LEFT) {
+		bool swallow = server->chord_swallow_left;
+		server->chord_swallow_left = false;
+		return swallow;
+	}
+	if (button == BTN_RIGHT) {
+		bool swallow = server->chord_swallow_right;
+		server->chord_swallow_right = false;
+		return swallow;
+	}
+	return false;
 }
 
 // 双击动作取决于按住的是哪个按钮:
@@ -1049,11 +1028,7 @@ static void chord_double_click(struct server *server, uint32_t chord_button) {
 	if (chord_button == BTN_LEFT) {
 		// 按住的是右键
 		focus_toplevel(server, tl);
-		if (tl->xdg_toplevel->current.maximized) {
-			restore_maximized_toplevel(tl);
-		} else {
-			set_maximized(server, tl, true);
-		}
+		toggle_maximized_toplevel(server, tl);
 	} else {
 		// 按住的是左键
 		close_toplevel(tl);
@@ -1077,11 +1052,7 @@ static void begin_chord(struct server *server, uint32_t button) {
 	// 触发按钮的按压被合成器吞掉
 	server->press_x = server->cursor->x;
 	server->press_y = server->cursor->y;
-	if (button == BTN_LEFT) {
-		server->chord_swallow_left = true;
-	} else {
-		server->chord_swallow_right = true;
-	}
+	chord_swallow_set(server, button, true);
 	// 注意: 被按住按钮的释放不需要额外的吞掉标志 -
 	// 若其按压作为标题区按压被吞, 它已在 bound_buttons 里,
 	// 释放要么由 process_chord_button (zone_press) 吞掉,
@@ -1111,11 +1082,7 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 	if (button == server->chord_button) {
 		if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
 			// 这次按压被和弦消费: 其释放也要吞掉 (即使和弦就此结束)
-			if (button == BTN_LEFT) {
-				server->chord_swallow_left = true;
-			} else {
-				server->chord_swallow_right = true;
-			}
+			chord_swallow_set(server, button, true);
 			// 双击窗口内的第二次按下: 用户双击了另一个按钮 ->
 			// 最大化 (按住右键) 或关闭 (按住左键)
 			if (is_double_click(server, button)) {
@@ -1144,11 +1111,7 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 		} else {
 			end_chord(server);
 		}
-		if (button == BTN_LEFT) {
-			server->chord_swallow_left = false;
-		} else {
-			server->chord_swallow_right = false;
-		}
+		chord_swallow_set(server, button, false);
 		return;
 	}
 
@@ -1158,18 +1121,10 @@ static void process_chord_button(struct server *server, uint32_t time_msec,
 		bool zone = server->zone_press;
 		// 被吞的标题区按压记在 bound_buttons 里; 这里清除它,
 		// 使过期条目绝不会吞掉之后的释放
-		bound_button_remove(&server->bound_buttons, button);
+		key_set_remove(&server->bound_buttons, NULL, button);
 		end_chord(server);
-		if (!zone) {
-			wlr_seat_pointer_notify_button(server->seat, time_msec,
-				button, state);
-			wlr_seat_pointer_notify_frame(server->seat);
-		}
-		if (button == BTN_LEFT) {
-			server->chord_swallow_left = false;
-		} else {
-			server->chord_swallow_right = false;
-		}
+		notify_button_release(server, time_msec, button, zone);
+		chord_swallow_set(server, button, false);
 		// 和弦移动在释放任一按钮时结束. 触发键的释放路径已经刷新过光标,
 		// 但先释放的是被按住的另一个按钮时, 这里是最后一次按压被通知给
 		// 客户端的地方: 必须在 notify_button 之后再算一次光标样式,
@@ -1422,11 +1377,7 @@ void refresh_pointer_focus(struct server *server) {
 		update_cursor_style(server);
 		return;
 	}
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	uint32_t now_ms = (uint32_t)now.tv_sec * 1000u +
-		(uint32_t)(now.tv_nsec / 1000000u);
-	process_cursor_motion(server, now_ms);
+	process_cursor_motion(server, current_time_ms());
 	// 合成器自己触发的这次 motion 不由输入设备的 frame 事件驱动, 所以必须
 	// 自己补一个 frame: 按 wl_pointer 协议, 客户端只在收到 frame 后才处理
 	// 之前那批 motion (wezterm 只有这样才会重算光标; 不补就永远停在默认箭头上,
@@ -1449,19 +1400,16 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		// 约束激活前被合成器吞掉的按压 (正在进行的抓取) 保持其释放被吞,
 		// 所以不会投递孤立的释放.
 		if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
-			bool swallow = bound_button_contains(&server->bound_buttons,
-				button);
-			bound_button_remove(&server->bound_buttons, button);
+			bool swallow = key_set_contains(&server->bound_buttons,
+				NULL, button);
+			key_set_remove(&server->bound_buttons, NULL, button);
 			if (button == BTN_LEFT) {
 				server->left_button_held = false;
-				swallow = swallow || server->chord_swallow_left;
-				server->chord_swallow_left = false;
 			}
 			if (button == BTN_RIGHT) {
 				server->right_button_held = false;
-				swallow = swallow || server->chord_swallow_right;
-				server->chord_swallow_right = false;
 			}
+			swallow = swallow || chord_swallow_take(server, button);
 			if (swallow) {
 				return;
 			}
@@ -1546,19 +1494,12 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
 		// 单一决策点 (labwc 风格): 合成器吞掉的每次按压都记录在 bound_buttons,
 		// 所以只有未被记录的释放才到达客户端.
-		bool was_bound = bound_button_contains(&server->bound_buttons,
-			button);
-		bound_button_remove(&server->bound_buttons, button);
+		bool was_bound = key_set_contains(&server->bound_buttons, NULL, button);
+		key_set_remove(&server->bound_buttons, NULL, button);
 
 		// 和弦消费了该按钮的按压但提前结束 (如被按住的按钮先释放):
 		// 吞掉释放, 使客户端绝不会看到没有匹配按压的孤立释放
-		if ((button == BTN_LEFT && server->chord_swallow_left) ||
-				(button == BTN_RIGHT && server->chord_swallow_right)) {
-			if (button == BTN_LEFT) {
-				server->chord_swallow_left = false;
-			} else {
-				server->chord_swallow_right = false;
-			}
+		if (chord_swallow_take(server, button)) {
 			// 这个释放被吞掉, 没有 notify_button 来降低 button_count.
 			// 和弦已经结束时仍要立即恢复光标, 不能等下一次 motion.
 			update_cursor_style(server);
@@ -1567,25 +1508,17 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 
 		if (server->resizing) {
 			end_resize(server);
-			if (!was_bound) {
-				// 客户端发起的缩放 (xdg_toplevel.resize): 其按压被转发过,
-				// 所以释放也必须转发
-				wlr_seat_pointer_notify_button(server->seat, time_msec,
-					button, state);
-				wlr_seat_pointer_notify_frame(server->seat);
-			}
+			// 客户端发起的缩放 (xdg_toplevel.resize): 其按压被转发过,
+			// 所以释放也必须转发
+			notify_button_release(server, time_msec, button, was_bound);
 			update_cursor_style(server);
 			return;
 		}
 		if (server->moving) {
 			end_move(server);
-			if (!was_bound) {
-				// 客户端发起的移动 (xdg_toplevel.move): 其按压被转发过,
-				// 所以释放也必须转发
-				wlr_seat_pointer_notify_button(server->seat, time_msec,
-					button, state);
-				wlr_seat_pointer_notify_frame(server->seat);
-			}
+			// 客户端发起的移动 (xdg_toplevel.move): 其按压被转发过,
+			// 所以释放也必须转发
+			notify_button_release(server, time_msec, button, was_bound);
 			update_cursor_style(server);
 			return;
 		}
@@ -1604,11 +1537,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 						break;
 					case ZONE_MAXIMIZE:
 						focus_toplevel(server, tl);
-						if (tl->xdg_toplevel->current.maximized) {
-							restore_maximized_toplevel(tl);
-						} else {
-							set_maximized(server, tl, true);
-						}
+						toggle_maximized_toplevel(server, tl);
 						break;
 					case ZONE_CLOSE:
 						close_toplevel(tl);
@@ -1642,7 +1571,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 
 	// WLR_BUTTON_PRESSED
 	if (server->moving || server->zone_press || server->resizing) {
-		bound_button_add(&server->bound_buttons, button);
+		key_set_add(&server->bound_buttons, NULL, button);
 		return; // 已经抓取: 吞掉, 释放也必须吞掉
 	}
 
@@ -1673,7 +1602,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 		if (edges != 0 &&
 				((edges & WLR_EDGE_TOP) != 0 ||
 				 !is_in_titlebar_zone(server, tl))) {
-			bound_button_add(&server->bound_buttons, button);
+			key_set_add(&server->bound_buttons, NULL, button);
 			begin_resize(server, tl, edges);
 			return;
 		}
@@ -1681,7 +1610,7 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 	if (tl != NULL && !tl->minimized && is_in_titlebar_zone(server, tl)) {
 		// 接管: 彩色顶部条是我们可见的标题栏
 		focus_toplevel(server, tl);
-		bound_button_add(&server->bound_buttons, button);
+		key_set_add(&server->bound_buttons, NULL, button);
 		server->zone_press = true;
 		server->zone_toplevel = tl;
 		server->zone_button = button;
@@ -1712,10 +1641,8 @@ static void process_cursor_button(struct server *server, uint32_t time_msec,
 static bool wheel_action_allowed(struct server *server) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	int64_t gap = (now.tv_sec - server->wheel_last_tick.tv_sec) * 1000000000L
-		+ (now.tv_nsec - server->wheel_last_tick.tv_nsec);
-	int64_t dur = (now.tv_sec - server->wheel_burst_start.tv_sec) * 1000000000L
-		+ (now.tv_nsec - server->wheel_burst_start.tv_nsec);
+	int64_t gap = time_diff_ns(&now, &server->wheel_last_tick);
+	int64_t dur = time_diff_ns(&now, &server->wheel_burst_start);
 	server->wheel_last_tick = now;
 	if (gap >= 0 && gap < CONFIG_WHEEL_TICK_GAP_NS &&
 			dur >= 0 && dur <= CONFIG_WHEEL_BURST_NS) {
@@ -1783,12 +1710,7 @@ static void process_cursor_axis(struct server *server, uint32_t time_msec,
 			return; // 吞掉: 仍在同一手势内
 		}
 		if (event->delta_discrete < 0) {
-			if (tl->xdg_toplevel->current.maximized) {
-				// 已最大化: 还原保存的几何
-				restore_maximized_toplevel(tl);
-			} else {
-				set_maximized(server, tl, true);
-			}
+			toggle_maximized_toplevel(server, tl);
 		} else if (tl->minimized) {
 			// 已最小化: 还原 (显示) 窗口
 			set_minimized(server, tl, false);

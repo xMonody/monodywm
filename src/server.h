@@ -10,6 +10,7 @@
 
 // 所有可调项 (快捷键、边缘抓取区)
 #include "config.h"
+#include "util.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -67,6 +68,15 @@ struct scene_tag {
 	struct wl_listener destroy; // 节点销毁时释放该标签
 };
 
+// 一次提交时的命中框缓存 (toplevel 与 popup 共用).
+// box 是缓存时的布局框, anchor_x/anchor_y 是当时所属场景节点的布局坐标;
+// 读取时按锚点位移平移, 窗口/popup 在提交之间被拖动也能得到当前位置.
+struct hit_cache {
+	struct wlr_box box;
+	int anchor_x, anchor_y;
+	bool valid;
+};
+
 #include <scenefx/types/wlr_scene.h>
 
 struct ipc_client;     // 定义在 ipc.c
@@ -84,13 +94,6 @@ struct ime_keyboard {
 	struct wlr_keyboard *keyboard;
 	struct wl_list link; // ime.keyboards
 	struct wl_listener modifiers;
-};
-
-// 已转发给 IM 抓取的按下键; 同一 keycode 可能同时来自多块键盘,
-// 释放时必须按 (keyboard, keycode) 配对, 不能只按 keycode.
-struct ime_forwarded_key {
-	struct wlr_keyboard *keyboard;
-	uint32_t keycode;
 };
 
 // 一个已连接的输入法 (fcitx5/ibus); 只使用第一个
@@ -113,9 +116,9 @@ struct ime {
 	struct wlr_keyboard *last_keyboard;
 	bool keyboard_grab_destroy_added; // 抓取 destroy 监听器已挂接
 
-	// 已转发给 IM 抓取的按下键; 用于抑制没有匹配按下的杂散释放事件
-	struct ime_forwarded_key forwarded_keys[16];
-	size_t forwarded_key_count;
+	// 已转发给 IM 抓取的按下键; 同一 keycode 可能同时来自多块键盘,
+	// 释放时必须按 (keyboard, keycode) 配对, 不能只按 keycode.
+	struct key_set forwarded;
 
 	// IM (fcitx5) 显示的候选窗. 协议允许同时存在多个 popup surface,
 	// 所以每个都单独跟踪 (struct ime_popup, 定义在 ime.c).
@@ -150,16 +153,10 @@ struct toplevel_popup {
 	struct wlr_scene_tree *tree;
 	// 上次提交后的布局命中框 (= 该 popup 的 surface 在布局里的位置与尺寸,
 	// popup 不经过 decor 的内容裁切), 用于判断一次提交/消失是否可能改变
-	// 光标下的 surface. 缓存坐标是**上次提交时**的布局坐标, 读取时要按
-	// popup 树节点的位移平移 (见 popup_hit_box_cached): 窗口被拖动、
-	// 或父 popup 重新定位后, 整棵 popup 子树跟着移动, 不平移就会拿一个
-	// 过期位置去比对光标.
-	struct wlr_box hit_box;
-	bool hit_box_valid;
-	// 缓存命中框时 popup 树节点 (pp->tree->node) 的布局坐标. 用树节点而不是
-	// 所属窗口节点, 嵌套 popup (子菜单) 随父 popup 移动时也能正确平移.
-	int hit_box_tree_x, hit_box_tree_y;
-	// 首次提交前的约束跟踪 (定义在 toplevel.c); popup 角色/树先销毁时
+	// 光标下的 surface. 锚点是 popup 树节点 (pp->tree->node) 的布局坐标:
+	// 嵌套 popup (子菜单) 随父 popup 移动时也能正确平移.
+	struct hit_cache hit;
+	// 首次提交前的约束跟踪 (popup.c); popup 角色/树先销毁时
 	// 必须一并释放, 否则之后的一次 commit 会解引用已释放的 wlr_xdg_popup
 	struct popup_unconstrain *unconstrain;
 	struct wl_listener tree_destroy;  // 树销毁时释放 pp
@@ -168,6 +165,16 @@ struct toplevel_popup {
 	struct wl_listener new_popup;
 	struct wl_listener destroy;
 };
+
+// ---- popup.c: xdg_popup 首次提交前的输出约束 ----
+// 两处 popup (toplevel / layer) 共用; 输出与坐标原点由回调提供.
+struct popup_unconstrain;
+struct popup_unconstrain *popup_unconstrain_create(struct server *server,
+	struct wlr_xdg_popup *popup,
+	struct wlr_output *(*get_output)(void *data, struct server *server),
+	void (*get_origin)(void *data, int *x, int *y),
+	struct popup_unconstrain **owner, void *data);
+void popup_unconstrain_free(struct popup_unconstrain *pu);
 
 // ---- decor.c: scenefx 圆角 / 边框 / 阴影 ----
 // 顶部三段边框 (最小化/最大化/关闭手势区) 用 3 个段 rect + 2*STEPS 个渐变 rect 拼成
@@ -239,16 +246,9 @@ struct toplevel {
 	// 不能用 toplevel_box() (节点 + window geometry) 代替: 最大化/全屏/
 	// 还原中的外框来自作区/输出/保存尺寸, 而客户端不一定在每次缩放时更新
 	// window geometry (wezterm 就只在启动时设一次).
-	// 不复用 decor.c 的 decor_signature: 签名里没有节点位置 (纯移动不改签名),
-	// 且它算完就丢在 decor_update() 里, 拿不到变化结果.
-	// hit_box 存的是上次提交那一刻的布局框, 而窗口在提交之间会被拖动/
-	// 落框 (move_toplevel_to/apply_saved_box/place_toplevel ...), 内容跟着
-	// 节点一起移动. 所以读取时先按节点位移平移 (见 commit 里的 old_hit_box),
-	// 否则窗口移动到光标下面后旧框仍停在原处, 会把"光标已经在窗口上"
-	// 误判成"不在附近", 于是漏掉命中刷新.
-	struct wlr_box hit_box;
-	bool hit_box_valid;
-	int hit_box_node_x, hit_box_node_y;  // 缓存时的 scene_tree->node 位置
+	// 窗口在提交之间会被拖动/落框, 内容跟着节点一起移动, 所以缓存带锚点,
+	// 读取时按节点位移平移, 见 hit_cache_translated().
+	struct hit_cache hit;
 
 	// 自动居中 (place.c): 新窗口在 surface 尺寸变化时重新居中,
 	// 直到用户与之交互 (移动/缩放/最大化/全屏会置 user_moved 并停止).
@@ -359,13 +359,6 @@ enum input_mode {
 	INPUT_MODE_PASSTHROUGH = 0,
 	INPUT_MODE_MOVE,
 	INPUT_MODE_RESIZE,
-};
-
-// 合成器吞掉的按钮按下 (其释放也被吞掉, 绝不到达客户端); 镜像 labwc 的 bound_buttons
-#define BOUND_BUTTONS_MAX 8
-struct bound_buttons {
-	uint32_t values[BOUND_BUTTONS_MAX];
-	int size;
 };
 
 // IPC Unix 域套接字路径长度 (<sys/un.h> 的 sun_path 为 108 字节)
@@ -511,7 +504,7 @@ struct server {
 	// 单独补一个 frame (见 refresh_pointer_focus)
 	bool pointer_motion_batch;
 	enum input_mode input_mode;      // PASSTHROUGH / MOVE / RESIZE
-	struct bound_buttons bound_buttons; // 被合成器吞掉的按压
+	struct key_set bound_buttons; // 被合成器吞掉的按压 (owner = NULL)
 	double grab_x, grab_y; // 光标相对窗口原点的偏移
 	// 隐式抓取 (按钮按住) 期间被抓 surface 的布局原点. 抓取可能发生在
 	// popup / subsurface / layer surface 上, 这些 surface 不能通过
@@ -611,6 +604,11 @@ void xdg_surface_tag(struct wlr_scene_tree *tree, enum scene_tag_type type,
 void *scene_tag_at(struct server *server, enum scene_tag_type type,
 	double lx, double ly);
 struct toplevel *toplevel_at(struct server *server);
+// 命中框缓存: store 记录新框与当前场景锚点, translated 按锚点位移取当前位置
+void hit_cache_store(struct hit_cache *cache, const struct wlr_box *box,
+	int anchor_x, int anchor_y);
+struct wlr_box hit_cache_translated(const struct hit_cache *cache,
+	int anchor_x, int anchor_y);
 // 光标位于 popup surface (菜单/下拉框/工具提示) 上: popup 在合成器边框
 // (resize 边缘、标题栏) 之前赢得指针
 bool pointer_over_popup(struct server *server);
@@ -644,6 +642,7 @@ void set_fullscreen(struct server *server, struct toplevel *tl,
 	bool fullscreen);
 void set_maximized(struct server *server, struct toplevel *tl,
 	bool maximized);
+void toggle_maximized_toplevel(struct server *server, struct toplevel *tl);
 void restore_maximized_toplevel(struct toplevel *tl);
 void set_minimized(struct server *server, struct toplevel *tl,
 	bool minimized);
@@ -666,6 +665,12 @@ void decor_update(struct toplevel *tl);
 void decor_hide(struct toplevel *tl);
 void decor_focus_changed(struct toplevel *tl, struct toplevel *prev);
 float decor_border_width(struct toplevel *tl);
+// 取整后的边框宽 (>= 0), 以及内容框 <-> 显示外框的换算.
+// 所有几何相关模块都走这两个 helper, 不再各自 roundf/内缩.
+int decor_bw(struct toplevel *tl);
+void decor_expand_frame_box(struct toplevel *tl, struct wlr_box *box);
+void decor_frame_to_content_box(struct toplevel *tl,
+	const struct wlr_box *frame, struct wlr_box *content);
 
 // ---- place.c: 初始窗口放置 ----
 // 尺寸完全由客户端决定, 位置在输出 (屏幕) 上居中
@@ -674,12 +679,19 @@ bool place_toplevel(struct server *server, struct toplevel *tl);
 // ---- layer.c: wlr-layer-shell + 作区 ----
 void get_work_area(struct server *server, struct wlr_output *output,
 	struct wlr_box *area);
+// 按当前输出框给一个 layer surface 重新计算布局 (output.c 的布局变化也用它)
+void layer_surface_configure(struct layer_surface *ls);
 void server_new_layer_surface(struct wl_listener *listener, void *data);
 // 释放交互 layer surface 的键盘持有 (若有), 并在同一步把 seat 键盘交给 `surface`
 // (NULL 清空)
 void layer_keyboard_clear(struct server *server, struct wlr_surface *surface);
 
 // ---- output.c: 显示器 + 输出管理 ----
+// 布局点所在输出 (退回中心输出), 以及输出的完整框 + 作区
+struct wlr_output *output_at_or_center(struct server *server, double lx,
+	double ly);
+void get_output_boxes(struct server *server, struct wlr_output *output,
+	struct wlr_box *full, struct wlr_box *work);
 void server_new_output(struct wl_listener *listener, void *data);
 void server_layout_change(struct wl_listener *listener, void *data);
 // 背景/底部层变化时让所有输出的预模糊缓存失效 (layer.c 调用)
@@ -689,6 +701,8 @@ void output_manager_test(struct wl_listener *listener, void *data);
 
 // ---- input.c: seat、键盘、快捷键 ----
 void focus_window(struct server *server, struct toplevel *tl);
+// 还原最小化 (若有) 并聚焦: activation / 任务栏 / 快捷键共用的入口
+void activate_toplevel(struct server *server, struct toplevel *tl);
 void seat_request_set_cursor(struct wl_listener *listener, void *data);
 void seat_request_set_shape(struct wl_listener *listener, void *data);
 void seat_request_set_selection(struct wl_listener *listener, void *data);
@@ -714,13 +728,14 @@ struct keyboard {
 
 	// 被合成器快捷键消费的按下键码 (evdev, 与 event->keycode 一致):
 	// 其释放也必须吞掉, 客户端绝不能收到没有对应按下的 release
-	uint32_t consumed_keys[16];
-	size_t consumed_key_count;
+	struct key_set consumed;
 };
 
 // ---- input.c: seat、键盘焦点、快捷键 ----
-void server_new_virtual_keyboard(struct wl_listener *listener, void *data);
 bool keyboard_is_typing(struct wlr_input_device *device);
+// 这块键盘是否是某个输入法自己的 passthrough 虚拟键盘 (绝不能当 seat 键盘)
+bool keyboard_emulated_by_input_method(struct wlr_keyboard *keyboard,
+	struct wlr_input_method_v2 *input_method);
 // 把 seat 键盘移到某个 surface (NULL 清空焦点)
 void seat_keyboard_focus(struct server *server, struct wlr_surface *surface);
 // 结束 next/prev 循环切换状态; 当前焦点窗口保持现状.

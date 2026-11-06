@@ -42,8 +42,7 @@ static void monitor_frame(struct wl_listener *listener, void *data) {
 	struct monitor *mon = wl_container_of(listener, mon, frame);
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	uint32_t now_ms = (uint32_t)now.tv_sec * 1000u +
-		(uint32_t)(now.tv_nsec / 1000000u);
+	uint32_t now_ms = current_time_ms();
 	if (!wlr_scene_output_commit(mon->scene_output, NULL)) {
 		return;
 	}
@@ -147,6 +146,27 @@ static void monitor_destroy(struct wl_listener *listener, void *data) {
 	free(mon);
 }
 
+// 布局坐标点所在输出; 不在任何输出上时退回中心输出.
+// place/pointer/toplevel/popup 的多处 fallback 共用这一份.
+struct wlr_output *output_at_or_center(struct server *server, double lx,
+		double ly) {
+	struct wlr_output *output = wlr_output_layout_output_at(
+		server->output_layout, lx, ly);
+	if (output == NULL) {
+		output = wlr_output_layout_get_center_output(server->output_layout);
+	}
+	return output;
+}
+
+// 输出的完整布局框与作区 (作区扣除 layer-shell 独占区)
+void get_output_boxes(struct server *server, struct wlr_output *output,
+		struct wlr_box *full, struct wlr_box *work) {
+	wlr_output_layout_get_box(server->output_layout, output, full);
+	if (work != NULL) {
+		get_work_area(server, output, work);
+	}
+}
+
 static void update_output_manager_config(struct server *server) {
 	struct wlr_output_configuration_v1 *config =
 		wlr_output_configuration_v1_create();
@@ -160,21 +180,11 @@ static void update_output_manager_config(struct server *server) {
 	wlr_output_manager_v1_set_configuration(server->output_manager, config);
 }
 
+// 布局变化后按输出重新配置所有 layer surface (单 surface 的实现在 layer.c)
 static void arrange_layer_surfaces(struct server *server) {
 	struct layer_surface *ls;
 	wl_list_for_each(ls, &server->layer_surfaces, link) {
-		struct wlr_output *output = ls->layer_surface->output;
-		if (output == NULL) {
-			output = wlr_output_layout_get_center_output(server->output_layout);
-		}
-		if (output == NULL) {
-			continue;
-		}
-		struct wlr_box full_area;
-		wlr_output_layout_get_box(server->output_layout, output, &full_area);
-		struct wlr_box usable_area = full_area;
-		wlr_scene_layer_surface_v1_configure(ls->scene_layer, &full_area,
-			&usable_area);
+		layer_surface_configure(ls);
 	}
 }
 
@@ -283,19 +293,19 @@ void server_layout_change(struct wl_listener *listener, void *data) {
 	}
 }
 
-void output_manager_apply(struct wl_listener *listener, void *data) {
-	struct server *server = wl_container_of(listener, server,
-		output_manager_apply);
-	struct wlr_output_configuration_v1 *config = data;
+// wlr-output-management 的 apply/test 共用实现:
+// 先测配置, apply 时再真正 commit 并同步输出布局.
+static void output_manager_handle(struct server *server,
+		struct wlr_output_configuration_v1 *config, bool apply) {
 	size_t states_len = 0;
 	struct wlr_backend_output_state *states =
 		wlr_output_configuration_v1_build_state(config, &states_len);
 	bool ok = wlr_backend_test(server->backend, states, states_len);
-	if (ok) {
+	if (ok && apply) {
 		ok = wlr_backend_commit(server->backend, states, states_len);
 	}
 	free(states);
-	if (ok) {
+	if (ok && apply) {
 		struct wlr_output_configuration_head_v1 *head;
 		wl_list_for_each(head, &config->heads, link) {
 			if (head->state.enabled) {
@@ -318,19 +328,14 @@ void output_manager_apply(struct wl_listener *listener, void *data) {
 	wlr_output_configuration_v1_destroy(config);
 }
 
+void output_manager_apply(struct wl_listener *listener, void *data) {
+	struct server *server = wl_container_of(listener, server,
+		output_manager_apply);
+	output_manager_handle(server, data, true);
+}
+
 void output_manager_test(struct wl_listener *listener, void *data) {
 	struct server *server = wl_container_of(listener, server,
 		output_manager_test);
-	struct wlr_output_configuration_v1 *config = data;
-	size_t states_len = 0;
-	struct wlr_backend_output_state *states =
-		wlr_output_configuration_v1_build_state(config, &states_len);
-	bool ok = wlr_backend_test(server->backend, states, states_len);
-	free(states);
-	if (ok) {
-		wlr_output_configuration_v1_send_succeeded(config);
-	} else {
-		wlr_output_configuration_v1_send_failed(config);
-	}
-	wlr_output_configuration_v1_destroy(config);
+	output_manager_handle(server, data, false);
 }

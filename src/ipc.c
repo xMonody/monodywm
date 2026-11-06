@@ -130,6 +130,15 @@ static bool ipc_client_flush(struct ipc_client *client) {
 	return true;
 }
 
+// 还有待发送输出时保持可写事件开启
+static void ipc_client_update_mask(struct ipc_client *client) {
+	uint32_t mask = WL_EVENT_READABLE;
+	if (client->out_off < client->out_len) {
+		mask |= WL_EVENT_WRITABLE;
+	}
+	wl_event_source_fd_update(client->source, mask);
+}
+
 static void ipc_client_queue(struct ipc_client *client, const char *json) {
 	if (client->dead) {
 		return;
@@ -154,12 +163,30 @@ static void ipc_client_queue(struct ipc_client *client, const char *json) {
 	if (!ipc_client_flush(client)) {
 		return;
 	}
-	// 还有待发送输出时保持可写事件开启
-	uint32_t mask = WL_EVENT_READABLE;
-	if (client->out_off < client->out_len) {
-		mask |= WL_EVENT_WRITABLE;
+	ipc_client_update_mask(client);
+}
+
+// 发送一条已序列化的 JSON; target 为 NULL 时广播给所有客户端
+static void ipc_broadcast(struct server *server, const char *json,
+		struct ipc_client *target) {
+	if (target != NULL) {
+		ipc_client_queue(target, json);
+		return;
 	}
-	wl_event_source_fd_update(client->source, mask);
+	struct ipc_client *client, *tmp;
+	wl_list_for_each_safe(client, tmp, &server->ipc_clients, link) {
+		ipc_client_queue(client, json);
+	}
+}
+
+// 请求里的 "id" -> 存活的 toplevel (缺失/非法/已消失时为 NULL)
+static struct toplevel *ipc_request_toplevel(struct server *server,
+		cJSON *root) {
+	cJSON *id = cJSON_GetObjectItem(root, "id");
+	if (id == NULL || !cJSON_IsNumber(id)) {
+		return NULL;
+	}
+	return toplevel_by_id(server, (int)id->valuedouble);
 }
 
 // 处理客户端发来的一条完整 JSON 消息
@@ -175,42 +202,25 @@ static void ipc_handle_line(struct server *server, struct ipc_client *client,
 			ipc_send_window_list(server, client);
 		} else if (strcmp(action->valuestring, "focus_window") == 0) {
 			// 任务栏点击了窗口图标: 切换焦点过去
-			cJSON *id = cJSON_GetObjectItem(root, "id");
-			if (id != NULL && cJSON_IsNumber(id)) {
-				struct toplevel *tl =
-					toplevel_by_id(server, (int)id->valuedouble);
-				if (tl != NULL) {
-					focus_window(server, tl);
-				}
+			struct toplevel *tl = ipc_request_toplevel(server, root);
+			if (tl != NULL) {
+				focus_window(server, tl);
 			}
 		} else if (strcmp(action->valuestring, "close_window") == 0) {
-			cJSON *id = cJSON_GetObjectItem(root, "id");
-			if (id != NULL && cJSON_IsNumber(id)) {
-				struct toplevel *tl =
-					toplevel_by_id(server, (int)id->valuedouble);
-				if (tl != NULL) {
-					close_toplevel(tl);
-				}
+			struct toplevel *tl = ipc_request_toplevel(server, root);
+			if (tl != NULL) {
+				close_toplevel(tl);
 			}
 		} else if (strcmp(action->valuestring, "maximize_window") == 0) {
 			// 切换: 未最大化则最大化, 已最大化则还原
-			cJSON *id = cJSON_GetObjectItem(root, "id");
-			if (id != NULL && cJSON_IsNumber(id)) {
-				struct toplevel *tl =
-					toplevel_by_id(server, (int)id->valuedouble);
-				if (tl != NULL) {
-					set_maximized(server, tl,
-						!tl->xdg_toplevel->current.maximized);
-				}
+			struct toplevel *tl = ipc_request_toplevel(server, root);
+			if (tl != NULL) {
+				toggle_maximized_toplevel(server, tl);
 			}
 		} else if (strcmp(action->valuestring, "minimize_window") == 0) {
-			cJSON *id = cJSON_GetObjectItem(root, "id");
-			if (id != NULL && cJSON_IsNumber(id)) {
-				struct toplevel *tl =
-					toplevel_by_id(server, (int)id->valuedouble);
-				if (tl != NULL) {
-					set_minimized(server, tl, true);
-				}
+			struct toplevel *tl = ipc_request_toplevel(server, root);
+			if (tl != NULL) {
+				set_minimized(server, tl, true);
 			}
 		}
 	}
@@ -255,11 +265,7 @@ static int ipc_client_handle_data(int fd, uint32_t mask, void *data) {
 		if (!ipc_client_flush(client)) {
 			return 0; // 写失败已销毁客户端
 		}
-		uint32_t new_mask = WL_EVENT_READABLE;
-		if (client->out_off < client->out_len) {
-			new_mask |= WL_EVENT_WRITABLE;
-		}
-		wl_event_source_fd_update(client->source, new_mask);
+		ipc_client_update_mask(client);
 	}
 	if ((mask & WL_EVENT_READABLE) != 0) {
 		char buf[4096];
@@ -335,10 +341,7 @@ void ipc_send_window_event(struct server *server, const char *event,
 	}
 	char *json = cJSON_PrintUnformatted(root);
 	if (json != NULL) {
-		struct ipc_client *client, *tmp;
-		wl_list_for_each_safe(client, tmp, &server->ipc_clients, link) {
-			ipc_client_queue(client, json);
-		}
+		ipc_broadcast(server, json, NULL);
 		free(json);
 	}
 	cJSON_Delete(root);
@@ -384,14 +387,7 @@ static void ipc_send_window_list(struct server *server,
 	cJSON_AddNumberToObject(root, "focused_id", focused_id);
 	char *json = cJSON_PrintUnformatted(root);
 	if (json != NULL) {
-		if (target != NULL) {
-			ipc_client_queue(target, json);
-		} else {
-			struct ipc_client *client, *tmp;
-			wl_list_for_each_safe(client, tmp, &server->ipc_clients, link) {
-				ipc_client_queue(client, json);
-			}
-		}
+		ipc_broadcast(server, json, target);
 		free(json);
 	}
 	cJSON_Delete(root);

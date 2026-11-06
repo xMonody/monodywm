@@ -40,77 +40,26 @@ static bool same_client(struct wlr_text_input_v3 *ti,
 
 // 这个键盘是输入法自己的 passthrough 虚拟键盘吗?
 // 来自它的按键本身就是 IM 的输出, 绝不能送回 IM 抓取
-// (否则按键会在合成器与 IM 之间成环).
-static bool is_keyboard_emulated_by_input_method(struct wlr_keyboard *keyboard,
+// (否则按键会在合成器与 IM 之间成环), 也绝不能成为 seat 键盘.
+// input.c 与 ime.c 共用这一份判断.
+bool keyboard_emulated_by_input_method(struct wlr_keyboard *keyboard,
 		struct wlr_input_method_v2 *input_method) {
-	if (keyboard == NULL || input_method == NULL) {
+	if (keyboard == NULL || input_method == NULL ||
+			input_method->resource == NULL) {
 		return false;
 	}
 	struct wlr_virtual_keyboard_v1 *vk =
 		wlr_input_device_get_virtual_keyboard(&keyboard->base);
-	return vk != NULL &&
-		wl_resource_get_client(vk->resource) ==
+	if (vk == NULL || vk->resource == NULL) {
+		return false;
+	}
+	return wl_resource_get_client(vk->resource) ==
 		wl_resource_get_client(input_method->resource);
 }
 
-// ---- 已转发按键记账: 只有匹配的按下被转发过, 才转发释放
-//      (IM 可能在某个键已按下后才抓取键盘) ----
-
-static bool ime_key_forwarded(struct ime *ime,
-		struct wlr_keyboard *keyboard, uint32_t keycode) {
-	for (size_t i = 0; i < ime->forwarded_key_count; i++) {
-		if (ime->forwarded_keys[i].keyboard == keyboard &&
-				ime->forwarded_keys[i].keycode == keycode) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void ime_key_forwarded_add(struct ime *ime,
-		struct wlr_keyboard *keyboard, uint32_t keycode) {
-	// 自动重复会反复投递 PRESSED; 同一个物理按键只能占一个槽位,
-	// 否则长按一个键就会把数组填满, 导致之后其他键的 release 被吞.
-	if (ime_key_forwarded(ime, keyboard, keycode)) {
-		return;
-	}
-	if (ime->forwarded_key_count >=
-			sizeof(ime->forwarded_keys) / sizeof(ime->forwarded_keys[0])) {
-		return;
-	}
-	struct ime_forwarded_key *key =
-		&ime->forwarded_keys[ime->forwarded_key_count++];
-	key->keyboard = keyboard;
-	key->keycode = keycode;
-}
-
-static void ime_key_forwarded_remove(struct ime *ime,
-		struct wlr_keyboard *keyboard, uint32_t keycode) {
-	for (size_t i = 0; i < ime->forwarded_key_count; i++) {
-		if (ime->forwarded_keys[i].keyboard == keyboard &&
-				ime->forwarded_keys[i].keycode == keycode) {
-			ime->forwarded_keys[i] =
-				ime->forwarded_keys[--ime->forwarded_key_count];
-			return;
-		}
-	}
-}
-
-// 键盘被拔掉时其按键不会再有 release: 清掉该键盘的所有记账,
-// 避免这些槽位一直占着并让后续按键无法配对.
-static void ime_key_forwarded_remove_keyboard(struct ime *ime,
-		struct wlr_keyboard *keyboard) {
-	size_t i = 0;
-	while (i < ime->forwarded_key_count) {
-		if (ime->forwarded_keys[i].keyboard == keyboard) {
-			ime->forwarded_keys[i] =
-				ime->forwarded_keys[--ime->forwarded_key_count];
-		} else {
-			i++;
-		}
-	}
-}
-
+// 已转发按键记账: 只有匹配的按下被转发过, 才转发释放
+// (IM 可能在某个键已按下后才抓取键盘). 使用 util.h 的通用 key_set,
+// owner 是键盘指针, 这样多块键盘的同一 keycode 能正确配对.
 // 把 text input 状态 (周围文本、内容类型、变更原因) 转发给输入法,
 // 并用 done 结束这次交互
 static void ime_send_text_input_state(struct server *server,
@@ -502,21 +451,26 @@ static void ime_keyboard_grab_modifiers(struct wl_listener *listener,
 		ime->input_method->keyboard_grab, &ik->keyboard->modifiers);
 }
 
-static void ime_keyboard_grab_destroy(struct wl_listener *listener,
-		void *data) {
-	struct ime *ime = wl_container_of(listener, ime, keyboard_grab_destroy);
-	(void)data;
+// 断开所有键盘并清空转发记账. 抓取销毁与 IM 对象销毁共用.
+static void ime_clear_keyboards(struct ime *ime) {
 	struct ime_keyboard *ik, *tmp;
 	wl_list_for_each_safe(ik, tmp, &ime->keyboards, link) {
 		wl_list_remove(&ik->modifiers.link);
 		wl_list_remove(&ik->link);
 		free(ik);
 	}
-	wl_list_remove(&ime->keyboard_grab_destroy.link);
+	listener_remove_if_attached(&ime->keyboard_grab_destroy);
 	ime->keyboard_grab_destroy_added = false;
 	ime->keyboard = NULL;
 	ime->last_keyboard = NULL;
-	ime->forwarded_key_count = 0;
+	key_set_clear(&ime->forwarded);
+}
+
+static void ime_keyboard_grab_destroy(struct wl_listener *listener,
+		void *data) {
+	struct ime *ime = wl_container_of(listener, ime, keyboard_grab_destroy);
+	(void)data;
+	ime_clear_keyboards(ime);
 }
 
 // 把一块键盘连接到 IM 抓取. 第一块键盘同时成为抓取的 keymap/repeat
@@ -552,7 +506,7 @@ static void ime_keyboard_add(struct ime *ime,
 		"ime: adding keyboard %p to grab (seat=%p primary=%p vk=%d)",
 		(void *)keyboard, (void *)wlr_seat_get_keyboard(ime->server->seat),
 		(void *)ime->keyboard,
-		is_keyboard_emulated_by_input_method(keyboard, ime->input_method));
+		keyboard_emulated_by_input_method(keyboard, ime->input_method));
 
 	if (ime->keyboard != NULL) {
 		return;
@@ -585,7 +539,7 @@ static void ime_keyboard_remove(struct ime *ime,
 	free(ik);
 
 	// 设备已经销毁, 它的按键不会再产生 release.
-	ime_key_forwarded_remove_keyboard(ime, keyboard);
+	key_set_remove_owner(&ime->forwarded, keyboard);
 	if (was_last) {
 		ime->last_keyboard = NULL;
 	}
@@ -620,7 +574,7 @@ static void ime_keyboards_attach_all(struct server *server, struct ime *ime) {
 	}
 	struct wlr_keyboard *seat_keyboard = wlr_seat_get_keyboard(server->seat);
 	if (seat_keyboard != NULL && keyboard_is_typing(&seat_keyboard->base) &&
-			!is_keyboard_emulated_by_input_method(seat_keyboard,
+			!keyboard_emulated_by_input_method(seat_keyboard,
 				ime->input_method)) {
 		ime_keyboard_add(ime, seat_keyboard);
 	}
@@ -630,7 +584,7 @@ static void ime_keyboards_attach_all(struct server *server, struct ime *ime) {
 			continue;
 		}
 		if (keyboard_is_typing(&kb->keyboard->base) &&
-				!is_keyboard_emulated_by_input_method(kb->keyboard,
+				!keyboard_emulated_by_input_method(kb->keyboard,
 					ime->input_method)) {
 			ime_keyboard_add(ime, kb->keyboard);
 		}
@@ -650,13 +604,13 @@ void ime_forward_key(struct server *server, struct wlr_keyboard *keyboard,
 			ime->input_method->keyboard_grab;
 		// 绝不转发没有匹配按下记录的释放
 		if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED &&
-				!ime_key_forwarded(ime, keyboard, event->keycode)) {
+				!key_set_contains(&ime->forwarded, keyboard, event->keycode)) {
 			continue;
 		}
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-			ime_key_forwarded_add(ime, keyboard, event->keycode);
+			key_set_add(&ime->forwarded, keyboard, event->keycode);
 		} else {
-			ime_key_forwarded_remove(ime, keyboard, event->keycode);
+			key_set_remove(&ime->forwarded, keyboard, event->keycode);
 		}
 		// 不同键盘有各自的 modifiers 状态. 输入法只保留一份状态,
 		// 所以在键盘切换时补发当前键盘的 modifiers.
@@ -698,7 +652,7 @@ void ime_attach_keyboard(struct server *server,
 		if (ime->input_method != NULL &&
 				ime->input_method->keyboard_grab != NULL &&
 				keyboard_is_typing(&keyboard->base) &&
-				!is_keyboard_emulated_by_input_method(keyboard,
+				!keyboard_emulated_by_input_method(keyboard,
 					ime->input_method)) {
 			ime_keyboard_add(ime, keyboard);
 		}
@@ -799,19 +753,7 @@ static void ime_destroy(struct wl_listener *listener, void *data) {
 	struct server *server = ime->server;
 
 	// 先摘掉所有键盘监听器: 这些信号可能比 input method 活得更久.
-	struct ime_keyboard *ik, *ik_tmp;
-	wl_list_for_each_safe(ik, ik_tmp, &ime->keyboards, link) {
-		wl_list_remove(&ik->modifiers.link);
-		wl_list_remove(&ik->link);
-		free(ik);
-	}
-	if (ime->keyboard_grab_destroy_added) {
-		wl_list_remove(&ime->keyboard_grab_destroy.link);
-		ime->keyboard_grab_destroy_added = false;
-	}
-	ime->keyboard = NULL;
-	ime->last_keyboard = NULL;
-	ime->forwarded_key_count = 0;
+	ime_clear_keyboards(ime);
 	// 正常路径下 input_method 先销毁所有 popup surface, 这里列表已经空了;
 	// 仍做一次兜底清理, 避免异常销毁顺序留下场景节点/监听器.
 	struct ime_popup *popup, *popup_tmp;

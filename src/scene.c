@@ -59,60 +59,66 @@ struct toplevel *toplevel_at(struct server *server) {
 		server->cursor->y);
 }
 
+// 光标下最近的带标签节点 (不继续向父链找).
+// popup/layer/窗口的分类都只需要这一次遍历.
+static struct scene_tag *scene_tag_at_cursor(struct server *server) {
+	double sx, sy;
+	struct wlr_scene_node *node = wlr_scene_node_at(
+		&server->scene->tree.node, server->cursor->x, server->cursor->y,
+		&sx, &sy);
+	for (struct wlr_scene_node *n = node; n != NULL;
+			n = n->parent != NULL ? &n->parent->node : NULL) {
+		if (n->data != NULL) {
+			return n->data;
+		}
+	}
+	return NULL;
+}
+
 // 光标是否位于 popup (菜单/下拉框/工具提示) surface 上?
 // popup 浮在其父 toplevel 之上, 盖住窗口边框的 popup 赢得指针:
 // 此时合成器的边框抓取 (resize 边缘、标题栏) 被禁用, 点击到达 popup
 // 而不是触发缩放. scene_tag_at() 会特意越过 TAG_POPUP 去找所属窗口,
 // 所以这里用显式的命中测试来检测 popup 本身.
 bool pointer_over_popup(struct server *server) {
-	double sx, sy;
-	struct wlr_scene_node *node = wlr_scene_node_at(
-		&server->scene->tree.node, server->cursor->x, server->cursor->y,
-		&sx, &sy);
-	if (node == NULL) {
-		return false;
-	}
-	struct wlr_scene_node *n = node;
-	while (n != NULL) {
-		if (n->data != NULL) {
-			struct scene_tag *tag = n->data;
-			return tag->type == TAG_POPUP;
-		}
-		n = n->parent != NULL ? &n->parent->node : NULL;
-	}
-	return false;
+	struct scene_tag *tag = scene_tag_at_cursor(server);
+	return tag != NULL && tag->type == TAG_POPUP;
 }
 
 // 光标是否位于 layer-shell surface (状态栏、菜单覆盖层等) 上?
 // 它们叠在窗口之上, 所以光标在其上时合成器不能在下方窗口上开始
 // 移动/缩放抓取 - 点击必须到达 layer surface (任务栏按钮、菜单项).
 bool pointer_over_layer_surface(struct server *server) {
-	double sx, sy;
-	struct wlr_scene_node *node = wlr_scene_node_at(
-		&server->scene->tree.node, server->cursor->x, server->cursor->y,
-		&sx, &sy);
-	if (node == NULL) {
+	struct scene_tag *tag = scene_tag_at_cursor(server);
+	if (tag == NULL || tag->type != TAG_LAYER) {
 		return false;
 	}
-	struct wlr_scene_node *n = node;
-	while (n != NULL) {
-		if (n->data != NULL) {
-			struct scene_tag *tag = n->data;
-			if (tag->type == TAG_LAYER) {
-				struct layer_surface *ls = tag->ptr;
-				if (ls == NULL || ls->layer_surface == NULL) {
-					return false;
-				}
-				// background/bottom 层在窗口之下 (壁纸、桌面图标).
-				// 它们不能阻止窗口外半侧的 resize 手柄/标题条; 只有
-				// 真正盖在窗口之上的 top/overlay 才赢得指针.
-				enum zwlr_layer_shell_v1_layer layer =
-					ls->layer_surface->current.layer;
-				return layer == ZWLR_LAYER_SHELL_V1_LAYER_TOP ||
-					layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
-			}
-		}
-		n = n->parent != NULL ? &n->parent->node : NULL;
+	struct layer_surface *ls = tag->ptr;
+	if (ls == NULL || ls->layer_surface == NULL) {
+		return false;
 	}
-	return false;
+	// background/bottom 层在窗口之下 (壁纸、桌面图标).
+	// 它们不能阻止窗口外半侧的 resize 手柄/标题条; 只有
+	// 真正盖在窗口之上的 top/overlay 才赢得指针.
+	enum zwlr_layer_shell_v1_layer layer = ls->layer_surface->current.layer;
+	return layer == ZWLR_LAYER_SHELL_V1_LAYER_TOP ||
+		layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
+}
+
+// ---- 命中框缓存 (toplevel / popup 提交后刷新指针焦点) ----
+
+void hit_cache_store(struct hit_cache *cache, const struct wlr_box *box,
+		int anchor_x, int anchor_y) {
+	cache->box = *box;
+	cache->anchor_x = anchor_x;
+	cache->anchor_y = anchor_y;
+	cache->valid = true;
+}
+
+struct wlr_box hit_cache_translated(const struct hit_cache *cache,
+		int anchor_x, int anchor_y) {
+	struct wlr_box box = cache->box;
+	box.x += anchor_x - cache->anchor_x;
+	box.y += anchor_y - cache->anchor_y;
+	return box;
 }

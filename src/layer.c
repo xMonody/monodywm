@@ -112,7 +112,7 @@ void get_work_area(struct server *server, struct wlr_output *output,
 	wl_list_for_each(ls, &server->layer_surfaces, link) {
 		struct wlr_layer_surface_v1 *layer = ls->layer_surface;
 		// output == NULL 的 layer surface 只被配置到中心输出
-		// (configure_layer_surface/arrange_layer_surfaces 的约定), 所以
+		// (layer_surface_configure/arrange_layer_surfaces 的约定), 所以
 		// 它的独占区也只能缩小中心输出的作区; 否则多显示器时其他输出
 		// 会被无端缩小.
 		struct wlr_output *effective = layer->output != NULL
@@ -132,7 +132,7 @@ void get_work_area(struct server *server, struct wlr_output *output,
 	}
 }
 
-static void configure_layer_surface(struct layer_surface *ls) {
+void layer_surface_configure(struct layer_surface *ls) {
 	struct wlr_layer_surface_v1 *layer_surface = ls->layer_surface;
 	if (!layer_surface->initialized) {
 		return;
@@ -216,7 +216,7 @@ static void arrange_for_layer_surface(struct layer_surface *ls) {
 	}
 	struct wlr_output *output = ls->layer_surface->output;
 	if (output == NULL) {
-		// output == NULL: 该 surface 配置在中心输出上 (见 configure_layer_surface)
+		// output == NULL: 该 surface 配置在中心输出上 (见 layer_surface_configure)
 		output = wlr_output_layout_get_center_output(
 			ls->server->output_layout);
 	}
@@ -266,6 +266,13 @@ static struct layer_surface *layer_focus_stack_top(struct server *server) {
 	return NULL;
 }
 
+// seat 键盘与输入法焦点总是一起移动; 本文件内三处切换共用.
+static void layer_hand_keyboard(struct server *server,
+		struct wlr_surface *surface) {
+	seat_keyboard_focus(server, surface);
+	ime_set_focus(server, surface);
+}
+
 static void layer_surface_take_keyboard(struct server *server,
 		struct layer_surface *ls) {
 	ls->keyboard_focused = true;
@@ -273,8 +280,7 @@ static void layer_surface_take_keyboard(struct server *server,
 	wlr_log(WLR_DEBUG, "layer: keyboard focus -> %s surface %p",
 		ls->layer_surface->namespace ? ls->layer_surface->namespace : "(null)",
 		(void *)ls->layer_surface->surface);
-	seat_keyboard_focus(server, ls->layer_surface->surface);
-	ime_set_focus(server, ls->layer_surface->surface);
+	layer_hand_keyboard(server, ls->layer_surface->surface);
 }
 
 // 把 seat 键盘焦点交给一个已映射且要求键盘交互的 layer surface
@@ -308,8 +314,7 @@ void layer_keyboard_clear(struct server *server, struct wlr_surface *surface) {
 	layer_focus_stack_clear(server);
 	wlr_log(WLR_DEBUG, "layer: keyboard focus released (surface %p)",
 		(void *)ls->layer_surface->surface);
-	seat_keyboard_focus(server, surface);
-	ime_set_focus(server, surface);
+	layer_hand_keyboard(server, surface);
 }
 
 // layer surface 不再持有键盘 (解除映射/销毁/交互关闭):
@@ -337,8 +342,7 @@ static void layer_surface_keyboard_unfocus(struct server *server,
 	if (toplevel_focusable(tl)) {
 		surface = tl->xdg_toplevel->base->surface;
 	}
-	seat_keyboard_focus(server, surface);
-	ime_set_focus(server, surface);
+	layer_hand_keyboard(server, surface);
 }
 
 static void layer_surface_commit(struct wl_listener *listener, void *data) {
@@ -361,7 +365,7 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	// configure ↔ commit 风暴 (见 layer_surface_layout_changed 注释).
 	bool layout_changed = layer_surface_layout_changed(ls);
 	if (layout_changed) {
-		configure_layer_surface(ls);
+		layer_surface_configure(ls);
 	}
 	// blur 尺寸跟随客户端 buffer, 必须每次提交同步, 不能只依赖上面的
 	// configure (尺寸变化时布局签名可能不变)
@@ -434,80 +438,33 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 // 所以跟着 layer surface 一起移动/销毁. wlroots 的 scene layer surface
 // 不处理 popup, 必须由合成器建节点并在首次提交时做约束(configure),
 // 否则 waybar 菜单这类 popup 永远不会映射.
-struct layer_popup_unconstrain;
-
 struct layer_popup {
 	struct layer_surface *ls;
 	struct wlr_scene_tree *tree;
 
-	// 首次提交前的约束跟踪; popup 角色销毁/树销毁时也要一并清理,
+	// 首次提交前的约束跟踪 (popup.c); popup 角色销毁/树销毁时一并清理,
 	// 否则之后的一次 surface commit 会解引用已释放的 wlr_xdg_popup
-	struct layer_popup_unconstrain *unconstrain;
+	struct popup_unconstrain *unconstrain;
 
 	struct wl_listener tree_destroy; // 树销毁时释放 lp
 	struct wl_listener new_popup;    // 嵌套 popup (子菜单)
 	struct wl_listener destroy;      // popup 角色销毁: 摘掉上面两个监听器
 };
 
-// 首次提交时把 popup 限制进所属输出. 与 lp 分开分配:
-// tree_destroy 会先释放 lp, 反向引用用于在释放时清空 lp->unconstrain.
-struct layer_popup_unconstrain {
-	struct layer_popup *lp;
-	struct layer_surface *ls;
-	struct wlr_xdg_popup *popup;
-	struct wl_listener commit;
-	struct wl_listener destroy;
-};
-
-// wayland 的 wl_list_remove 会把 link 置空; 对同一监听器重复移除会崩
-static void listener_remove_if_attached(struct wl_listener *listener) {
-	if (listener->link.prev != NULL) {
-		wl_list_remove(&listener->link);
-	}
+// layer popup 限制进所属 layer surface 的输出 (与光标位置无关);
+// 约束框原点是 layer surface 左上角, 所以减去场景树的布局坐标.
+static struct wlr_output *layer_popup_output(void *data,
+		struct server *server) {
+	(void)server;
+	struct layer_popup *lp = data;
+	return lp->ls->layer_surface != NULL
+		? lp->ls->layer_surface->output : NULL;
 }
 
-static void layer_popup_unconstrain_free(struct layer_popup_unconstrain *lu) {
-	listener_remove_if_attached(&lu->commit);
-	listener_remove_if_attached(&lu->destroy);
-	if (lu->lp != NULL) {
-		lu->lp->unconstrain = NULL;
-	}
-	free(lu);
-}
-
-static void layer_popup_unconstrain_apply(
-		struct layer_popup_unconstrain *lu) {
-	struct server *server = lu->ls->server;
-	struct wlr_output *output = lu->ls->layer_surface->output;
-	if (output == NULL) {
-		output = wlr_output_layout_get_center_output(server->output_layout);
-	}
-	if (output != NULL) {
-		struct wlr_box box;
-		wlr_output_layout_get_box(server->output_layout, output, &box);
-		// 约束框是 wlr_xdg_popup_unconstrain_from_box 要求的"toplevel 本地"
-		// 坐标 (layer popup 的基准是所属 layer surface 左上角), 而
-		// wlr_output_layout_get_box 给的是布局全局坐标: 减去 layer surface
-		// 的场景位置, 否则面板不在原点时菜单会被 positioner 推出屏幕
-		box.x -= lu->ls->scene_layer->tree->node.x;
-		box.y -= lu->ls->scene_layer->tree->node.y;
-		wlr_xdg_popup_unconstrain_from_box(lu->popup, &box);
-	}
-	layer_popup_unconstrain_free(lu);
-}
-
-static void layer_popup_unconstrain_commit(struct wl_listener *listener,
-		void *data) {
-	struct layer_popup_unconstrain *lu =
-		wl_container_of(listener, lu, commit);
-	layer_popup_unconstrain_apply(lu);
-}
-
-static void layer_popup_unconstrain_destroy(struct wl_listener *listener,
-		void *data) {
-	struct layer_popup_unconstrain *lu =
-		wl_container_of(listener, lu, destroy);
-	layer_popup_unconstrain_free(lu);
+static void layer_popup_origin(void *data, int *x, int *y) {
+	struct layer_popup *lp = data;
+	*x = lp->ls->scene_layer->tree->node.x;
+	*y = lp->ls->scene_layer->tree->node.y;
 }
 
 static void layer_popup_tree_destroy(struct wl_listener *listener, void *data) {
@@ -515,7 +472,7 @@ static void layer_popup_tree_destroy(struct wl_listener *listener, void *data) {
 	// 父树 (layer surface) 先销毁而 popup base 还活着时, 约束监听仍挂在
 	// 它的信号上: 先解除反向引用再释放 lp
 	if (lp->unconstrain != NULL) {
-		layer_popup_unconstrain_free(lp->unconstrain);
+		popup_unconstrain_free(lp->unconstrain);
 	}
 	listener_remove_if_attached(&lp->tree_destroy);
 	listener_remove_if_attached(&lp->new_popup);
@@ -530,7 +487,7 @@ static void layer_popup_destroy(struct wl_listener *listener, void *data) {
 	// popup 角色先销毁 (xdg_popup.destroy) 时 base/surface 可能还活着,
 	// 之后的一次 commit 会解引用已释放的 wlr_xdg_popup
 	if (lp->unconstrain != NULL) {
-		layer_popup_unconstrain_free(lp->unconstrain);
+		popup_unconstrain_free(lp->unconstrain);
 	}
 }
 
@@ -550,18 +507,8 @@ static void layer_popup_attach(struct layer_surface *ls,
 		return;
 	}
 	lp->ls = ls;
-
-	struct layer_popup_unconstrain *lu = calloc(1, sizeof(*lu));
-	if (lu != NULL) {
-		lu->lp = lp;
-		lu->ls = ls;
-		lu->popup = popup;
-		lp->unconstrain = lu;
-		lu->commit.notify = layer_popup_unconstrain_commit;
-		wl_signal_add(&popup->base->surface->events.commit, &lu->commit);
-		lu->destroy.notify = layer_popup_unconstrain_destroy;
-		wl_signal_add(&popup->base->events.destroy, &lu->destroy);
-	}
+	lp->unconstrain = popup_unconstrain_create(ls->server, popup,
+		layer_popup_output, layer_popup_origin, &lp->unconstrain, lp);
 
 	// wlr_scene_xdg_surface_create 处理 popup surface 及其 subsurface,
 	// 并在每次提交时把树定位到 popup->current.geometry;
@@ -569,7 +516,7 @@ static void layer_popup_attach(struct layer_surface *ls,
 	lp->tree = wlr_scene_xdg_surface_create(parent_tree, popup->base);
 	if (lp->tree == NULL) {
 		if (lp->unconstrain != NULL) {
-			layer_popup_unconstrain_free(lp->unconstrain);
+			popup_unconstrain_free(lp->unconstrain);
 		}
 		free(lp);
 		return;

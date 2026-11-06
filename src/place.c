@@ -45,11 +45,8 @@ bool place_toplevel(struct server *server, struct toplevel *tl) {
 	int gy = base->geometry.y;
 
 	// 居中到光标所在的输出 (窗口应出现在用户看的地方), 退回中心输出
-	struct wlr_output *output = wlr_output_layout_output_at(
-		server->output_layout, server->cursor->x, server->cursor->y);
-	if (output == NULL) {
-		output = wlr_output_layout_get_center_output(server->output_layout);
-	}
+	struct wlr_output *output = output_at_or_center(server,
+		server->cursor->x, server->cursor->y);
 	if (output == NULL) {
 		return false;
 	}

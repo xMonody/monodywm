@@ -218,6 +218,7 @@ set(COMPOSITOR_SOURCES
 	src/main.c
 	src/ipc.c
 	src/scene.c
+	src/popup.c
 	src/ime.c
 	src/toplevel.c
 	src/decor.c
